@@ -10,3 +10,7 @@ python add_indexes.py --input_file {file_path} --output_file {output_path}
 ```commandline
 python add_documents_to_db.py --dataset_path {file_path_with_indexes}
 ```
+4. Create file with hard negatives and scores:
+```commandline
+python find_negatives.py --dataset_path {input_file_path} --output_path {output_file_path}
+```
