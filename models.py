@@ -1,10 +1,11 @@
 from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from langchain_huggingface import HuggingFaceEmbeddings
+from decouple import config
 import torch
 
 class SpladeEmbedding(SparseEmbeddings):
-    def __init__(self, model_name, batch_size: int = 32):
+    def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForMaskedLM.from_pretrained(model_name,
                                                           device_map='cuda')
@@ -41,10 +42,10 @@ class SpladeEmbedding(SparseEmbeddings):
             results.extend(self._encode_splade_batch(batch))
         return results
 
-def get_sparse_model(model_name: str, batch_size: int = 16) -> SpladeEmbedding:
+def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> SpladeEmbedding:
     return SpladeEmbedding(model_name, batch_size=batch_size)
 
-def get_dense_model(model_name: str, batch_size: int = 16) -> HuggingFaceEmbeddings:
+def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=model_name,
         encode_kwargs={'batch_size': batch_size}

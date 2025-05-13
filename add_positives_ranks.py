@@ -65,7 +65,7 @@ try:
         print(f"Przygotowano {len(reranker_input)} par tekstów.")
 
         print("Obliczanie wyników za pomocą rerankera...")
-        scores = reranker.predict(reranker_input, batch_size=16).tolist()
+        scores = reranker.predict(reranker_input, batch_size=config("RERANKER_BATCH_SIZE", cast=int)).tolist()
         print("Wyniki obliczone.")
 
         merged_df['positive_ranking'] = scores
