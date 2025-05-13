@@ -68,7 +68,7 @@ if __name__ == '__main__':
     parser.add_argument("--queries_path", type=str, required=False, help="Path to the queries parquet file.", default="data/queries.parquet")
     parser.add_argument("--relevant_path", type=str, required=False, help="Path to the relevancy parquet file.", default="data/relevant_with_score.parquet")
     parser.add_argument("--output_path", type=str, required=False, help="Path to the output parquet file.", default="data/negatives.parquet")
-    parser.add_argument("--top_k", type=int, default=30, required=False, help="Number of documents to retrieve")
+    parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int), required=False, help="Number of documents to retrieve")
     args = parser.parse_args()
     find_negatives(args.dense_model_name, args.sparse_model_name, args.embedding_batch_size, args.reranker_model_name, args.reranker_batch_size, args.database_collection_name, args.database_path, args.queries_path, args.relevant_path,
                    args.output_path, args.top_k)
