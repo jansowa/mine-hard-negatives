@@ -45,8 +45,8 @@ class SpladeEmbedding(SparseEmbeddings):
 def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> SpladeEmbedding:
     return SpladeEmbedding(model_name, batch_size=batch_size)
 
-def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> HuggingFaceEmbeddings:
+def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), prompt="") -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=model_name,
-        encode_kwargs={'batch_size': batch_size}
+        encode_kwargs={'batch_size': batch_size, 'prompt': prompt}
     )

@@ -9,7 +9,7 @@ from decouple import config
 
 
 def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch_size: int, reranker_model_name: str, reranker_batch_size: int, collection_name: str, database_path: str, queries_path: str, relevant_path: str, output_path: str, top_k: int):
-    dense_embeddings = get_dense_model(dense_model_name, batch_size=embedding_batch_size)
+    dense_embeddings = get_dense_model(dense_model_name, batch_size=embedding_batch_size, prompt=config("DENSE_PROMPT"))
     print("Loaded dense embeddings")
     sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=embedding_batch_size)
     print("Loaded sparse embeddings")
