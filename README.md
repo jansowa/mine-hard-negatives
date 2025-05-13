@@ -1,6 +1,8 @@
 # Project to mine hard negatives and set scores for knowledge distillation
 
 ### How to run?
+1. Create `.env` file - you can use `.env.example.base` with models based on "roberta base" or `.env.example.large` with models based on "roberta large".
+
 1. Run:
 ```shell
 python to_huggingface_dataset.py
@@ -21,5 +23,5 @@ python find_negatives.py
 
 5. Create a FlagEmbedding-style JSONL with a training-ready dataset:
 ```shell
-create_flag_embedding_jsonl.py
+python create_flag_embedding_jsonl.py
 ```

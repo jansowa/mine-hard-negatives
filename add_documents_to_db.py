@@ -1,13 +1,11 @@
-# Popraw teraz poniższy skrypt w taki sposób, żeby brał dokumenty do wektoryzacji z pliku data/queries.parquet. Są tam pola "text" i "id", które powinny odpowiadać polom "content" i "id" z pliku JSONL. Zamiast wczytywać dokumenty (pytania) z pliku JSONL rób to z tego pliku parquet i zapisuj je w bazie qdrant.
-
 import argparse
 from models import get_dense_model, get_sparse_model
-import json
 from langchain_qdrant import QdrantVectorStore
 from langchain_qdrant.qdrant import RetrievalMode
 from langchain_core.documents import Document
 from qdrant_client.http.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client import QdrantClient, models
+from decouple import config
 
 from datasets import Dataset
 
@@ -77,7 +75,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the input parquet file.")
     parser.add_argument("--database_path", type=str, required=False, help="Path to the qdrant output database", default="qdrant_db")
-    parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default="sdadas/mmlw-retrieval-roberta-base")
+    parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default="sdadas/polish-splade")
     parser.add_argument("--batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=16)
     parser.add_argument("--database_collection_name", type=str, required=False, help="Name of database collection", default="all_documents")
