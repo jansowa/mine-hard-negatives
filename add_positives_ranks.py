@@ -1,16 +1,7 @@
-from sentence_transformers import CrossEncoder
 from decouple import config
-import torch
+from models import get_reranker_model, rerank
 
-def load_reranker(model_name=config("RERANKER_NAME")) -> CrossEncoder:
-    return CrossEncoder(
-        model_name,
-        default_activation_function=torch.nn.Identity(),
-        max_length=512,
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-reranker = load_reranker()
+tokenizer, reranker = get_reranker_model(model_name=config("RERANKER_NAME"))
 
 import pandas as pd
 import pyarrow as pa
@@ -65,7 +56,7 @@ try:
         print(f"Przygotowano {len(reranker_input)} par tekstów.")
 
         print("Obliczanie wyników za pomocą rerankera...")
-        scores = reranker.predict(reranker_input, batch_size=config("RERANKER_BATCH_SIZE", cast=int)).tolist()
+        scores = rerank(tokenizer, reranker, queries_list, documents_list)
         print("Wyniki obliczone.")
 
         merged_df['positive_ranking'] = scores

@@ -1,9 +1,7 @@
-from models import get_dense_model, get_sparse_model
+from models import get_dense_model, get_sparse_model, get_reranker_model, rerank
 import argparse
 from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore, RetrievalMode
-from sentence_transformers import CrossEncoder
-import torch.nn
 import pandas as pd
 from decouple import config
 
@@ -27,7 +25,7 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
     retriever = vector_store.as_retriever(
         search_kwargs={"k": top_k}
     )
-    reranker = load_reranker(reranker_model_name)
+    tokenizer, reranker = get_reranker_model(model_name=reranker_model_name)
     print("Loaded reranker")
     queries_df = pd.read_parquet(queries_path)
     relative_df = pd.read_parquet(relevant_path)
@@ -39,21 +37,13 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
     for index, row in positives_df.iterrows():
         retrieved_docs = [document for document in retriever.get_relevant_documents(row['text']) if
                           document.metadata['document_id'] != row['document_id']]
-        ranking = reranker.predict([[row['text'], document.page_content] for document in retrieved_docs],
-                                   batch_size=reranker_batch_size).tolist()
+        ranking = rerank(tokenizer, reranker, row['text'], [document.page_content for document in retrieved_docs],
+                         batch_size=reranker_batch_size)
         zipped = zipped + [(row['query_id'], document_id, ranking) for document_id, ranking in
                            zip([document.metadata['document_id'] for document in retrieved_docs], ranking)]
     negatives = pd.DataFrame(zipped, columns=["query_id", "document_id", "ranking"])
     negatives.to_parquet(output_path)
 
-
-def load_reranker(model_name: str) -> CrossEncoder:
-    return CrossEncoder(
-        model_name,
-        default_activation_function=torch.nn.Identity(),
-        max_length=512,
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")

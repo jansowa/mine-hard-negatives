@@ -1,7 +1,9 @@
 from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModelForSequenceClassification
 from langchain_huggingface import HuggingFaceEmbeddings
 from decouple import config
+from typing import Tuple
+import numpy as np
 import torch
 
 class SpladeEmbedding(SparseEmbeddings):
@@ -50,3 +52,38 @@ def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SI
         model_name=model_name,
         encode_kwargs={'batch_size': batch_size, 'prompt': prompt}
     )
+
+def get_reranker_model(model_name: str = config("RERANKER_NAME")):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda"
+    )
+    return tokenizer, model
+
+def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16) -> list[float]:
+    if isinstance(query, str):
+        texts = [f"{query}</s></s>{answer}" for answer in answers]
+    else:
+        texts = [f"{q}>/s></s>{answer}" for q, answer in zip(query, answers)]
+
+    results = []
+
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        tokens = tokenizer(
+            batch_texts,
+            padding="longest",
+            max_length=512,
+            truncation=True,
+            return_tensors="pt"
+        ).to("cuda")
+        output = model(**tokens)
+        batch_results = output.logits.detach().cpu().float().numpy()
+        results.append(batch_results)
+
+    results = np.concatenate(results, axis=0)
+    results = np.squeeze(results)
+    return [float(result) for result in results.tolist()]
