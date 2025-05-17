@@ -50,7 +50,7 @@ if __name__ == '__main__':
     parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default="sdadas/polish-splade")
     parser.add_argument("--embedding_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("EMBEDDER_BATCH_SIZE", cast=int))
-    parser.add_argument("--reranker_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
+    parser.add_argument("--reranker_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("RERANKER_NAME"))
     parser.add_argument("--reranker_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("RERANKER_BATCH_SIZE", cast=int))
     parser.add_argument("--database_collection_name", type=str, required=False, help="Name of database collection", default="all_documents")
     parser.add_argument("--database_path", type=str, required=False, help="Path to the output JSONL file (optional).",
