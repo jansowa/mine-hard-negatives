@@ -19,35 +19,35 @@ def process_relevant(
 ) -> None:
     output_dir: str = os.path.dirname(output_path) if output_path else "."
 
-    print("Rozpoczynam tworzenie pliku relevant_with_score.parquet...")
+    print("Starting creation of relevant_with_score.parquet file...")
 
     try:
-        print(f"Wczytywanie danych z:\n - {queries_path} (kolumny: id, text)\n - {corpus_path} (kolumny: id, text)")
+        print(f"Loading data from:\n - {queries_path} (columns: id, text)\n - {corpus_path} (columns: id, text)")
         queries_df: pd.DataFrame = pd.read_parquet(queries_path, columns=['id', 'text'])
         queries_df = queries_df.rename(columns={'text': 'query_text'}).set_index('id')
 
         corpus_df: pd.DataFrame = pd.read_parquet(corpus_path, columns=['id', 'text'])
         corpus_df = corpus_df.rename(columns={'text': 'document_text'}).set_index('id')
-        print("Pliki queries.parquet i corpus.parquet wczytane i przygotowane.")
+        print("Files queries.parquet and corpus.parquet loaded and prepared.")
 
         tokenizer, reranker = get_reranker_model(reranker_model_name)
-        print(f"Reranker załadowany. Urządzenie: {reranker.device}")
+        print(f"Reranker loaded. Device: {reranker.device}")
 
         relevant_extended_schema: pa.Schema = pa.schema([
             ('query_id', pa.int32()),
             ('document_id', pa.int32()),
             ('positive_ranking', pa.float32())
         ])
-        print("Zdefiniowano schemat dla pliku wyjściowego.")
+        print("Schema for the output file defined.")
 
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
-            print(f"Utworzono katalog docelowy: {output_dir}")
+            print(f"Created output directory: {output_dir}")
 
         writer: Optional[pq.ParquetWriter] = pq.ParquetWriter(output_path, relevant_extended_schema)
-        print(f"Rozpoczęto zapis do pliku: {output_path}")
+        print(f"Started writing to file: {output_path}")
 
-        print(f"Przetwarzanie pliku {relevant_path} w chunkach o rozmiarze {chunk_size}...")
+        print(f"Processing file {relevant_path} in chunks of size {chunk_size}...")
         parquet_file_relevant = pq.ParquetFile(relevant_path)
         total_batches: int = parquet_file_relevant.num_row_groups
 
@@ -56,10 +56,10 @@ def process_relevant(
         for i, batch in enumerate(
             tqdm(
                 parquet_file_relevant.iter_batches(batch_size=chunk_size, columns=['query_id', 'document_id']),
-                desc="Przetwarzanie chunków relevant.parquet"
+                desc="Processing relevant.parquet chunks"
             )):
             relevant_chunk_df: pd.DataFrame = batch.to_pandas()
-            print(f"Przetwarzanie chunka {i+1} ({len(relevant_chunk_df)} wierszy)...")
+            print(f"Processing chunk {i+1} ({len(relevant_chunk_df)} rows)...")
 
             if relevant_chunk_df.empty:
                 continue
@@ -94,45 +94,45 @@ def process_relevant(
             del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
 
         writer.close()
-        print(f"\nPomyślnie utworzono plik: {output_path}")
-        print(f"Przetworzono i zapisano łącznie {processed_pairs_count} par pytanie-dokument.")
+        print(f"\nSuccessfully created file: {output_path}")
+        print(f"Processed and saved a total of {processed_pairs_count} question-document pairs.")
 
         if processed_pairs_count > 0:
-            print("\nPodgląd pierwszych 5 wierszy pliku relevant_with_score.parquet:")
+            print("\nPreview of the first 5 rows of relevant with score parquet file:")
             print(pd.read_parquet(output_path).head())
         else:
-            print("Nie przetworzono żadnych par, plik wyjściowy może być pusty lub nie zawierać danych.")
+            print("No pairs were processed, the output file may be empty or contain no data.")
 
     except FileNotFoundError as e:
-        print(f"BŁĄD: Nie znaleziono jednego z plików wejściowych: {e}. Upewnij się, że pliki istnieją w podanych ścieżkach.")
+        print(f"ERROR: One of the input files was not found: {e}. Make sure the files exist at the specified paths.")
     except KeyError as e:
-        print(f"BŁĄD: Brak oczekiwanej kolumny w jednym z plików Parquet: {e}. Sprawdź strukturę plików wejściowych.")
+        print(f"ERROR: Missing expected column in one of the Parquet files: {e}. Check the structure of the input files.")
     except AttributeError as e:
         if 'reranker' in str(e) and hasattr(e, 'obj') and e.obj is None:
-            print(f"BŁĄD: Obiekt 'reranker' nie został poprawnie zainicjalizowany (jest None). Szczegóły: {e}")
+            print(f"ERROR: The 'reranker' object was not properly initialized (is None). Details: {e}")
         elif 'reranker' in str(e):
-            print(f"BŁĄD: Problem z obiektem 'reranker'. Upewnij się, że jest poprawnie załadowany i ma metodę 'predict'. Szczegóły: {e}")
+            print(f"ERROR: Problem with the 'reranker' object. Make sure it is properly loaded and has a 'predict' method. Details: {e}")
         else:
-            print(f"BŁĄD: Wystąpił problem z atrybutem: {e}")
+            print(f"ERROR: An attribute problem occurred: {e}")
     except Exception as e:
         import traceback
-        print(f"BŁĄD: Wystąpił nieoczekiwany błąd podczas przetwarzania: {e}")
+        print(f"ERROR: An unexpected error occurred during processing: {e}")
         print("Traceback:")
         traceback.print_exc()
     finally:
         if 'writer' in locals() and writer is not None and writer.is_open:
             writer.close()
-            print("ParquetWriter został zamknięty w bloku finally.")
+            print("ParquetWriter was closed in the finally block.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scoring relevant pairs and saving to Parquet.")
-    parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Ścieżka do pliku queries.parquet")
-    parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Ścieżka do pliku corpus.parquet")
-    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"), help="Ścieżka do pliku relevant.parquet")
-    parser.add_argument("--output_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Ścieżka do pliku output.parquet")
-    parser.add_argument("--chunk_size", type=int, default=config("PROCESSING_CHUNK_SIZE", cast=int), help="Rozmiar chunku do przetwarzania")
-    parser.add_argument("--reranker_batch_size", type=int, default=config("RERANKER_BATCH_SIZE", cast=int), help="Batch size dla rerankera")
-    parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"), help="Nazwa modelu rerankera")
+    parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Path to parquet file with queries")
+    parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Path to parquet file with corpus")
+    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"), help="Path to parquet file with relevant connections")
+    parser.add_argument("--output_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Path to output parquet file (relevant with positive scores)")
+    parser.add_argument("--chunk_size", type=int, default=config("PROCESSING_CHUNK_SIZE", cast=int), help="Chunk size for processing")
+    parser.add_argument("--reranker_batch_size", type=int, default=config("RERANKER_BATCH_SIZE", cast=int), help="Batch size for reranker")
+    parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"), help="Name of the reranker model")
     args = parser.parse_args()
 
     process_relevant(

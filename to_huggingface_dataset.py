@@ -60,14 +60,14 @@ def main(
     if relevant_writer:
         relevant_writer.close()
 
-    print("Zbiory zostały zapisane w formacie Parquet (strumieniowo).")
+    print("Datasets have been saved in Parquet format (streaming).")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Przetwarzanie pliku wejściowego na Parquet (queries, corpus, relevant)")
-    parser.add_argument("--input_file_path", type=str, required=False, help="Ścieżka do pliku wejściowego (jsonl)", default=config("INPUT_FILE_PATH"))
-    parser.add_argument("--queries_path", type=str, required=False, help="Ścieżka wyjściowa do pliku queries (parquet)", default=config("QUERIES_PATH"))
-    parser.add_argument("--corpus_path", type=str, required=False, help="Ścieżka wyjściowa do pliku corpus (parquet)", default=config("CORPUS_PATH"))
-    parser.add_argument("--relevant_path", type=str, required=False, help="Ścieżka wyjściowa do pliku relevant (parquet)", default=config("RELEVANT_PATH"))
+    parser = argparse.ArgumentParser(description="Processing the input file to Parquet (queries, corpus, relevant)")
+    parser.add_argument("--input_file_path", type=str, required=False, help="Path to the input file (jsonl)", default=config("INPUT_FILE_PATH"))
+    parser.add_argument("--queries_path", type=str, required=False, help="Output path for the queries file (parquet)", default=config("QUERIES_PATH"))
+    parser.add_argument("--corpus_path", type=str, required=False, help="Output path for the corpus file (parquet)", default=config("CORPUS_PATH"))
+    parser.add_argument("--relevant_path", type=str, required=False, help="Output path for the relevant file (parquet)", default=config("RELEVANT_PATH"))
     args = parser.parse_args()
     main(
         input_file_path=args.input_file_path,

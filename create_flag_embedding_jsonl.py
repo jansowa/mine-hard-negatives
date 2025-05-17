@@ -67,14 +67,14 @@ def process_negatives(
     print(f"Zapisano plik: {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Tworzenie pliku output.jsonl z pozytywami i negatywami.")
-    parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Ścieżka do corpus.parquet")
-    parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Ścieżka do queries.parquet")
-    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Ścieżka do relevant_with_score.parquet")
-    parser.add_argument("--negatives_path", type=str, default=config("NEGATIVES_PATH"), help="Ścieżka do negatives.parquet")
-    parser.add_argument("--output_path", type=str, default=config("OUTPUT_PATH"), help="Ścieżka z wygenerowanym plikiem JSONL")
-    parser.add_argument("--num_negatives", type=int, default=config("NUM_NEGATIVES", cast=int), help="Liczba negatywnych przykładów do wybrania")
-    parser.add_argument("--negatives_threshold", type=float, default=config("NEGATIVES_THRESHOLD", cast=float), help="Próg dla negatywów (procent od minimalnego pozytywnego)")
+    parser = argparse.ArgumentParser(description="Creating the jsonl file with positives, negatives and scores.")
+    parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Path to parquet file with corpus")
+    parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Path to parquet file with queries")
+    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Path to parquet file with relevant connections (with scores)")
+    parser.add_argument("--negatives_path", type=str, default=config("NEGATIVES_PATH"), help="Path to parquet file with negatives")
+    parser.add_argument("--output_path", type=str, default=config("OUTPUT_PATH"), help="Path to output parquet file")
+    parser.add_argument("--num_negatives", type=int, default=config("NUM_NEGATIVES", cast=int), help="Number of negatives for each question")
+    parser.add_argument("--negatives_threshold", type=float, default=config("NEGATIVES_THRESHOLD", cast=float), help="Threshold for negatives (percent of the minimum positive)")
     args = parser.parse_args()
 
     process_negatives(
