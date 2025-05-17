@@ -6,7 +6,6 @@ import pandas as pd
 from decouple import config
 import pyarrow as pa
 import pyarrow.parquet as pq
-import os
 
 
 def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch_size: int, reranker_model_name: str, reranker_batch_size: int, processing_batch_size: int, collection_name: str, database_path: str, queries_path: str, relevant_path: str, output_path: str, top_k: int):
@@ -81,13 +80,13 @@ if __name__ == '__main__':
     parser.add_argument("--embedding_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("EMBEDDER_BATCH_SIZE", cast=int))
     parser.add_argument("--reranker_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("RERANKER_NAME"))
     parser.add_argument("--reranker_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("RERANKER_BATCH_SIZE", cast=int))
-    parser.add_argument("--processing_batch_size", type=int, required=False, help="Number of questions in single iteration before save", default=10) # TODO: set 1000
+    parser.add_argument("--processing_batch_size", type=int, required=False, help="Number of questions in single iteration before save", default=config("PROCESSING_CHUNK_SIZE", cast=int))
     parser.add_argument("--database_collection_name", type=str, required=False, help="Name of database collection", default="all_documents")
     parser.add_argument("--database_path", type=str, required=False, help="Path to the output JSONL file (optional).",
                         default="qdrant_db")
-    parser.add_argument("--queries_path", type=str, required=False, help="Path to the queries parquet file.", default="data/queries.parquet")
-    parser.add_argument("--relevant_path", type=str, required=False, help="Path to the relevancy parquet file.", default="data/relevant_with_score.parquet")
-    parser.add_argument("--output_path", type=str, required=False, help="Path to the output parquet file.", default="data/negatives.parquet")
+    parser.add_argument("--queries_path", type=str, required=False, help="Path to the queries parquet file.", default=config("QUERIES_PATH"))
+    parser.add_argument("--relevant_path", type=str, required=False, help="Path to the relevancy parquet file.", default=config("RELEVANT_WITH_SCORE_PATH"))
+    parser.add_argument("--output_path", type=str, required=False, help="Path to the output parquet file.", default=config("NEGATIVES_PATH"))
     parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int), required=False, help="Number of documents to retrieve")
     args = parser.parse_args()
     find_negatives(args.dense_model_name, args.sparse_model_name, args.embedding_batch_size, args.reranker_model_name, args.reranker_batch_size, args.processing_batch_size,

@@ -72,7 +72,7 @@ def create_collection_if_not_exists(client, database_collection_name, dense_dim_
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the input parquet file.")
+    parser.add_argument("--dataset_path", type=str, required=False, help="Path to the input parquet file.", default=config("CORPUS_PATH"))
     parser.add_argument("--database_path", type=str, required=False, help="Path to the qdrant output database", default="qdrant_db")
     parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default="sdadas/polish-splade")
