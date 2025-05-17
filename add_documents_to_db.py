@@ -48,7 +48,6 @@ def add_documents(input_file: str, lines_number_batch: int, vectorstore: QdrantV
 
     for batch in read_parquet_batches(input_file, lines_number_batch):
         documents: list[Document] = []
-        print(f"{batch=}")
         for content, doc_id in zip(batch['text'], batch['id']):
             if not content:
                 continue
