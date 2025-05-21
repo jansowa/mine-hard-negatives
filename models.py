@@ -65,9 +65,9 @@ def get_reranker_model(model_name: str = config("RERANKER_NAME")):
 
 def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16) -> list[float]:
     if isinstance(query, str):
-        texts = [f"{query}</s></s>{answer}" for answer in answers]
+        texts = [[query, answer] for answer in answers]
     else:
-        texts = [f"{q}>/s></s>{answer}" for q, answer in zip(query, answers)]
+        texts = [[q, answer] for q, answer in zip(query, answers)]
 
     results = []
 
