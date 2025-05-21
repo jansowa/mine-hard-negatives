@@ -58,6 +58,8 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
             for document, rank in zip(retrieved_docs, ranking):
                 buffer.append((row['query_id'], document.metadata['document_id'], rank))
 
+            if i % 10 == 0:
+                print(f"Found negatives for {i} queries.")
             if i % processing_batch_size == 0 or i == n:
                 batch_df = pd.DataFrame(buffer, columns=["query_id", "document_id", "ranking"])
                 batch_df = batch_df.astype({"query_id": "int64", "document_id": "int64", "ranking": "float32"})

@@ -1,12 +1,13 @@
-DENSE_EMBEDDER_NAME="sdadas/mmlw-retrieval-roberta-base"
-DENSE_PROMPT="zapytanie: "
-RERANKER_NAME="sdadas/polish-reranker-base-ranknet"
+SPLADE_MODEL_NAME="naver/splade-v3"
+DENSE_EMBEDDER_NAME="Snowflake/snowflake-arctic-embed-l-v2.0"
+DENSE_PROMPT="query: "
+RERANKER_NAME="BAAI/bge-reranker-v2-m3"
 EMBEDDER_BATCH_SIZE=16
 RERANKER_BATCH_SIZE=16
 TOP_K=40
 NUM_NEGATIVES=10
 NEGATIVES_THRESHOLD=0.2
-PROCESSING_CHUNK_SIZE=100000
+PROCESSING_CHUNK_SIZE=1000
 INPUT_FILE_PATH="data/input.jsonl"
 QUERIES_PATH="data/queries.parquet"
 CORPUS_PATH="data/corpus.parquet"

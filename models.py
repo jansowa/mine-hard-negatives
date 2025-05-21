@@ -44,32 +44,63 @@ class SpladeEmbedding(SparseEmbeddings):
             results.extend(self._encode_splade_batch(batch))
         return results
 
+
 def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> SpladeEmbedding:
     return SpladeEmbedding(model_name, batch_size=batch_size)
 
-def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), prompt="") -> HuggingFaceEmbeddings:
+
+def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int),
+                    prompt="") -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(
         model_name=model_name,
         encode_kwargs={'batch_size': batch_size, 'prompt': prompt}
     )
 
+
+def is_flag_embedding_reranker(model_name: str) -> bool:
+    return model_name.startswith("BAAI")
+
+
+def is_llm_lightweight_reranker(model_name: str) -> bool:
+    return model_name.endswith("lightweight")
+
+
 def get_reranker_model(model_name: str = config("RERANKER_NAME")):
+    if is_flag_embedding_reranker(model_name):
+        from FlagEmbedding import FlagAutoReranker
+        num_gpus = torch.cuda.device_count()
+        devices = [f"cuda:{i}" for i in range(num_gpus)]
+        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices)
+        return None, model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        device_map="cuda"
+        device_map="auto"
     )
     return tokenizer, model
 
-def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16) -> list[float]:
+
+def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16,
+           model_name: str = config("RERANKER_NAME")) -> list[float]:
     if isinstance(query, str):
         texts = [[query, answer] for answer in answers]
     else:
         texts = [[q, answer] for q, answer in zip(query, answers)]
 
     results = []
+
+    if is_flag_embedding_reranker(model_name):
+        additional_params = dict()
+        if is_llm_lightweight_reranker(model_name):
+            additional_params["cutoff_layers"] = [28]
+            additional_params["compress_ratio"] = [2]
+            additional_params["compress_layers"] = [24, 40]
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            results += model.compute_score(batch_texts, **additional_params)
+        return results
 
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]

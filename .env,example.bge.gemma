@@ -1,0 +1,17 @@
+SPLADE_MODEL_NAME="naver/splade-v3"
+DENSE_EMBEDDER_NAME="Snowflake/snowflake-arctic-embed-l-v2.0"
+DENSE_PROMPT="query: "
+RERANKER_NAME="BAAI/bge-reranker-v2-gemma"
+EMBEDDER_BATCH_SIZE=16
+RERANKER_BATCH_SIZE=16
+TOP_K=40
+NUM_NEGATIVES=10
+NEGATIVES_THRESHOLD=0.2
+PROCESSING_CHUNK_SIZE=1000
+INPUT_FILE_PATH="data/input.jsonl"
+QUERIES_PATH="data/queries.parquet"
+CORPUS_PATH="data/corpus.parquet"
+RELEVANT_PATH="data/relevant.parquet"
+RELEVANT_WITH_SCORE_PATH="data/relevant_with_score.parquet"
+NEGATIVES_PATH="data/negatives.parquet"
+OUTPUT_PATH="data/output.jsonl"

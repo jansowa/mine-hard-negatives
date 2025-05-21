@@ -31,7 +31,7 @@ def process_relevant(
         print("Files queries.parquet and corpus.parquet loaded and prepared.")
 
         tokenizer, reranker = get_reranker_model(reranker_model_name)
-        print(f"Reranker loaded. Device: {reranker.device}")
+        print(f"Reranker loaded.")
 
         relevant_extended_schema: pa.Schema = pa.schema([
             ('query_id', pa.int32()),
