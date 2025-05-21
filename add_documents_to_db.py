@@ -44,9 +44,10 @@ def get_points_number(client: QdrantClient, collection_name: str) -> int:
 
 
 
-def add_documents(input_file: str, lines_number_batch: int, vectorstore: QdrantVectorStore):
+def add_documents(input_file: str, batch_size: int, vectorstore: QdrantVectorStore):
 
-    for batch in read_parquet_batches(input_file, lines_number_batch):
+    count=0
+    for batch in read_parquet_batches(input_file, batch_size):
         documents: list[Document] = []
         for content, doc_id in zip(batch['text'], batch['id']):
             if not content:
@@ -57,6 +58,8 @@ def add_documents(input_file: str, lines_number_batch: int, vectorstore: QdrantV
             ))
         if documents:
             vectorstore.add_documents(documents=documents)
+            count+=batch_size
+            print(f"{count} documents added")
 
 
 def create_collection_if_not_exists(client, database_collection_name, dense_dim_size):
