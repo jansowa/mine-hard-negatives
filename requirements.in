@@ -1,0 +1,12 @@
+langchain-qdrant
+langchain-core
+qdrant-client
+python-decouple
+datasets
+pandas
+transformers==4.51
+langchain-huggingface
+numpy
+torch
+accelerate
+FlagEmbedding
