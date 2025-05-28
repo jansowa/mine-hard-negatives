@@ -1,6 +1,6 @@
 CODE_DIRECTORY=/code
 QDRANT_URL=http://vdb:6333
-HFTOKEN=hf_TOKEN
+HF_TOKEN=hf_TOKEN
 SPLADE_MODEL_NAME="naver/splade-v3"
 DENSE_EMBEDDER_NAME="Snowflake/snowflake-arctic-embed-l-v2.0"
 DENSE_PROMPT="query: "
