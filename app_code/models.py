@@ -97,7 +97,7 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         additional_params = dict()
         if is_llm_lightweight_reranker(model_name):
             additional_params["cutoff_layers"] = [28]
-            additional_params["compress_ratio"] = [2]
+            additional_params["compress_ratio"] = 2
             additional_params["compress_layers"] = [24, 40]
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i + batch_size]
