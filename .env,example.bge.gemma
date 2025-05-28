@@ -1,7 +1,10 @@
+CODE_DIRECTORY=/code
+QDRANT_URL=http://vdb:6333
+HFTOKEN=hf_TOKEN
 SPLADE_MODEL_NAME="naver/splade-v3"
 DENSE_EMBEDDER_NAME="Snowflake/snowflake-arctic-embed-l-v2.0"
 DENSE_PROMPT="query: "
-RERANKER_NAME="BAAI/bge-reranker-v2-gemma"
+RERANKER_NAME="BAAI/bge-reranker-v2.5-gemma2-lightweight"
 EMBEDDER_BATCH_SIZE=16
 RERANKER_BATCH_SIZE=16
 TOP_K=500

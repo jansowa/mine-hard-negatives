@@ -6,6 +6,7 @@ import pandas as pd
 from decouple import config
 import pyarrow as pa
 import pyarrow.parquet as pq
+from utils.vdb import get_qdrant_client
 
 
 def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch_size: int, reranker_model_name: str, reranker_batch_size: int, processing_batch_size: int, collection_name: str, database_path: str, queries_path: str, relevant_path: str, output_path: str, top_k: int):
@@ -13,7 +14,7 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
     print("Loaded dense embeddings")
     sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=embedding_batch_size)
     print("Loaded sparse embeddings")
-    client = QdrantClient(path=database_path)
+    client = get_qdrant_client()
     print("Loaded database")
     vector_store = QdrantVectorStore(
         client=client,

@@ -72,6 +72,7 @@ def get_reranker_model(model_name: str = config("RERANKER_NAME")):
         num_gpus = torch.cuda.device_count()
         devices = [f"cuda:{i}" for i in range(num_gpus)]
         model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices)
+        # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
