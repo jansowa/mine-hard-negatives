@@ -16,7 +16,7 @@ class SpladeEmbedding(SparseEmbeddings):
         self.batch_size = batch_size
 
     def _encode_splade_batch(self, texts: list[str]) -> list[SparseVector]:
-        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=512).to(
+        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=config("EMBEDDER_MAX_LENGTH", cast=int, default=None)).to(
             self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -51,11 +51,11 @@ def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_S
 
 def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int),
                     prompt="") -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={'model_kwargs': {'torch_dtype': torch.bfloat16}},
-        encode_kwargs={'batch_size': batch_size, 'prompt': prompt}
-    )
+    embeddings = HuggingFaceEmbeddings(model_name=model_name,
+                                       model_kwargs={'model_kwargs': {'torch_dtype': torch.bfloat16}},
+                                       encode_kwargs={'batch_size': batch_size, 'prompt': prompt})
+    embeddings._client.tokenizer.model_max_length = config("EMBEDDER_MAX_LENGTH", cast=int, default=None)
+    return embeddings
 
 
 def is_flag_embedding_reranker(model_name: str) -> bool:
@@ -71,7 +71,7 @@ def get_reranker_model(model_name: str = config("RERANKER_NAME")):
         from FlagEmbedding import FlagAutoReranker
         num_gpus = torch.cuda.device_count()
         devices = [f"cuda:{i}" for i in range(num_gpus)]
-        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices)
+        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, max_legnth=config("RERANKER_NAME"))
         # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -109,7 +109,7 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         tokens = tokenizer(
             batch_texts,
             padding="longest",
-            max_length=512,
+            max_length=config("RERANKER_MAX_LENGTH", cast=int, default=None),
             truncation=True,
             return_tensors="pt"
         ).to("cuda")
