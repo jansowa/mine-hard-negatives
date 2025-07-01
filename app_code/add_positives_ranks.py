@@ -62,17 +62,21 @@ def process_relevant(
             print(f"Processing chunk {i+1} ({len(relevant_chunk_df)} rows)...")
 
             if relevant_chunk_df.empty:
+                print("Chunk of data is empty.")
                 continue
 
             merged_chunk_df: pd.DataFrame = pd.merge(
                 relevant_chunk_df, queries_df,
                 left_on='query_id', right_index=True, how='inner'
             )
+            print("Merged relevant_chunk_df with queries_df.")
             merged_chunk_df = pd.merge(
                 merged_chunk_df, corpus_df,
                 left_on='document_id', right_index=True, how='inner'
             )
+            print("Merged merged_chunk_df with corpus_df.")
             if merged_chunk_df.empty:
+                print("merged_chunk_df is empty")
                 continue
 
             scores_chunk = rerank(
@@ -81,17 +85,23 @@ def process_relevant(
                 merged_chunk_df['document_text'].values.tolist(),
                 batch_size=reranker_batch_size
             )
+            print("Calculated scores for chunk of data")
 
             result_chunk_df: pd.DataFrame = pd.DataFrame({
                 'query_id': merged_chunk_df['query_id'],
                 'document_id': merged_chunk_df['document_id'],
                 'positive_ranking': scores_chunk
             })
+            print("Created dataframe with triplets query+document+score")
             result_table_chunk: pa.Table = pa.Table.from_pandas(result_chunk_df, schema=relevant_extended_schema, preserve_index=False)
+            print("Created pyarrow table with data")
             writer.write_table(result_table_chunk)
+            print("Writed table to file")
             processed_pairs_count += len(result_chunk_df)
+            print(f"{len(result_chunk_df)=}")
 
             del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
+            print("Deleted unnecessary variables")
 
         writer.close()
         print(f"\nSuccessfully created file: {output_path}")

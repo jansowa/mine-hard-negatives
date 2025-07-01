@@ -86,6 +86,7 @@ def get_reranker_model(model_name: str = config("RERANKER_NAME")):
 
 def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16,
            model_name: str = config("RERANKER_NAME")) -> list[float]:
+    print("Calculating ranks")
     if isinstance(query, str):
         texts = [[query, answer] for answer in answers]
     else:
@@ -94,6 +95,7 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
     results = []
 
     if is_flag_embedding_reranker(model_name):
+        print("Creating params for FlagEmbedding reranker")
         additional_params = dict()
         if is_llm_lightweight_reranker(model_name):
             additional_params["cutoff_layers"] = [28]
@@ -105,6 +107,7 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         return results
 
     for i in range(0, len(texts), batch_size):
+        print(f"Calculating ranks for batch {i}")
         batch_texts = texts[i:i + batch_size]
         tokens = tokenizer(
             batch_texts,
@@ -113,9 +116,13 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
             truncation=True,
             return_tensors="pt"
         ).to("cuda")
+        print("Moved tokens to GPU")
         output = model(**tokens)
+        print("Calculated reranker output")
         batch_results = output.logits.detach().cpu().float().numpy()
+        print("Moved logits to batch_results")
         results.append(batch_results)
+        print("Added batch_results to the list")
 
     results = np.concatenate(results, axis=0)
     results = np.squeeze(results)
