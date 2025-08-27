@@ -7,8 +7,14 @@ services:
       target: dev
     volumes:
       - ./app_code:${CODE_DIRECTORY}
+      - hf_cache:/cache/hf
     env_file:
       - .env
+    environment:
+      - HF_HOME=/cache/hf
+      - HF_HUB_CACHE=/cache/hf/hub
+      - HF_DATASETS_CACHE=/cache/hf/datasets
+      - HF_STREAM_CACHE=/cache/hf/stream   # dla streamingu (fsspec simplecache)
     tty: true
     deploy:
       resources:
@@ -28,4 +34,5 @@ services:
       - 6334
     volumes:
       - ./qdrant_storage:/qdrant/storage
-
+volumes:
+  hf_cache:
