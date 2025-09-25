@@ -7,16 +7,16 @@ import numpy as np
 import torch
 
 class SpladeEmbedding(SparseEmbeddings):
-    def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)):
+    def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForMaskedLM.from_pretrained(model_name,
-                                                          device_map='cuda', torch_dtype=torch.float16)
+                                                          device_map=f'cuda:{gpu_id}', torch_dtype=torch.float16)
         self.model.eval()
-        self.device = torch.device("cuda")
+        self.device = torch.device(f"cuda:{gpu_id}")
         self.batch_size = batch_size
 
     def _encode_splade_batch(self, texts: list[str]) -> list[SparseVector]:
-        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=512).to(
+        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=config("EMBEDDER_MAX_LENGTH", cast=int, default=None)).to(
             self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -45,17 +45,21 @@ class SpladeEmbedding(SparseEmbeddings):
         return results
 
 
-def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int)) -> SpladeEmbedding:
-    return SpladeEmbedding(model_name, batch_size=batch_size)
+def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0) -> SpladeEmbedding:
+    return SpladeEmbedding(model_name, batch_size=batch_size, gpu_id=gpu_id)
 
 
-def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int),
+def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0,
                     prompt="") -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={'model_kwargs': {'torch_dtype': torch.bfloat16}},
-        encode_kwargs={'batch_size': batch_size, 'prompt': prompt}
-    )
+    embeddings = HuggingFaceEmbeddings(model_name=model_name,
+                                       model_kwargs={'model_kwargs': {
+                                            'torch_dtype': torch.bfloat16,
+                                            'device_map': f'cuda:{gpu_id}',
+                                            }
+                                        },
+                                       encode_kwargs={'batch_size': batch_size, 'prompt': prompt})
+    embeddings._client.tokenizer.model_max_length = config("EMBEDDER_MAX_LENGTH", cast=int, default=None)
+    return embeddings
 
 
 def is_flag_embedding_reranker(model_name: str) -> bool:
@@ -66,14 +70,17 @@ def is_llm_lightweight_reranker(model_name: str) -> bool:
     return model_name.endswith("lightweight")
 
 
-def get_reranker_model(model_name: str = config("RERANKER_NAME")):
+def get_reranker_model(model_name: str = config("RERANKER_NAME"), gpu_id: int = 0):
     if is_flag_embedding_reranker(model_name):
         from FlagEmbedding import FlagAutoReranker
-        num_gpus = torch.cuda.device_count()
-        devices = [f"cuda:{i}" for i in range(num_gpus)]
-        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices)
+        devices = [f"cuda:{gpu_id}"]
+        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, max_legnth=config("RERANKER_MAX_LENGTH"))
+        # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    print(f"Using {torch.cuda.device_count()} GPUs for reranker model")
+
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -91,12 +98,12 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         texts = [[q, answer] for q, answer in zip(query, answers)]
 
     results = []
-
+    print(f"Reranking {len(texts)} texts with batch size {batch_size} using model {model_name}")
     if is_flag_embedding_reranker(model_name):
         additional_params = dict()
         if is_llm_lightweight_reranker(model_name):
             additional_params["cutoff_layers"] = [28]
-            additional_params["compress_ratio"] = [2]
+            additional_params["compress_ratio"] = 2
             additional_params["compress_layers"] = [24, 40]
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i + batch_size]
@@ -108,7 +115,7 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         tokens = tokenizer(
             batch_texts,
             padding="longest",
-            max_length=512,
+            max_length=config("RERANKER_MAX_LENGTH", cast=int, default=None),
             truncation=True,
             return_tensors="pt"
         ).to("cuda")

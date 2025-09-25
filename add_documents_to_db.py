@@ -1,4 +1,5 @@
 import argparse
+import logging
 from models import get_dense_model, get_sparse_model
 from langchain_qdrant import QdrantVectorStore
 from langchain_qdrant.qdrant import RetrievalMode
@@ -6,21 +7,27 @@ from langchain_core.documents import Document
 from qdrant_client.http.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client import QdrantClient, models
 from decouple import config
+from utils.vdb import get_qdrant_client
 
 from datasets import Dataset
+
+# Suppress HTTP request logs from Qdrant client
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("qdrant_client").setLevel(logging.WARNING)
 
 def read_parquet_batches(file_path: str, batch_size: int):
     ds = Dataset.from_parquet(file_path)
     for batch in ds.iter(batch_size=batch_size):
         yield batch
 
-def process_file(dataset_path: str, database_path: str, dense_model_name: str, sparse_model_name:str,
+def process_file(dataset_path: str, dense_model_name: str, sparse_model_name:str,
                  batch_size: int, database_collection_name: str):
     dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
     sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=batch_size)
     dense_dim_size = len(dense_embeddings.embed_query("text"))
 
-    client = QdrantClient(path=database_path)
+    client = get_qdrant_client()
     create_collection_if_not_exists(client, database_collection_name, dense_dim_size)
     vectorstore = QdrantVectorStore(
         client=client,
@@ -76,7 +83,6 @@ def create_collection_if_not_exists(client, database_collection_name, dense_dim_
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")
     parser.add_argument("--dataset_path", type=str, required=False, help="Path to the input parquet file.", default=config("CORPUS_PATH"))
-    parser.add_argument("--database_path", type=str, required=False, help="Path to the qdrant output database", default="qdrant_db")
     parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default=config("SPLADE_MODEL_NAME"))
     parser.add_argument("--batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("EMBEDDER_BATCH_SIZE", cast=int))
@@ -84,5 +90,5 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    process_file(args.dataset_path, args.database_path, args.dense_model_name, args.sparse_model_name,
+    process_file(args.dataset_path, args.dense_model_name, args.sparse_model_name,
                  args.batch_size, args.database_collection_name)
