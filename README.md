@@ -3,7 +3,7 @@
 ### How to run?
 1. Create `.env` file - you can use `.env.example.base` with models based on "roberta base" or `.env.example.large` with models based on "roberta large".
 2. Run containers: `bash docker compose up`
-3. Run terminal in `miner` container: `bash docker exec -it miner /bin/bash`
+3. Run terminal in `miner` container: `bash docker exec -it -w /code miner /bin/bash`
 4. Prepare your data in proper form. You can run:
    - `python to_huggingface_dataset.py` to transform `data/input.jsonl` into parquets
    - `python msmarco_to_huggingface_dataset.py` to transform MS Marco into parquets
