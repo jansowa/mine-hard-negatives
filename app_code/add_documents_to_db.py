@@ -63,9 +63,7 @@ def load_all_existing_ids(client: QdrantClient, collection_name: str, page_limit
     return existing
 
 
-def filter_dataset_by_missing_ids(dataset_path: str, existing_ids: set[str], num_proc: int | None = None, batch_size: int = 10000) -> Dataset:
-    ds = Dataset.from_parquet(dataset_path)
-
+def filter_dataset_by_missing_ids_ds(ds: Dataset, existing_ids: set[str], num_proc: int | None = None, batch_size: int = 10000) -> Dataset:
     if not existing_ids:
         return ds
 
@@ -81,17 +79,33 @@ def filter_dataset_by_missing_ids(dataset_path: str, existing_ids: set[str], num
 
 
 def process_file(dataset_path: str, dense_model_name: str, sparse_model_name: str,
-                 batch_size: int, database_collection_name: str) -> None:
+                 batch_size: int, database_collection_name: str,
+                 skip: int = 0, offset: int | None = None) -> None:
     client = get_qdrant_client()
 
+    ds_all = Dataset.from_parquet(dataset_path)
+    total_in_parquet = len(ds_all)
+
+    if skip < 0:
+        skip = 0
+    if skip >= total_in_parquet:
+        print(f"Corpus items in parquet: {total_in_parquet}")
+        print(f"Requested window starts beyond dataset length (skip={skip}). Nothing to do. Exiting.")
+        return
+
+    end_idx = total_in_parquet if offset is None else min(total_in_parquet, skip + max(offset, 0))
+    indices = list(range(skip, end_idx))
+    ds_window = ds_all.select(indices)
+    window_size = len(ds_window)
+
     existing_ids = load_all_existing_ids(client, database_collection_name)
-    ds_filtered = filter_dataset_by_missing_ids(dataset_path, existing_ids)
-    total_in_parquet = len(Dataset.from_parquet(dataset_path))
+    ds_filtered = filter_dataset_by_missing_ids_ds(ds_window, existing_ids)
     to_add_total = len(ds_filtered)
 
     print(f"Corpus items in parquet: {total_in_parquet}")
+    print(f"Selected window (skip={skip}, offset={offset}): {window_size}")
     print(f"Already present in Qdrant ({database_collection_name}): {len(existing_ids)}")
-    print(f"Will add (after filtering): {to_add_total}")
+    print(f"Will add from selected window (after filtering): {to_add_total}")
 
     if to_add_total == 0:
         print("Nothing to add. Exiting.")
@@ -157,14 +171,23 @@ def create_collection_if_not_exists(client: QdrantClient, collection_name: str, 
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")
+    parser = argparse.ArgumentParser(description="Add documents to Qdrant with optional skip/offset windowing.")
     parser.add_argument("--dataset_path", type=str, required=False, help="Path to the input parquet file.", default=config("CORPUS_PATH"))
     parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default=config("SPLADE_MODEL_NAME"))
     parser.add_argument("--batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("EMBEDDER_BATCH_SIZE", cast=int))
     parser.add_argument("--database_collection_name", type=str, required=False, help="Name of database collection", default="all_documents")
+    parser.add_argument("--skip", type=int, required=False, default=0, help="How many initial items to skip in the parquet before processing.")
+    parser.add_argument("--offset", type=int, required=False, default=None, help="How many items in total to process from the parquet window (after skip). If omitted, process to the end.")
 
     args = parser.parse_args()
 
-    process_file(args.dataset_path, args.dense_model_name, args.sparse_model_name,
-                 args.batch_size, args.database_collection_name)
+    process_file(
+        dataset_path=args.dataset_path,
+        dense_model_name=args.dense_model_name,
+        sparse_model_name=args.sparse_model_name,
+        batch_size=args.batch_size,
+        database_collection_name=args.database_collection_name,
+        skip=args.skip,
+        offset=args.offset,
+    )
