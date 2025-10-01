@@ -63,11 +63,11 @@ def add_documents(input_file: str, batch_size: int, vectorstore: QdrantVectorSto
                     metadata={"document_id": doc_id}
                 ))
             if documents:
-                vectorstore.add_documents(documents=documents)
+                vectorstore.add_documents(documents=documents, wait=False)
                 pbar.update(len(documents))
 
 
-def create_collection_if_not_exists(client, database_collection_name, dense_dim_size):
+def create_collection_if_not_exists(client, database_collection_name, dense_dim_size) -> None:
     if not client.collection_exists(collection_name=database_collection_name):
         client.create_collection(
             collection_name=database_collection_name,
