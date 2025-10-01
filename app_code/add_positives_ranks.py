@@ -1,12 +1,57 @@
 import os
 import argparse
-from typing import Optional
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from models import get_reranker_model, rerank
 from decouple import config
+import uuid
+import glob
+import shutil
+
+def _list_parts(parts_dir: str) -> list[str]:
+    parts = sorted(glob.glob(os.path.join(parts_dir, "part_*.parquet")))
+    return parts
+
+def _finalize_single_file(parts_dir: str, output_path: str, schema: pa.schema, compression: str = "zstd") -> None:
+    parts = _list_parts(parts_dir)
+    if not parts:
+        print(f"[Finalize] No parts found in: {parts_dir}")
+        return
+
+    print(f"[Finalize] Merging {len(parts)} parts into: {output_path}")
+
+    temp_out = f"{output_path}.tmp-{uuid.uuid4().hex}"
+    if os.path.exists(temp_out):
+        os.remove(temp_out)
+
+    writer = pq.ParquetWriter(temp_out, schema=schema, compression=compression, use_dictionary=True)
+
+    try:
+        with tqdm(total=len(parts), desc="Finalizing (merging parts)", unit="part") as pbar:
+            for part_path in parts:
+                table = pq.read_table(part_path)
+                if table.schema != schema:
+                    table = table.cast(schema)
+                writer.write_table(table)
+                pbar.update(1)
+        writer.close()
+        os.replace(temp_out, output_path)
+        print(f"[Finalize] Final file saved at: {output_path}")
+
+        print(f"[Finalize] Removed parts directory: {parts_dir}")
+        shutil.rmtree(parts_dir, ignore_errors=True)
+
+    except Exception as e:
+        try:
+            if writer and writer.is_open:
+                writer.close()
+        except Exception:
+            pass
+        if os.path.exists(temp_out):
+            os.remove(temp_out)
+        raise e
 
 def process_relevant(
     queries_path: str,
@@ -18,8 +63,9 @@ def process_relevant(
     reranker_model_name: str
 ) -> None:
     output_dir: str = os.path.dirname(output_path) if output_path else "."
+    parts_dir: str = f"{output_path}.parts"
 
-    print("Starting creation of relevant_with_score.parquet file...")
+    print("Starting creation of relevant_with_score dataset (crash-safe, multi-file)...")
 
     try:
         print(f"Loading data from:\n - {queries_path} (columns: id, text)\n - {corpus_path} (columns: id, text)")
@@ -32,109 +78,107 @@ def process_relevant(
         print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
 
         tokenizer, reranker = get_reranker_model(reranker_model_name)
-        print(f"Reranker loaded.")
+        print("Reranker loaded.")
 
         relevant_extended_schema: pa.Schema = pa.schema([
             ('query_id', pa.int32()),
             ('document_id', pa.int32()),
             ('positive_ranking', pa.float32())
         ])
-        print("Schema for the output file defined.")
+        print("Schema for output parts defined.")
 
         if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
             print(f"Created output directory: {output_dir}")
+        os.makedirs(parts_dir, exist_ok=True)
+        print(f"Parts will be written to: {parts_dir}")
 
-        writer: Optional[pq.ParquetWriter] = pq.ParquetWriter(output_path, relevant_extended_schema)
-        print(f"Started writing to file: {output_path}")
-
-        print(f"Processing file {relevant_path} in chunks of size {chunk_size}...")
         parquet_file_relevant = pq.ParquetFile(relevant_path)
-        total_batches: int = parquet_file_relevant.num_row_groups
-        print(f"Total number of batches in relevant.parquet: {total_batches}")
+        total_rows: int = parquet_file_relevant.metadata.num_rows
+        print(f"Total rows in relevant.parquet: {total_rows:,}")
+
         processed_pairs_count: int = 0
+        part_idx: int = 0
 
-        for i, batch in enumerate(
-            tqdm(
-                parquet_file_relevant.iter_batches(batch_size=chunk_size, columns=['query_id', 'document_id']),
-                desc="Processing relevant.parquet chunks"
-            )):
-            relevant_chunk_df: pd.DataFrame = batch.to_pandas()
-            print(f"Processing chunk {i+1} ({len(relevant_chunk_df)} rows)...")
+        with tqdm(total=total_rows, unit="row", desc="Scoring & writing") as pbar:
+            for batch in parquet_file_relevant.iter_batches(
+                batch_size=chunk_size,
+                columns=['query_id', 'document_id']
+            ):
+                relevant_chunk_df: pd.DataFrame = batch.to_pandas()
+                pbar.update(len(relevant_chunk_df))
 
-            if relevant_chunk_df.empty:
-                continue
+                if relevant_chunk_df.empty:
+                    continue
 
-            merged_chunk_df: pd.DataFrame = pd.merge(
-                relevant_chunk_df, queries_df,
-                left_on='query_id', right_index=True, how='inner'
-            )
-            merged_chunk_df = pd.merge(
-                merged_chunk_df, corpus_df,
-                left_on='document_id', right_index=True, how='inner'
-            )
-            if merged_chunk_df.empty:
-                continue
-            
-            scores_chunk = rerank(
-                tokenizer, reranker,
-                merged_chunk_df['query_text'].values.tolist(),
-                merged_chunk_df['document_text'].values.tolist(),
-                batch_size=reranker_batch_size
-            )
-            
+                merged_chunk_df: pd.DataFrame = pd.merge(
+                    relevant_chunk_df, queries_df,
+                    left_on='query_id', right_index=True, how='inner'
+                )
+                merged_chunk_df = pd.merge(
+                    merged_chunk_df, corpus_df,
+                    left_on='document_id', right_index=True, how='inner'
+                )
+                if merged_chunk_df.empty:
+                    continue
 
-            print(f"Chunk {i+1} processed: {len(scores_chunk)} scores generated.")
-            result_chunk_df: pd.DataFrame = pd.DataFrame({
-                'query_id': merged_chunk_df['query_id'],
-                'document_id': merged_chunk_df['document_id'],
-                'positive_ranking': scores_chunk
-            })
-            print(f"Result chunk DataFrame shape: {result_chunk_df.shape}")
+                scores_chunk = rerank(
+                    tokenizer, reranker,
+                    merged_chunk_df['query_text'].values.tolist(),
+                    merged_chunk_df['document_text'].values.tolist(),
+                    batch_size=reranker_batch_size
+                )
 
-            result_table_chunk: pa.Table = pa.Table.from_pandas(result_chunk_df, schema=relevant_extended_schema, preserve_index=False)
-            writer.write_table(result_table_chunk)
-            processed_pairs_count += len(result_chunk_df)
+                result_chunk_df: pd.DataFrame = pd.DataFrame({
+                    'query_id': merged_chunk_df['query_id'].astype('int32', copy=False),
+                    'document_id': merged_chunk_df['document_id'].astype('int32', copy=False),
+                    'positive_ranking': pd.Series(scores_chunk, dtype='float32')
+                })
 
-            del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
+                result_table_chunk: pa.Table = pa.Table.from_pandas(
+                    result_chunk_df,
+                    schema=relevant_extended_schema,
+                    preserve_index=False
+                )
 
-        writer.close()
-        print(f"\nSuccessfully created file: {output_path}")
-        print(f"Processed and saved a total of {processed_pairs_count} question-document pairs.")
+                part_idx += 1
+                part_filename = f"part_{part_idx:06d}.parquet"
+                temp_path = os.path.join(parts_dir, f".{part_filename}.tmp-{uuid.uuid4().hex}")
+                final_path = os.path.join(parts_dir, part_filename)
 
-        if processed_pairs_count > 0:
-            print("\nPreview of the first 5 rows of relevant with score parquet file:")
-            print(pd.read_parquet(output_path).head())
-        else:
-            print("No pairs were processed, the output file may be empty or contain no data.")
+                pq.write_table(
+                    result_table_chunk,
+                    temp_path,
+                    compression="zstd",
+                    use_dictionary=True
+                )
+                os.replace(temp_path, final_path)
+                processed_pairs_count += len(result_chunk_df)
 
-    except FileNotFoundError as e:
-        print(f"ERROR: One of the input files was not found: {e}. Make sure the files exist at the specified paths.")
-    except KeyError as e:
-        print(f"ERROR: Missing expected column in one of the Parquet files: {e}. Check the structure of the input files.")
-    except AttributeError as e:
-        if 'reranker' in str(e) and hasattr(e, 'obj') and e.obj is None:
-            print(f"ERROR: The 'reranker' object was not properly initialized (is None). Details: {e}")
-        elif 'reranker' in str(e):
-            print(f"ERROR: Problem with the 'reranker' object. Make sure it is properly loaded and has a 'predict' method. Details: {e}")
-        else:
-            print(f"ERROR: An attribute problem occurred: {e}")
+                del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
+
+        print(f"\nDone. Wrote {processed_pairs_count:,} scored pairs into parts directory:")
+        print(f"  {parts_dir}")
+
+        print("\n[Finalize] Starting finalization into a single file...")
+        _finalize_single_file(
+            parts_dir=parts_dir,
+            output_path=output_path,
+            schema=relevant_extended_schema,
+            compression="zstd"
+        )
+
     except Exception as e:
         import traceback
-        print(f"ERROR: An unexpected error occurred during processing: {e}")
-        print("Traceback:")
+        print(f"ERROR: {e}")
         traceback.print_exc()
-    finally:
-        if 'writer' in locals() and writer is not None and writer.is_open:
-            writer.close()
-            print("ParquetWriter was closed in the finally block.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scoring relevant pairs and saving to Parquet.")
+    parser = argparse.ArgumentParser(description="Scoring relevant pairs and saving to Parquet (crash-safe, with finalization).")
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Path to parquet file with queries")
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Path to parquet file with corpus")
     parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"), help="Path to parquet file with relevant connections")
-    parser.add_argument("--output_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Path to output parquet file (relevant with positive scores)")
+    parser.add_argument("--output_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Base path for output (final file will be at output_path)")
     parser.add_argument("--chunk_size", type=int, default=config("PROCESSING_CHUNK_SIZE", cast=int), help="Chunk size for processing")
     parser.add_argument("--reranker_batch_size", type=int, default=config("RERANKER_BATCH_SIZE", cast=int), help="Batch size for reranker")
     parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"), help="Name of the reranker model")

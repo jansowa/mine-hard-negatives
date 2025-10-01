@@ -98,7 +98,6 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
         texts = [[q, answer] for q, answer in zip(query, answers)]
 
     results = []
-    print(f"Reranking {len(texts)} texts with batch size {batch_size} using model {model_name}")
     if is_flag_embedding_reranker(model_name):
         additional_params = dict()
         if is_llm_lightweight_reranker(model_name):

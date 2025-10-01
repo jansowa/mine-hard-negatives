@@ -7,6 +7,7 @@
 4. Prepare your data in proper form. You can run:
    - `python to_huggingface_dataset.py` to transform `data/input.jsonl` into parquets
    - `python msmarco_to_huggingface_dataset.py` to transform MS Marco into parquets
+   - `python clips_mqa_to_huggingface_dataset.py` to transform `clips/mqa` into parquets (only split `pl-faq-question`) 
 
    This script will generate the files `corpus.parquet`, `queries.parquet`, and `relevant.parquet` in the `data` folder.  
    Expected structure:  
