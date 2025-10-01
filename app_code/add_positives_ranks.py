@@ -29,6 +29,7 @@ def process_relevant(
         corpus_df: pd.DataFrame = pd.read_parquet(corpus_path, columns=['id', 'text'])
         corpus_df = corpus_df.rename(columns={'text': 'document_text'}).set_index('id')
         print("Files queries.parquet and corpus.parquet loaded and prepared.")
+        print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
 
         tokenizer, reranker = get_reranker_model(reranker_model_name)
         print(f"Reranker loaded.")
@@ -50,7 +51,7 @@ def process_relevant(
         print(f"Processing file {relevant_path} in chunks of size {chunk_size}...")
         parquet_file_relevant = pq.ParquetFile(relevant_path)
         total_batches: int = parquet_file_relevant.num_row_groups
-
+        print(f"Total number of batches in relevant.parquet: {total_batches}")
         processed_pairs_count: int = 0
 
         for i, batch in enumerate(
@@ -74,19 +75,23 @@ def process_relevant(
             )
             if merged_chunk_df.empty:
                 continue
-
+            
             scores_chunk = rerank(
                 tokenizer, reranker,
                 merged_chunk_df['query_text'].values.tolist(),
                 merged_chunk_df['document_text'].values.tolist(),
                 batch_size=reranker_batch_size
             )
+            
 
+            print(f"Chunk {i+1} processed: {len(scores_chunk)} scores generated.")
             result_chunk_df: pd.DataFrame = pd.DataFrame({
                 'query_id': merged_chunk_df['query_id'],
                 'document_id': merged_chunk_df['document_id'],
                 'positive_ranking': scores_chunk
             })
+            print(f"Result chunk DataFrame shape: {result_chunk_df.shape}")
+
             result_table_chunk: pa.Table = pa.Table.from_pandas(result_chunk_df, schema=relevant_extended_schema, preserve_index=False)
             writer.write_table(result_table_chunk)
             processed_pairs_count += len(result_chunk_df)

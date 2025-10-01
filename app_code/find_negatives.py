@@ -6,6 +6,13 @@ import pandas as pd
 from decouple import config
 import pyarrow as pa
 import pyarrow.parquet as pq
+from utils.vdb import get_qdrant_client
+import logging
+
+# Suppress HTTP request logs from Qdrant client
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("qdrant_client").setLevel(logging.WARNING)
 
 
 def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch_size: int, reranker_model_name: str, reranker_batch_size: int, processing_batch_size: int, collection_name: str, database_path: str, queries_path: str, relevant_path: str, output_path: str, top_k: int):
@@ -13,7 +20,7 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
     print("Loaded dense embeddings")
     sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=embedding_batch_size)
     print("Loaded sparse embeddings")
-    client = QdrantClient(path=database_path)
+    client = get_qdrant_client()
     print("Loaded database")
     vector_store = QdrantVectorStore(
         client=client,
@@ -78,7 +85,7 @@ def find_negatives(dense_model_name: str, sparse_model_name:str, embedding_batch
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Assign unique IDs to each input.")
     parser.add_argument("--dense_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("DENSE_EMBEDDER_NAME"))
-    parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default="sdadas/polish-splade")
+    parser.add_argument("--sparse_model_name", type=str, required=False, help="Name of sparse model to calculate embeddings", default=config("SPLADE_MODEL_NAME"))
     parser.add_argument("--embedding_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("EMBEDDER_BATCH_SIZE", cast=int))
     parser.add_argument("--reranker_model_name", type=str, required=False, help="Name of dense model to calculate embeddings", default=config("RERANKER_NAME"))
     parser.add_argument("--reranker_batch_size", type=int, required=False, help="Number of documents in one embeddings model batch", default=config("RERANKER_BATCH_SIZE", cast=int))
