@@ -1,4 +1,6 @@
 .ipynb_checkpoints
 .idea
 .env
+qdrant_storage
+app_code/data
 __pycache__
