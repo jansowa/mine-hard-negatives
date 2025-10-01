@@ -9,6 +9,7 @@ from decouple import config
 import uuid
 import glob
 import shutil
+from typing import Iterable
 
 def _list_parts(parts_dir: str) -> list[str]:
     parts = sorted(glob.glob(os.path.join(parts_dir, "part_*.parquet")))
@@ -53,6 +54,37 @@ def _finalize_single_file(parts_dir: str, output_path: str, schema: pa.schema, c
             os.remove(temp_out)
         raise e
 
+def _pack_pair(query_id: int, document_id: int) -> int:
+    # pack two signed 32-bit ints into one 64-bit key
+    return (int(query_id) & 0xFFFFFFFF) << 32 | (int(document_id) & 0xFFFFFFFF)
+
+def _load_scored_pairs_from_files(paths: Iterable[str]) -> set[int]:
+    scored: set[int] = set()
+    for p in paths:
+        try:
+            pf = pq.ParquetFile(p)
+        except Exception:
+            continue
+        for batch in pf.iter_batches(columns=["query_id", "document_id"], batch_size=200_000):
+            tbl = pa.Table.from_batches([batch])
+            q = tbl.column("query_id").to_pylist()
+            d = tbl.column("document_id").to_pylist()
+            for qi, di in zip(q, d):
+                scored.add(_pack_pair(qi, di))
+    return scored
+
+def _load_scored_pairs(output_path: str) -> set[int]:
+    parts_dir = f"{output_path}.parts"
+    paths: list[str] = []
+    if os.path.isdir(parts_dir):
+        paths.extend(_list_parts(parts_dir))
+    if os.path.isfile(output_path):
+        paths.append(output_path)
+    if not paths:
+        return set()
+    print(f"Scanning already-scored pairs from {len(paths)} file(s)...")
+    return _load_scored_pairs_from_files(paths)
+
 def process_relevant(
     queries_path: str,
     corpus_path: str,
@@ -77,6 +109,13 @@ def process_relevant(
         print("Files queries.parquet and corpus.parquet loaded and prepared.")
         print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
 
+        already_scored_pairs: set[int] = _load_scored_pairs(output_path)
+        already_scored_count = len(already_scored_pairs)
+        if already_scored_count:
+            print(f"Found {already_scored_count:,} previously scored unique pairs.")
+        else:
+            print("Found 0 previously scored pairs.")
+
         tokenizer, reranker = get_reranker_model(reranker_model_name)
         print("Reranker loaded.")
 
@@ -95,24 +134,36 @@ def process_relevant(
 
         parquet_file_relevant = pq.ParquetFile(relevant_path)
         total_rows: int = parquet_file_relevant.metadata.num_rows
-        print(f"Total rows in relevant.parquet: {total_rows:,}")
+        to_compute_estimated = max(0, total_rows - min(total_rows, already_scored_count))
+        print(f"Total pairs in relevant.parquet: {total_rows:,}")
+        print(f"Previously scored pairs: {already_scored_count:,}")
+        print(f"Pairs to be scored now (estimated): {to_compute_estimated:,}")
 
         processed_pairs_count: int = 0
         part_idx: int = 0
 
-        with tqdm(total=total_rows, unit="row", desc="Scoring & writing") as pbar:
+        with tqdm(total=to_compute_estimated, unit="row", desc="Scoring & writing new pairs") as pbar:
             for batch in parquet_file_relevant.iter_batches(
                 batch_size=chunk_size,
                 columns=['query_id', 'document_id']
             ):
                 relevant_chunk_df: pd.DataFrame = batch.to_pandas()
-                pbar.update(len(relevant_chunk_df))
 
                 if relevant_chunk_df.empty:
                     continue
 
+                # filter out pairs that already have a score
+                packed = (_pack_pair(q, d) for q, d in zip(relevant_chunk_df['query_id'].values,
+                                                          relevant_chunk_df['document_id'].values))
+                mask = [k not in already_scored_pairs for k in packed]
+                new_pairs_df = relevant_chunk_df.loc[mask]
+                if new_pairs_df.empty:
+                    continue
+
+                pbar.update(len(new_pairs_df))
+
                 merged_chunk_df: pd.DataFrame = pd.merge(
-                    relevant_chunk_df, queries_df,
+                    new_pairs_df, queries_df,
                     left_on='query_id', right_index=True, how='inner'
                 )
                 merged_chunk_df = pd.merge(
@@ -155,9 +206,9 @@ def process_relevant(
                 os.replace(temp_path, final_path)
                 processed_pairs_count += len(result_chunk_df)
 
-                del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
+                del relevant_chunk_df, new_pairs_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
 
-        print(f"\nDone. Wrote {processed_pairs_count:,} scored pairs into parts directory:")
+        print(f"\nDone. Wrote {processed_pairs_count:,} newly scored pairs into parts directory:")
         print(f"  {parts_dir}")
 
         print("\n[Finalize] Starting finalization into a single file...")
