@@ -8,6 +8,7 @@ from qdrant_client.http.models import Distance, SparseVectorParams, VectorParams
 from qdrant_client import QdrantClient, models
 from decouple import config
 from utils.vdb import get_qdrant_client
+from tqdm import tqdm
 
 from datasets import Dataset
 
@@ -22,7 +23,7 @@ def read_parquet_batches(file_path: str, batch_size: int):
         yield batch
 
 def process_file(dataset_path: str, dense_model_name: str, sparse_model_name:str,
-                 batch_size: int, database_collection_name: str):
+                 batch_size: int, database_collection_name: str) -> None:
     dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
     sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=batch_size)
     dense_dim_size = len(dense_embeddings.embed_query("text"))
@@ -50,23 +51,20 @@ def get_points_number(client: QdrantClient, collection_name: str) -> int:
     ).count
 
 
-
-def add_documents(input_file: str, batch_size: int, vectorstore: QdrantVectorStore):
-
-    count=0
-    for batch in read_parquet_batches(input_file, batch_size):
-        documents: list[Document] = []
-        for content, doc_id in zip(batch['text'], batch['id']):
-            if not content:
-                continue
-            documents.append(Document(
-                page_content=content,
-                metadata={"document_id": doc_id}
-            ))
-        if documents:
-            vectorstore.add_documents(documents=documents)
-            count+=batch_size
-            print(f"{count} documents added")
+def add_documents(input_file: str, batch_size: int, vectorstore: QdrantVectorStore) -> None:
+    with tqdm(total=len(Dataset.from_parquet(input_file)), desc="Adding documents to vector database:") as pbar:
+        for batch in read_parquet_batches(input_file, batch_size):
+            documents: list[Document] = []
+            for content, doc_id in zip(batch['text'], batch['id']):
+                if not content:
+                    continue
+                documents.append(Document(
+                    page_content=content,
+                    metadata={"document_id": doc_id}
+                ))
+            if documents:
+                vectorstore.add_documents(documents=documents)
+                pbar.update(len(documents))
 
 
 def create_collection_if_not_exists(client, database_collection_name, dense_dim_size):
