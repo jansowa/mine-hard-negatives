@@ -9,7 +9,21 @@ from decouple import config
 import uuid
 import glob
 import shutil
-from typing import Iterable
+from typing import Iterable, Optional
+import re
+
+def _get_next_part_idx(parts_dir: str) -> int:
+    parts = _list_parts(parts_dir)
+    if not parts:
+        return 0
+    max_idx = 0
+    for p in parts:
+        m = re.search(r"part_(\d+)\.parquet$", os.path.basename(p))
+        if m:
+            idx = int(m.group(1))
+            if idx > max_idx:
+                max_idx = idx
+    return max_idx
 
 def _list_parts(parts_dir: str) -> list[str]:
     parts = sorted(glob.glob(os.path.join(parts_dir, "part_*.parquet")))
@@ -85,6 +99,90 @@ def _load_scored_pairs(output_path: str) -> set[int]:
     print(f"Scanning already-scored pairs from {len(paths)} file(s)...")
     return _load_scored_pairs_from_files(paths)
 
+def _filter_relevant_to_missing(
+    relevant_path: str,
+    already_scored_pairs: set[int],
+    skip: int,
+    offset: Optional[int],
+    tmp_dir: str,
+    chunk_size: int = 200_000,
+) -> tuple[str, int]:
+    pf = pq.ParquetFile(relevant_path)
+    total_rows = pf.metadata.num_rows
+
+    if skip < 0: skip = 0
+    if offset is not None and offset < 0: offset = 0
+
+    window_start = min(skip, total_rows)
+    window_end = total_rows if offset is None else min(total_rows, window_start + offset)
+    window_size = max(0, window_end - window_start)
+
+    print(f"Total pairs in relevant.parquet: {total_rows:,}")
+    if window_size:
+        print(f"Selected window (skip={skip}, offset={offset}): {window_size:,} rows "
+              f"[{window_start:,} .. {window_end-1:,}]")
+    else:
+        print(f"Selected window (skip={skip}, offset={offset}): 0 rows")
+
+    if window_size == 0:
+        return "", 0
+
+    filtered_schema = pa.schema([('query_id', pa.int32()), ('document_id', pa.int32())])
+    filtered_path = os.path.join(tmp_dir, f"filtered_{uuid.uuid4().hex}.parquet")
+    writer = pq.ParquetWriter(filtered_path, filtered_schema, compression="zstd", use_dictionary=True)
+
+    seen_rows = 0
+    kept = 0
+
+    try:
+        with tqdm(total=window_size, desc="Pre-filtering relevant (one-time)", unit="row") as pbar:
+            for batch in pf.iter_batches(batch_size=chunk_size, columns=['query_id', 'document_id']):
+                batch_len = batch.num_rows
+                batch_start = seen_rows
+                batch_end = seen_rows + batch_len
+                seen_rows = batch_end
+
+                if batch_end <= window_start or batch_start >= window_end:
+                    continue
+
+                local_start = max(0, window_start - batch_start)
+                local_end = min(batch_len, window_end - batch_start)
+                if local_start >= local_end:
+                    continue
+
+                sub = batch.slice(local_start, local_end - local_start)
+                df = sub.to_pandas()
+
+                if already_scored_pairs:
+                    packed = (_pack_pair(q, d) for q, d in zip(df['query_id'].values, df['document_id'].values))
+                    mask = [k not in already_scored_pairs for k in packed]
+                    df = df.loc[mask]
+
+                if not df.empty:
+                    df = df.astype({'query_id': 'int32', 'document_id': 'int32'}, copy=False)
+                    tbl = pa.Table.from_pandas(df, schema=filtered_schema, preserve_index=False)
+                    writer.write_table(tbl)
+                    kept += len(df)
+
+                pbar.update(local_end - local_start)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    if kept == 0:
+        try:
+            if os.path.exists(filtered_path):
+                os.remove(filtered_path)
+        except Exception:
+            pass
+        print("After pre-filtering: 0 rows remain to score.")
+        return "", 0
+
+    print(f"After pre-filtering: {kept:,} rows remain to score.")
+    return filtered_path, kept
+
 def process_relevant(
     queries_path: str,
     corpus_path: str,
@@ -92,10 +190,14 @@ def process_relevant(
     output_path: str,
     chunk_size: int,
     reranker_batch_size: int,
-    reranker_model_name: str
+    reranker_model_name: str,
+    skip: int = 0,
+    offset: Optional[int] = None,
 ) -> None:
     output_dir: str = os.path.dirname(output_path) if output_path else "."
     parts_dir: str = f"{output_path}.parts"
+    tmp_dir: str = os.path.join(output_dir or ".", ".tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     print("Starting creation of relevant_with_score dataset (crash-safe, multi-file)...")
 
@@ -116,6 +218,19 @@ def process_relevant(
         else:
             print("Found 0 previously scored pairs.")
 
+        filtered_relevant_path, rows_to_score = _filter_relevant_to_missing(
+            relevant_path=relevant_path,
+            already_scored_pairs=already_scored_pairs,
+            skip=skip,
+            offset=offset,
+            tmp_dir=tmp_dir,
+            chunk_size=chunk_size
+        )
+
+        if rows_to_score == 0:
+            print("Nothing to score after pre-filter. Exiting.")
+            return
+
         tokenizer, reranker = get_reranker_model(reranker_model_name)
         print("Reranker loaded.")
 
@@ -132,38 +247,19 @@ def process_relevant(
         os.makedirs(parts_dir, exist_ok=True)
         print(f"Parts will be written to: {parts_dir}")
 
-        parquet_file_relevant = pq.ParquetFile(relevant_path)
-        total_rows: int = parquet_file_relevant.metadata.num_rows
-        to_compute_estimated = max(0, total_rows - min(total_rows, already_scored_count))
-        print(f"Total pairs in relevant.parquet: {total_rows:,}")
-        print(f"Previously scored pairs: {already_scored_count:,}")
-        print(f"Pairs to be scored now (estimated): {to_compute_estimated:,}")
-
         processed_pairs_count: int = 0
-        part_idx: int = 0
+        part_idx: int = _get_next_part_idx(parts_dir)
 
-        with tqdm(total=to_compute_estimated, unit="row", desc="Scoring & writing new pairs") as pbar:
-            for batch in parquet_file_relevant.iter_batches(
-                batch_size=chunk_size,
-                columns=['query_id', 'document_id']
-            ):
+        pf_filtered = pq.ParquetFile(filtered_relevant_path)
+
+        with tqdm(total=rows_to_score, unit="row", desc="Scoring & writing (filtered)") as pbar:
+            for batch in pf_filtered.iter_batches(batch_size=chunk_size, columns=['query_id', 'document_id']):
                 relevant_chunk_df: pd.DataFrame = batch.to_pandas()
-
                 if relevant_chunk_df.empty:
                     continue
 
-                # filter out pairs that already have a score
-                packed = (_pack_pair(q, d) for q, d in zip(relevant_chunk_df['query_id'].values,
-                                                          relevant_chunk_df['document_id'].values))
-                mask = [k not in already_scored_pairs for k in packed]
-                new_pairs_df = relevant_chunk_df.loc[mask]
-                if new_pairs_df.empty:
-                    continue
-
-                pbar.update(len(new_pairs_df))
-
                 merged_chunk_df: pd.DataFrame = pd.merge(
-                    new_pairs_df, queries_df,
+                    relevant_chunk_df, queries_df,
                     left_on='query_id', right_index=True, how='inner'
                 )
                 merged_chunk_df = pd.merge(
@@ -171,6 +267,7 @@ def process_relevant(
                     left_on='document_id', right_index=True, how='inner'
                 )
                 if merged_chunk_df.empty:
+                    pbar.update(len(relevant_chunk_df))
                     continue
 
                 scores_chunk = rerank(
@@ -206,7 +303,9 @@ def process_relevant(
                 os.replace(temp_path, final_path)
                 processed_pairs_count += len(result_chunk_df)
 
-                del relevant_chunk_df, new_pairs_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
+                pbar.update(len(relevant_chunk_df))
+
+                del relevant_chunk_df, merged_chunk_df, scores_chunk, result_chunk_df, result_table_chunk
 
         print(f"\nDone. Wrote {processed_pairs_count:,} newly scored pairs into parts directory:")
         print(f"  {parts_dir}")
@@ -223,6 +322,12 @@ def process_relevant(
         import traceback
         print(f"ERROR: {e}")
         traceback.print_exc()
+    finally:
+        try:
+            if 'filtered_relevant_path' in locals() and filtered_relevant_path and os.path.exists(filtered_relevant_path):
+                os.remove(filtered_relevant_path)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scoring relevant pairs and saving to Parquet (crash-safe, with finalization).")
@@ -233,6 +338,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=config("PROCESSING_CHUNK_SIZE", cast=int), help="Chunk size for processing")
     parser.add_argument("--reranker_batch_size", type=int, default=config("RERANKER_BATCH_SIZE", cast=int), help="Batch size for reranker")
     parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"), help="Name of the reranker model")
+    parser.add_argument("--skip", type=int, default=0, help="How many initial items to skip in relevant_path (by position in the file).")
+    parser.add_argument("--offset", type=int, default=None, help="How many items in total to process from relevant_path window (after skip). If omitted, process to the end.")
     args = parser.parse_args()
 
     process_relevant(
@@ -242,5 +349,7 @@ if __name__ == "__main__":
         output_path=args.output_path,
         chunk_size=args.chunk_size,
         reranker_batch_size=args.reranker_batch_size,
-        reranker_model_name=args.reranker_model_name
+        reranker_model_name=args.reranker_model_name,
+        skip=args.skip,
+        offset=args.offset,
     )
