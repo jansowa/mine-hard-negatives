@@ -3,4 +3,5 @@
 .env
 qdrant_storage
 app_code/data
+app_code/logs
 __pycache__

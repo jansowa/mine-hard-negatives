@@ -1,20 +1,20 @@
-from models import get_dense_model, get_sparse_model, get_reranker_model, rerank
+from models import get_dense_model, get_sparse_model, rerank
 import argparse
 from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore, RetrievalMode
 import pandas as pd
 from decouple import config
-import pyarrow as pa
-import pyarrow.parquet as pq
 from utils.vdb import get_qdrant_client
 import torch
 import logging
 from datetime import datetime
 from multi_gpu_processor import MultiGPUNegativeFinder, setup_multi_gpu_models, should_resume_processing
 from tqdm import tqdm
+import os
 
 # Setup logging with same datetime-based filename as multi_gpu_processor
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+os.makedirs("logs", exist_ok=True)
 log_filename = f"logs/run_{current_time}.log"
 
 logging.basicConfig(
@@ -34,10 +34,10 @@ logging.getLogger("qdrant_client").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embedding_batch_size: int, 
-                           reranker_model_name: str, reranker_batch_size: int, 
-                           collection_name: str, database_path: str, queries_path: str, relevant_path: str, 
-                           output_path: str, top_k: int, force_resume: bool = None):
+def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embedding_batch_size: int,
+                            reranker_model_name: str, reranker_batch_size: int,
+                            collection_name: str, queries_path: str, relevant_path: str,
+                            output_path: str, top_k: int, force_resume: bool = None):
     
     # Check GPU availability
     num_gpus = torch.cuda.device_count()
@@ -52,8 +52,8 @@ def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embed
     
     # Setup multi-GPU models for processing (these can be on all GPUs)
     model_sets = setup_multi_gpu_models(
-        dense_model_name, sparse_model_name, reranker_model_name,
-        embedding_batch_size, config("DENSE_PROMPT"), models_per_gpu=1, logger=logger
+        reranker_model_name,
+        models_per_gpu=1, logger=logger
     )
     
     # Check if we should resume processing
@@ -81,7 +81,6 @@ def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embed
         sparse_vector_name="sparse"
     )
     
-    # Load and prepare data
     logger.info("Loading queries and relevance data")
     queries_df = pd.read_parquet(queries_path)
     relevant_df = pd.read_parquet(relevant_path)
@@ -160,9 +159,7 @@ if __name__ == '__main__':
                        default=config("RERANKER_BATCH_SIZE", cast=int))
     parser.add_argument("--database_collection_name", type=str, required=False, 
                        help="Name of database collection", default="all_documents")
-    parser.add_argument("--database_path", type=str, required=False, 
-                       help="Path to the database", default="qdrant_db")
-    parser.add_argument("--queries_path", type=str, required=False, 
+    parser.add_argument("--queries_path", type=str, required=False,
                        help="Path to the queries parquet file.", 
                        default=config("QUERIES_PATH"))
     parser.add_argument("--relevant_path", type=str, required=False, 
@@ -183,6 +180,6 @@ if __name__ == '__main__':
     find_negatives_multigpu(
         args.dense_model_name, args.sparse_model_name, args.embedding_batch_size, 
         args.reranker_model_name, args.reranker_batch_size,
-        args.database_collection_name, args.database_path, args.queries_path, 
+        args.database_collection_name, args.queries_path,
         args.relevant_path, args.output_path, args.top_k, args.resume
     )

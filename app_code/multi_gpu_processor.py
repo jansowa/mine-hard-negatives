@@ -1,8 +1,7 @@
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue, Empty  # Modified import
+from queue import Queue, Empty
 import time
-from typing import List, Callable, Any, Dict, Tuple
+from typing import List, Callable, Dict, Tuple
 import logging
 import torch
 import json
@@ -192,14 +191,12 @@ class MultiGPUNegativeFinder:
                                            f"({self.processed_queries/self.total_queries*100:.1f}%) | "
                                            f"Elapsed: {elapsed_str} | ETA: calculating...")
                 
-                # Update completion count
                 self.completed_batches += 1
                 
                 self.logger.debug(f"[GPU {model_set.gpu_id}] Query {query_id} completed "
                           f"in {processing_time:.2f}s, saved {len(batch_results)} results "
                           f"({self.completed_batches}/{self.total_batches} total)")
                 
-                # Mark task as done
                 self.query_queue.task_done()
                 
             except Empty:
@@ -216,7 +213,6 @@ class MultiGPUNegativeFinder:
         """Process all queries using available GPU model sets"""
         self.logger.info(f"[MAIN] Starting processing of {len(queries)} queries across {len(self.model_sets)} GPUs")
         
-        # Create batches
         self.create_batches(queries)
         
         # Start worker threads for each GPU model set
@@ -232,8 +228,8 @@ class MultiGPUNegativeFinder:
         
         # Wait for all batches to be processed
         start_time = time.time()
-        self.start_time = start_time  # Store for progress calculations
-        
+        self.start_time = start_time
+
         try:
             self.query_queue.join()
         except KeyboardInterrupt:
@@ -332,10 +328,10 @@ def should_resume_processing(output_path: str, model_sets: List[GPUModelSet]) ->
     return False
 
 
-def setup_multi_gpu_models(dense_model_name: str, sparse_model_name: str, reranker_model_name: str,
-                          embedding_batch_size: int, dense_prompt: str, models_per_gpu: int = 1, logger=None) -> List[GPUModelSet]:
+def setup_multi_gpu_models(reranker_model_name: str,
+                           models_per_gpu: int = 1, logger=None) -> List[GPUModelSet]:
     """Setup model sets across all available GPUs, with multiple model instances per GPU if desired"""
-    from models import get_dense_model, get_sparse_model, get_reranker_model
+    from models import get_reranker_model
     
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -350,12 +346,7 @@ def setup_multi_gpu_models(dense_model_name: str, sparse_model_name: str, rerank
     for gpu_id in range(num_gpus):
         for instance in range(models_per_gpu):
             logger.info(f"[GPU {gpu_id}] Loading models (instance {instance+1}/{models_per_gpu})")
-            # Load models on specific GPU
-            # dense_model = get_dense_model(dense_model_name, batch_size=embedding_batch_size, 
-            #                             prompt=dense_prompt, gpu_id=gpu_id)
-            # sparse_model = get_sparse_model(sparse_model_name, batch_size=embedding_batch_size, 
-            #                               gpu_id=gpu_id)
-            reranker_tokenizer, reranker_model = get_reranker_model(model_name=reranker_model_name, 
+            reranker_tokenizer, reranker_model = get_reranker_model(model_name=reranker_model_name,
                                                                   gpu_id=gpu_id)
             model_set = GPUModelSet(gpu_id, reranker_tokenizer, reranker_model, logger)
             model_sets.append(model_set)
