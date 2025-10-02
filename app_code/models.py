@@ -16,7 +16,7 @@ class SpladeEmbedding(SparseEmbeddings):
         self.batch_size = batch_size
 
     def _encode_splade_batch(self, texts: list[str]) -> list[SparseVector]:
-        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=config("EMBEDDER_MAX_LENGTH", cast=int, default=None)).to(
+        inputs = self.tokenizer(texts, padding="longest", truncation=True, return_tensors="pt", max_length=config("SPARSE_EMBEDDER_MAX_LENGTH", cast=int, default=None)).to(
             self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -58,7 +58,7 @@ def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SI
                                             }
                                         },
                                        encode_kwargs={'batch_size': batch_size, 'prompt': prompt})
-    embeddings._client.tokenizer.model_max_length = config("EMBEDDER_MAX_LENGTH", cast=int, default=None)
+    embeddings._client.tokenizer.model_max_length = config("DENSE_EMBEDDER_MAX_LENGTH", cast=int, default=None)
     return embeddings
 
 
