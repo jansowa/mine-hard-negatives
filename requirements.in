@@ -10,3 +10,5 @@ numpy
 torch
 accelerate
 FlagEmbedding
+rapidfuzz
+simhash
