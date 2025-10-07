@@ -7,47 +7,167 @@ import torch
 import json
 import os
 import pandas as pd
+import numpy as np
+from decouple import config
+import random
+
+from langchain_qdrant import QdrantVectorStore
+
 
 
 class GPUModelSet:
     """Represents a set of models (dense, sparse, reranker) running on a specific GPU"""
     
-    def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, logger=None):
+    def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, logger=None,
+                 skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int),
+                 beta: float = 0.4, u_floor: float = 0.1):
+
         self.gpu_id = gpu_id
         self.reranker_tokenizer = reranker_tokenizer
         self.reranker_model = reranker_model
         self.processed_batches = 0
         self.total_queries = 0
         self.logger = logger or logging.getLogger(__name__)
-    
-    def process_query_batch(self, query_batch: List[Dict], vector_store, rerank_function: Callable, 
-                           top_k: int, reranker_batch_size: int) -> List[Tuple]:
-        """Process a batch of queries to find negatives (typically 1 query for line-by-line processing)"""
-        
-        results = []
+        self.skip_if_not_in_top_k = skip_if_not_in_top_k
+
+        relevant_df = pd.read_parquet(config("RELEVANT_WITH_SCORE_PATH"))
+
+        if not {"query_id","document_id","positive_ranking"}.issubset(relevant_df.columns):
+            raise ValueError("Required columns are missing in Parquet for 'relevant with score'.")
+
+        scores = relevant_df["positive_ranking"].dropna().to_numpy()
+        scores.sort()
+        self._ecdf_x = scores
+        n = len(scores)
+        self._ecdf_y = np.linspace(0.0, 1.0, n) if n > 1 else np.array([1.0])
+
+        self.pos_score_by_qd = {
+            (int(row["query_id"]), int(row["document_id"])): float(row["positive_ranking"])
+            for _, row in relevant_df.iterrows()
+        }
+
+        self.beta = beta
+        self.u_floor = u_floor
+
+    def _percentile(self, s: np.ndarray) -> np.ndarray:
+        return np.interp(s, self._ecdf_x, self._ecdf_y, left=0.0, right=1.0)
+
+    def _is_negative_percentile(self, u_pos: float, u_doc: float) -> bool:
+        return (u_doc - u_pos) <= -self.beta or (u_doc <= self.u_floor)
+
+    def _search_with_offset_qdrant(self, vector_store: QdrantVectorStore, query_text: str, limit: int, offset: int):
+        return vector_store.similarity_search(query=query_text, k=limit, offset=offset)
+
+    def _random_sample_qdrant(self, vector_store, limit: int):
+        client = getattr(vector_store, "client", None) or getattr(vector_store, "_client", None)
+        collection = getattr(vector_store, "collection_name", None)
+        from langchain_core.documents import Document
+
+        if client is None or collection is None:
+            # Fallback: zrób zwykłe zapytanie z losowym bełkotem i weź top-k (nieidealne, ale proste)
+            docs = vector_store.as_retriever(search_kwargs={"k": limit}).invoke("random")
+            return docs
+
+        out = []
+        next_page = None
+        for _ in range(10):
+            resp = client.scroll(
+                collection_name=collection,
+                with_payload=True,
+                with_vectors=False,
+                limit=min(limit - len(out), 256),
+                offset=next_page
+            )
+            points, next_page = resp
+            random.shuffle(points)
+            for p in points:
+                payload = p.payload or {}
+                pc = payload.get("page_content") or payload.get("text") or ""
+                metadata = payload.get("metadata")
+                out.append(Document(page_content=pc, metadata=metadata))
+                if len(out) >= limit:
+                    break
+            if len(out) >= limit or next_page is None:
+                break
+        return out[:limit]
+
+    def process_query_batch(self, query_batch: List[Dict], vector_store, rerank_function: Callable,
+                            top_k: int, reranker_batch_size: int) -> List[Tuple]:
+        """
+        Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
+        until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
+        or completes 10 iterations; then it fetches an additional random 128 and stops.
+        Returns all (query_id, doc_id, score) collected during the process for each query.
+        """
+        NEG_TARGET = 20
+        CHUNK = 128
+        MAX_ITERS = 10
+
+        results: List[Tuple] = []
+
         for query_data in query_batch:
-            # Retrieve documents using the vector store
-            retrieved_docs = [
-                document for document in vector_store.as_retriever(search_kwargs={"k": top_k}).invoke(query_data['text'])
-                if document.metadata['document_id'] != query_data['document_id']
-            ]
-            
-            # Rerank the documents
-            if retrieved_docs:
-                ranking = rerank_function(
-                    self.reranker_tokenizer, 
-                    self.reranker_model, 
-                    query_data['text'],
-                    [document.page_content for document in retrieved_docs],
+            qtext = query_data["text"]
+            qid = int(query_data["query_id"])
+            pos_doc_id = int(query_data["document_id"])
+
+            s_pos = float(query_data["positive_ranking"])
+            u_pos = float(self._percentile(np.array([s_pos]))[0])
+
+            seen_ids: set[int] = set([pos_doc_id])
+            collected_docs = []
+            neg_count = 0
+
+            for n in range(MAX_ITERS):
+                offset = 0 if n == 0 else 2 ** (n + 7)
+                docs = self._search_with_offset_qdrant(vector_store, qtext, CHUNK, offset)
+
+                batch_docs = []
+                for d in docs:
+                    did = d.metadata.get("document_id")
+                    if did is None:
+                        continue
+                    if int(did) in seen_ids:
+                        continue
+                    seen_ids.add(int(did))
+                    batch_docs.append(d)
+
+                if not batch_docs:
+                    continue
+
+                batch_scores = rerank_function(
+                    self.reranker_tokenizer,
+                    self.reranker_model,
+                    qtext,
+                    [d.page_content for d in batch_docs],
                     batch_size=reranker_batch_size
                 )
-                
-                # Collect results
-                for document, rank in zip(retrieved_docs, ranking):
-                    results.append((query_data['query_id'], document.metadata['document_id'], rank))
-        
+
+                u_docs = self._percentile(np.array(batch_scores, dtype=float))
+                for d, s, u_d in zip(batch_docs, batch_scores, u_docs):
+                    collected_docs.append((qid, d.metadata["document_id"], float(s)))
+                    if self._is_negative_percentile(u_pos, float(u_d)):
+                        neg_count += 1
+
+                if neg_count >= NEG_TARGET:
+                    break
+
+            if neg_count < NEG_TARGET:
+                rand_docs = self._random_sample_qdrant(vector_store, CHUNK)
+                rand_docs = [d for d in rand_docs if int(d.metadata.get("document_id", -1)) not in seen_ids]
+                if rand_docs:
+                    rand_scores = rerank_function(
+                        self.reranker_tokenizer,
+                        self.reranker_model,
+                        qtext,
+                        [d.page_content for d in rand_docs],
+                        batch_size=reranker_batch_size
+                    )
+                    for d, s in zip(rand_docs, rand_scores):
+                        collected_docs.append((qid, d.metadata.get("document_id"), float(s)))
+
+            results.extend(collected_docs)
+
         self.total_queries += len(query_batch)
-        
         return results
 
 
@@ -203,7 +323,7 @@ class MultiGPUNegativeFinder:
                 self.logger.info(f"[GPU {model_set.gpu_id}] Worker found no more queries to process... quitting")
                 break
             except Exception as e:
-                self.logger.error(f"[GPU {model_set.gpu_id}] Worker error: {e}")
+                self.logger.error(f"[GPU {model_set.gpu_id}] Worker error:", exc_info=True)
                 break
         
         self.logger.info(f"[GPU {model_set.gpu_id}] Worker finished. Total results saved: {results_count}")

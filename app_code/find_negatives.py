@@ -1,6 +1,5 @@
 from models import get_dense_model, get_sparse_model, rerank
 import argparse
-from qdrant_client import QdrantClient
 from langchain_qdrant import QdrantVectorStore, RetrievalMode
 import pandas as pd
 from decouple import config
@@ -32,6 +31,75 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("qdrant_client").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+from qdrant_client import models
+
+class PatchedQdrantVectorStore(QdrantVectorStore):
+    """This class is introduced to fix problem related to empty results with offset>0"""
+    def similarity_search_with_score(
+        self, query: str, k: int = 4, filter=None, search_params=None,
+        offset: int = 0, score_threshold=None, consistency=None,
+        hybrid_fusion=None, **kwargs
+    ):
+        query_options = {
+            "collection_name": self.collection_name,
+            "query_filter": filter,
+            "search_params": search_params,
+            "limit": k,
+            "offset": offset,
+            "with_payload": True,
+            "with_vectors": False,
+            "score_threshold": score_threshold,
+            "consistency": consistency,
+            **kwargs,
+        }
+
+        if self.retrieval_mode == RetrievalMode.HYBRID:
+            q_dense = self.embeddings.embed_query(query)
+            q_sparse = self.sparse_embeddings.embed_query(query)
+
+            prefetch_limit = k + offset
+
+            results = self.client.query_points(
+                prefetch=[
+                    models.Prefetch(
+                        using=self.vector_name,
+                        query=q_dense,
+                        filter=filter,
+                        limit=prefetch_limit,
+                        params=search_params,
+                    ),
+                    models.Prefetch(
+                        using=self.sparse_vector_name,
+                        query=models.SparseVector(
+                            indices=q_sparse.indices,
+                            values=q_sparse.values,
+                        ),
+                        filter=filter,
+                        limit=prefetch_limit,
+                        params=search_params,
+                    ),
+                ],
+                query=hybrid_fusion or models.FusionQuery(fusion=models.Fusion.RRF),
+                **query_options,
+            ).points
+        else:
+            # oryginalne ścieżki DENSE/SPARSE bez zmian
+            return super().similarity_search_with_score(
+                query, k, filter, search_params, offset, score_threshold,
+                consistency, hybrid_fusion, **kwargs
+            )
+
+        return [
+            (
+                self._document_from_point(
+                    r, self.collection_name,
+                    self.content_payload_key, self.metadata_payload_key,
+                ),
+                r.score,
+            )
+            for r in results
+        ]
 
 
 def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embedding_batch_size: int,
@@ -71,7 +139,7 @@ def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embed
     # Setup vector store using dedicated models (on GPU 0)
     logger.info("Setting up vector store")
     client = get_qdrant_client()
-    vector_store = QdrantVectorStore(
+    vector_store = PatchedQdrantVectorStore(
         client=client,
         collection_name=collection_name,
         embedding=dense_model_vs,  # Dedicated model for vector store
@@ -87,6 +155,7 @@ def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embed
     
     # Get best positive for each query
     best_relevant_df = relevant_df.loc[relevant_df.groupby('query_id')['positive_ranking'].idxmax()]
+    print(f"{best_relevant_df.head()=}")
     positives_df = queries_df.merge(best_relevant_df, left_on='id', right_on="query_id").drop(columns="id")
     
     # Convert DataFrame to list of dictionaries for processing
@@ -95,6 +164,7 @@ def find_negatives_multigpu(dense_model_name: str, sparse_model_name: str, embed
         queries_list.append({
             'query_id': row['query_id'],
             'document_id': row['document_id'],
+            'positive_ranking': row['positive_ranking'],
             'text': row['text']
         })
     
