@@ -42,7 +42,7 @@ class GPUModelSet:
         self._ecdf_y = np.linspace(0.0, 1.0, n) if n > 1 else np.array([1.0])
 
         self.pos_score_by_qd = {
-            (int(row["query_id"]), int(row["document_id"])): float(row["positive_ranking"])
+            (str(row["query_id"]), str(row["document_id"])): float(row["positive_ranking"])
             for _, row in relevant_df.iterrows()
         }
 
@@ -92,7 +92,7 @@ class GPUModelSet:
         return out[:limit]
 
     def process_query_batch(self, query_batch: List[Dict], vector_store, rerank_function: Callable,
-                            top_k: int, reranker_batch_size: int) -> List[Tuple]:
+                            reranker_batch_size: int) -> List[Tuple]:
         """
         Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
         until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
@@ -107,13 +107,13 @@ class GPUModelSet:
 
         for query_data in query_batch:
             qtext = query_data["text"]
-            qid = int(query_data["query_id"])
-            pos_doc_id = int(query_data["document_id"])
+            qid = str(query_data["query_id"])
+            pos_doc_id = str(query_data["document_id"])
 
             s_pos = float(query_data["positive_ranking"])
             u_pos = float(self._percentile(np.array([s_pos]))[0])
 
-            seen_ids: set[int] = set([pos_doc_id])
+            seen_ids: set[str] = set([pos_doc_id])
             collected_docs = []
             neg_count = 0
 
@@ -126,9 +126,10 @@ class GPUModelSet:
                     did = d.metadata.get("document_id")
                     if did is None:
                         continue
-                    if int(did) in seen_ids:
+                    did = str(did)
+                    if did in seen_ids:
                         continue
-                    seen_ids.add(int(did))
+                    seen_ids.add(did)
                     batch_docs.append(d)
 
                 if not batch_docs:
@@ -144,7 +145,7 @@ class GPUModelSet:
 
                 u_docs = self._percentile(np.array(batch_scores, dtype=float))
                 for d, s, u_d in zip(batch_docs, batch_scores, u_docs):
-                    collected_docs.append((qid, d.metadata["document_id"], float(s)))
+                    collected_docs.append((qid, str(d.metadata["document_id"]), float(s)))
                     if self._is_negative_percentile(u_pos, float(u_d)):
                         neg_count += 1
 
@@ -153,7 +154,7 @@ class GPUModelSet:
 
             if neg_count < NEG_TARGET:
                 rand_docs = self._random_sample_qdrant(vector_store, CHUNK)
-                rand_docs = [d for d in rand_docs if int(d.metadata.get("document_id", -1)) not in seen_ids]
+                rand_docs = [d for d in rand_docs if str(d.metadata.get("document_id", "")) not in seen_ids]
                 if rand_docs:
                     rand_scores = rerank_function(
                         self.reranker_tokenizer,
@@ -163,7 +164,7 @@ class GPUModelSet:
                         batch_size=reranker_batch_size
                     )
                     for d, s in zip(rand_docs, rand_scores):
-                        collected_docs.append((qid, d.metadata.get("document_id"), float(s)))
+                        collected_docs.append((qid, str(d.metadata.get("document_id", "")), float(s)))
 
             results.extend(collected_docs)
 
@@ -227,8 +228,8 @@ class MultiGPUNegativeFinder:
         """Save a single result to worker's JSONL file"""
         
         result = {
-            "query_id": int(query_id),
-            "document_id": int(document_id), 
+            "query_id": str(query_id),
+            "document_id": str(document_id),
             "ranking": float(ranking)
         }
         
@@ -272,7 +273,7 @@ class MultiGPUNegativeFinder:
                 # Process the single query (query_batch contains only 1 query)
                 start_time = time.time()
                 batch_results = model_set.process_query_batch(
-                    query_batch, vector_store, rerank_function, top_k, reranker_batch_size
+                    query_batch, vector_store, rerank_function, reranker_batch_size
                 )
                 processing_time = time.time() - start_time
                 
@@ -406,7 +407,7 @@ class MultiGPUNegativeFinder:
             try:
                 # Convert to DataFrame and save as parquet
                 df = pd.DataFrame(all_results)
-                df = df.astype({"query_id": "int64", "document_id": "int64", "ranking": "float32"})
+                df = df.astype({"query_id": "string", "document_id": "string", "ranking": "float32"})
                 df.to_parquet(self.output_path, index=False)
                 self.logger.info(f"[MAIN] Saved {total_results} results to {self.output_path}")
                 self.logger.info(f"[MAIN] Worker files preserved at: {', '.join(self.worker_files)}")

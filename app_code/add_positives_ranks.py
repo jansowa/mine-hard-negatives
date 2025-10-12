@@ -68,9 +68,9 @@ def _finalize_single_file(parts_dir: str, output_path: str, schema: pa.schema, c
             os.remove(temp_out)
         raise e
 
-def _pack_pair(query_id: int, document_id: int) -> int:
+def _pack_pair(query_id: str, document_id: str) -> str:
     # pack two signed 32-bit ints into one 64-bit key
-    return (int(query_id) & 0xFFFFFFFF) << 32 | (int(document_id) & 0xFFFFFFFF)
+    return f"{str(query_id)}\t{str(document_id)}"
 
 def _load_scored_pairs_from_files(paths: Iterable[str]) -> set[int]:
     scored: set[int] = set()
@@ -127,7 +127,7 @@ def _filter_relevant_to_missing(
     if window_size == 0:
         return "", 0
 
-    filtered_schema = pa.schema([('query_id', pa.int32()), ('document_id', pa.int32())])
+    filtered_schema = pa.schema([('query_id', pa.string()), ('document_id', pa.string())])
     filtered_path = os.path.join(tmp_dir, f"filtered_{uuid.uuid4().hex}.parquet")
     writer = pq.ParquetWriter(filtered_path, filtered_schema, compression="zstd", use_dictionary=True)
 
@@ -159,7 +159,7 @@ def _filter_relevant_to_missing(
                     df = df.loc[mask]
 
                 if not df.empty:
-                    df = df.astype({'query_id': 'int32', 'document_id': 'int32'}, copy=False)
+                    df = df.astype({'query_id': 'string', 'document_id': 'string'}, copy=False)
                     tbl = pa.Table.from_pandas(df, schema=filtered_schema, preserve_index=False)
                     writer.write_table(tbl)
                     kept += len(df)
@@ -204,9 +204,11 @@ def process_relevant(
     try:
         print(f"Loading data from:\n - {queries_path} (columns: id, text)\n - {corpus_path} (columns: id, text)")
         queries_df: pd.DataFrame = pd.read_parquet(queries_path, columns=['id', 'text'])
+        queries_df['id'] = queries_df['id'].astype('string')
         queries_df = queries_df.rename(columns={'text': 'query_text'}).set_index('id')
 
         corpus_df: pd.DataFrame = pd.read_parquet(corpus_path, columns=['id', 'text'])
+        corpus_df['id'] = corpus_df['id'].astype('string')
         corpus_df = corpus_df.rename(columns={'text': 'document_text'}).set_index('id')
         print("Files queries.parquet and corpus.parquet loaded and prepared.")
         print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
@@ -235,8 +237,8 @@ def process_relevant(
         print("Reranker loaded.")
 
         relevant_extended_schema: pa.Schema = pa.schema([
-            ('query_id', pa.int32()),
-            ('document_id', pa.int32()),
+            ('query_id', pa.string()),
+            ('document_id', pa.string()),
             ('positive_ranking', pa.float32())
         ])
         print("Schema for output parts defined.")
@@ -278,8 +280,8 @@ def process_relevant(
                 )
 
                 result_chunk_df: pd.DataFrame = pd.DataFrame({
-                    'query_id': merged_chunk_df['query_id'].astype('int32', copy=False),
-                    'document_id': merged_chunk_df['document_id'].astype('int32', copy=False),
+                    'query_id': merged_chunk_df['query_id'].astype('string', copy=False),
+                    'document_id': merged_chunk_df['document_id'].astype('string', copy=False),
                     'positive_ranking': pd.Series(scores_chunk, dtype='float32')
                 })
 

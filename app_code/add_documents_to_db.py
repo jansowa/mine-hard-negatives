@@ -152,7 +152,7 @@ def add_documents_from_dataset(ds: Dataset, batch_size: int, vectorstore: Qdrant
                     continue
                 documents.append(Document(
                     page_content=content,
-                    metadata={"document_id": doc_id}
+                    metadata={"document_id": str(doc_id)}
                 ))
             if documents:
                 vectorstore.add_documents(documents=documents, wait=False)

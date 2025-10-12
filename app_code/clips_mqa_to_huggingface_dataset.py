@@ -17,9 +17,9 @@ def main(
     for path in [queries_path, corpus_path, relevant_path]:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    queries_schema: pa.Schema = pa.schema([("id", pa.int32()), ("text", pa.string())])
-    corpus_schema: pa.Schema = pa.schema([("id", pa.int32()), ("text", pa.string())])
-    relevant_schema: pa.Schema = pa.schema([("query_id", pa.int32()), ("document_id", pa.int32())])
+    queries_schema: pa.Schema = pa.schema([("id", pa.string()), ("text", pa.string())])
+    corpus_schema: pa.Schema = pa.schema([("id", pa.string()), ("text", pa.string())])
+    relevant_schema: pa.Schema = pa.schema([("query_id", pa.string()), ("document_id", pa.string())])
 
     queries_writer = None
     corpus_writer = None
@@ -36,7 +36,6 @@ def main(
         corpus_writer = pq.ParquetWriter(corpus_path, corpus_schema)
         relevant_writer = pq.ParquetWriter(relevant_path, relevant_schema)
 
-        next_query_id = 1
         next_doc_id = 1
 
         queries_batch = []
@@ -65,13 +64,12 @@ def main(
                 skipped_questions += 1
                 continue
 
-            q_id = next_query_id
+            q_id = str(item["id"])
             queries_batch.append({"id": q_id, "text": q_text})
-            next_query_id += 1
             kept_questions += 1
 
             for atext in accepted_answers:
-                d_id = next_doc_id
+                d_id = str(next_doc_id)
                 corpus_batch.append({"id": d_id, "text": atext})
                 relevant_batch.append({"query_id": q_id, "document_id": d_id})
                 next_doc_id += 1

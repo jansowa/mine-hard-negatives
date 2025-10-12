@@ -18,6 +18,13 @@ def process_negatives(
     relevant_df = pd.read_parquet(relevant_path)
     negatives_df = pd.read_parquet(negatives_path)
 
+    corpus_df["id"] = corpus_df["id"].astype("string")
+    queries_df["id"] = queries_df["id"].astype("string")
+    relevant_df["query_id"] = relevant_df["query_id"].astype("string")
+    relevant_df["document_id"] = relevant_df["document_id"].astype("string")
+    negatives_df["query_id"] = negatives_df["query_id"].astype("string")
+    negatives_df["document_id"] = negatives_df["document_id"].astype("string")
+
     corpus_dict = corpus_df.set_index("id")["text"].to_dict()
     queries_dict = queries_df.set_index("id")["text"].to_dict()
 
@@ -43,7 +50,7 @@ def process_negatives(
 
         if qid in negatives_grouped.groups:
             neg_rows = negatives_grouped.get_group(qid)
-            threshold = negatives_threshold * min_positive_score
+            threshold = min_positive_score - negatives_threshold
             filtered_negs = neg_rows[neg_rows["ranking"] < threshold]
             top_negs = filtered_negs.sort_values(by="ranking", ascending=False).head(num_negatives)
 
@@ -74,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--negatives_path", type=str, default=config("NEGATIVES_PATH"), help="Path to parquet file with negatives")
     parser.add_argument("--output_path", type=str, default=config("OUTPUT_PATH"), help="Path to output parquet file")
     parser.add_argument("--num_negatives", type=int, default=config("NUM_NEGATIVES", cast=int), help="Number of negatives for each question")
-    parser.add_argument("--negatives_threshold", type=float, default=config("NEGATIVES_THRESHOLD", cast=float), help="Threshold for negatives (percent of the minimum positive)")
+    parser.add_argument("--negatives_threshold", type=float, default=config("NEGATIVES_THRESHOLD", cast=float), help="Threshold for negatives (subtraction type)")
     args = parser.parse_args()
 
     process_negatives(
