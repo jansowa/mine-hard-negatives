@@ -1,6 +1,7 @@
 langchain-qdrant
 langchain-core
 qdrant-client
+lancedb
 python-decouple
 datasets
 pandas
@@ -12,3 +13,4 @@ accelerate
 FlagEmbedding
 rapidfuzz
 simhash
+pytest

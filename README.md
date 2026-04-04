@@ -1,38 +1,67 @@
-# Project to mine hard negatives and set scores for knowledge distillation
+# Hard negatives mining pipeline
 
-### How to run?
-1. Create `.env` file - you can use `.env.example.base` with models based on "roberta base" or `.env.example.large` with models based on "roberta large".
-2. Run containers: `docker compose up`
-3. Run terminal in `miner` container: `docker exec -it -w /code miner /bin/bash`
-4. Prepare your data in proper form. You can run:
-   - `python to_huggingface_dataset.py` to transform `data/input.jsonl` into parquets
-   - `python msmarco_to_huggingface_dataset.py` to transform MS Marco into parquets
-   - `python clips_mqa_to_huggingface_dataset.py` to transform `clips/mqa` into parquets (only split `pl-faq-question`) 
+Projekt służy do budowania datasetu treningowego (query, positive, hard negatives) dla embedderów i rerankerów.
 
-   This script will generate the files `corpus.parquet`, `queries.parquet`, and `relevant.parquet` in the `data` folder.  
-   Expected structure:  
-   - **corpus.parquet**  
-     - `id` — document id (int32)  
-     - `text` — document text (string)  
-   - **queries.parquet**  
-     - `id` — query id (int32)  
-     - `text` — query text (string)  
-   - **relevant.parquet**  
-     - `query_id` (int32)  
-     - `document_id` (int32)  
-3. Add documents to the database (default is folder `qdrant_db` and collection `all_documents`):
-   ```shell
-   python add_documents_to_db.py
+## Tryby uruchomienia
+
+### 1) venv + pip (zalecane na HPC, bez Dockera)
+
+1. Utwórz i aktywuj środowisko:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -U pip
+   pip install -r requirements.txt
    ```
-4. Add scores to the "positives" in the `relevant_with_score.parquet` file:
-   ```shell
-   python add_positives_ranks.py
+2. Przygotuj `.env` (na bazie `.env.example.base` lub `.env.example.large`).
+3. Ustaw backend bazy wektorowej:
+   - LanceDB (domyślny, bez Dockera):
+     ```bash
+     export VECTOR_DB_BACKEND=lancedb
+     export LANCEDB_PATH=./lancedb_data
+     ```
+   - Qdrant (opcjonalnie):
+     ```bash
+     export VECTOR_DB_BACKEND=qdrant
+     export QDRANT_URL=http://localhost:6333
+     ```
+
+### 2) Docker Compose (opcjonalny wygodny local setup)
+
+```bash
+docker compose up -d
+```
+
+To uruchamia kontener `executable` oraz (opcjonalny) serwis `vdb` oparty o Qdrant.
+
+## Pipeline
+
+1. Przygotuj dane (`corpus.parquet`, `queries.parquet`, `relevant.parquet`):
+   ```bash
+   python app_code/to_huggingface_dataset.py
+   # albo
+   python app_code/msmarco_to_huggingface_dataset.py
+   # albo
+   python app_code/clips_mqa_to_huggingface_dataset.py
    ```
-5. Add computed negatives:
-   ```shell
-   python find_negatives.py
+2. Załaduj dokumenty do bazy wektorowej:
+   ```bash
+   python app_code/add_documents_to_db.py
    ```
-6. Create a FlagEmbedding-style JSONL with a training-ready dataset:
-   ```shell
-   python create_flag_embedding_jsonl.py
+3. Dodaj score dla pozytywów:
+   ```bash
+   python app_code/add_positives_ranks.py
    ```
+4. Wykop negatywy:
+   ```bash
+   python app_code/find_negatives.py
+   ```
+5. Zbuduj JSONL pod FlagEmbedding:
+   ```bash
+   python app_code/create_flag_embedding_jsonl.py
+   ```
+
+## Uwaga o backendach
+
+- `VECTOR_DB_BACKEND=lancedb` używa dense retrieval + BM25/hybrid LanceDB.
+- `VECTOR_DB_BACKEND=qdrant` zachowuje dotychczasowy przepływ dense+sparse (SPLADE).

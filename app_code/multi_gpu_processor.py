@@ -9,9 +9,6 @@ import os
 import pandas as pd
 import numpy as np
 from decouple import config
-import random
-
-from langchain_qdrant import QdrantVectorStore
 
 
 
@@ -19,7 +16,7 @@ class GPUModelSet:
     """Represents a set of models (dense, sparse, reranker) running on a specific GPU"""
     
     def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, logger=None,
-                 skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int),
+                 skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int, default=100),
                  beta: float = 0.4, u_floor: float = 0.1):
 
         self.gpu_id = gpu_id
@@ -55,43 +52,13 @@ class GPUModelSet:
     def _is_negative_percentile(self, u_pos: float, u_doc: float) -> bool:
         return (u_doc - u_pos) <= -self.beta or (u_doc <= self.u_floor)
 
-    def _search_with_offset_qdrant(self, vector_store: QdrantVectorStore, query_text: str, limit: int, offset: int):
-        return vector_store.similarity_search(query=query_text, k=limit, offset=offset)
+    def _search_with_offset(self, backend, query_text: str, limit: int, offset: int):
+        return backend.search(query_text=query_text, k=limit, offset=offset)
 
-    def _random_sample_qdrant(self, vector_store, limit: int):
-        client = getattr(vector_store, "client", None) or getattr(vector_store, "_client", None)
-        collection = getattr(vector_store, "collection_name", None)
-        from langchain_core.documents import Document
+    def _random_sample(self, backend, limit: int):
+        return backend.random_sample(k=limit)
 
-        if client is None or collection is None:
-            # Fallback: zrób zwykłe zapytanie z losowym bełkotem i weź top-k (nieidealne, ale proste)
-            docs = vector_store.as_retriever(search_kwargs={"k": limit}).invoke("random")
-            return docs
-
-        out = []
-        next_page = None
-        for _ in range(10):
-            resp = client.scroll(
-                collection_name=collection,
-                with_payload=True,
-                with_vectors=False,
-                limit=min(limit - len(out), 256),
-                offset=next_page
-            )
-            points, next_page = resp
-            random.shuffle(points)
-            for p in points:
-                payload = p.payload or {}
-                pc = payload.get("page_content") or payload.get("text") or ""
-                metadata = payload.get("metadata")
-                out.append(Document(page_content=pc, metadata=metadata))
-                if len(out) >= limit:
-                    break
-            if len(out) >= limit or next_page is None:
-                break
-        return out[:limit]
-
-    def process_query_batch(self, query_batch: List[Dict], vector_store, rerank_function: Callable,
+    def process_query_batch(self, query_batch: List[Dict], backend, rerank_function: Callable,
                             reranker_batch_size: int) -> List[Tuple]:
         """
         Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
@@ -119,7 +86,7 @@ class GPUModelSet:
 
             for n in range(MAX_ITERS):
                 offset = 0 if n == 0 else 2 ** (n + 7)
-                docs = self._search_with_offset_qdrant(vector_store, qtext, CHUNK, offset)
+                docs = self._search_with_offset(backend, qtext, CHUNK, offset)
 
                 batch_docs = []
                 for d in docs:
@@ -153,7 +120,7 @@ class GPUModelSet:
                     break
 
             if neg_count < NEG_TARGET:
-                rand_docs = self._random_sample_qdrant(vector_store, CHUNK)
+                rand_docs = self._random_sample(backend, CHUNK)
                 rand_docs = [d for d in rand_docs if str(d.metadata.get("document_id", "")) not in seen_ids]
                 if rand_docs:
                     rand_scores = rerank_function(

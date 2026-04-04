@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 class SpladeEmbedding(SparseEmbeddings):
-    def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0):
+    def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForMaskedLM.from_pretrained(model_name,
                                                           device_map=f'cuda:{gpu_id}', torch_dtype=torch.float16)
@@ -45,11 +45,11 @@ class SpladeEmbedding(SparseEmbeddings):
         return results
 
 
-def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0) -> SpladeEmbedding:
+def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0) -> SpladeEmbedding:
     return SpladeEmbedding(model_name, batch_size=batch_size, gpu_id=gpu_id)
 
 
-def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int), gpu_id: int = 0,
+def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0,
                     prompt="") -> HuggingFaceEmbeddings:
     embeddings = HuggingFaceEmbeddings(model_name=model_name,
                                        model_kwargs={'model_kwargs': {
@@ -70,7 +70,7 @@ def is_llm_lightweight_reranker(model_name: str) -> bool:
     return model_name.endswith("lightweight")
 
 
-def get_reranker_model(model_name: str = config("RERANKER_NAME"), gpu_id: int = 0):
+def get_reranker_model(model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2"), gpu_id: int = 0):
     if is_flag_embedding_reranker(model_name):
         from FlagEmbedding import FlagAutoReranker
         devices = [f"cuda:{gpu_id}"]
@@ -91,7 +91,7 @@ def get_reranker_model(model_name: str = config("RERANKER_NAME"), gpu_id: int = 
 
 
 def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], batch_size=16,
-           model_name: str = config("RERANKER_NAME")) -> list[float]:
+           model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2")) -> list[float]:
     if isinstance(query, str):
         texts = [[query, answer] for answer in answers]
     else:
