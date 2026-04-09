@@ -62,7 +62,12 @@ def find_negatives_multigpu(
         sparse_model_vs = get_sparse_model(sparse_model_name, batch_size=embedding_batch_size, gpu_id=0)
         dense_dim_size = len(dense_model_vs.embed_query("text"))
 
-    model_sets = setup_multi_gpu_models(reranker_model_name, models_per_gpu=1, logger=logger)
+    model_sets = setup_multi_gpu_models(
+        reranker_model_name,
+        relevant_path,
+        models_per_gpu=1,
+        logger=logger,
+    )
 
     if force_resume is not None:
         resume = force_resume
@@ -83,6 +88,10 @@ def find_negatives_multigpu(
     logger.info("Loading queries and relevance data")
     queries_df = pd.read_parquet(queries_path)
     relevant_df = pd.read_parquet(relevant_path)
+
+    queries_df["id"] = queries_df["id"].astype("string")
+    relevant_df["query_id"] = relevant_df["query_id"].astype("string")
+    relevant_df["document_id"] = relevant_df["document_id"].astype("string")
 
     best_relevant_df = relevant_df.loc[relevant_df.groupby("query_id")["positive_ranking"].idxmax()]
     positives_df = queries_df.merge(best_relevant_df, left_on="id", right_on="query_id").drop(columns="id")

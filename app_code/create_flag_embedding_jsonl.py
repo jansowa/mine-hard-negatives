@@ -196,15 +196,15 @@ def process_negatives_streaming(
         )
     )
 
-    pos_scores_all = (
+    pos_scores_all = np.sort(
         rel.select(pl.col("positive_ranking"))
-           .collect()["positive_ranking"]
-           .drop_nulls()
-           .to_numpy()
+        .collect()["positive_ranking"]
+        .drop_nulls()
+        .to_numpy()
+        .copy()
     )
     if pos_scores_all.size == 0:
         raise ValueError("Brak wartości 'positive_ranking' w pliku RELEVANT_WITH_SCORE_PATH.")
-    pos_scores_all.sort()
     ecdf_x, ecdf_y = build_ecdf(pos_scores_all)
 
     try:

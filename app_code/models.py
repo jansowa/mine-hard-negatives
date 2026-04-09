@@ -1,10 +1,23 @@
-from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
-from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModelForSequenceClassification
-from langchain_huggingface import HuggingFaceEmbeddings
-from decouple import config
+from dataclasses import dataclass
 from typing import Tuple
+
+from decouple import config
+from langchain_huggingface import HuggingFaceEmbeddings
+from transformers import AutoModelForMaskedLM, AutoModelForSequenceClassification, AutoTokenizer
 import numpy as np
 import torch
+
+try:
+    from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
+except ImportError:
+    class SparseEmbeddings:
+        pass
+
+    @dataclass
+    class SparseVector:
+        indices: list[int]
+        values: list[float]
+
 
 class SpladeEmbedding(SparseEmbeddings):
     def __init__(self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0):

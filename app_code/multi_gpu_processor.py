@@ -15,7 +15,7 @@ from decouple import config
 class GPUModelSet:
     """Represents a set of models (dense, sparse, reranker) running on a specific GPU"""
     
-    def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, logger=None,
+    def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, relevant_path: str, logger=None,
                  skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int, default=100),
                  beta: float = 0.4, u_floor: float = 0.1):
 
@@ -27,13 +27,12 @@ class GPUModelSet:
         self.logger = logger or logging.getLogger(__name__)
         self.skip_if_not_in_top_k = skip_if_not_in_top_k
 
-        relevant_df = pd.read_parquet(config("RELEVANT_WITH_SCORE_PATH"))
+        relevant_df = pd.read_parquet(relevant_path)
 
         if not {"query_id","document_id","positive_ranking"}.issubset(relevant_df.columns):
             raise ValueError("Required columns are missing in Parquet for 'relevant with score'.")
 
-        scores = relevant_df["positive_ranking"].dropna().to_numpy()
-        scores.sort()
+        scores = np.sort(relevant_df["positive_ranking"].dropna().to_numpy(copy=True))
         self._ecdf_x = scores
         n = len(scores)
         self._ecdf_y = np.linspace(0.0, 1.0, n) if n > 1 else np.array([1.0])
@@ -417,6 +416,7 @@ def should_resume_processing(output_path: str, model_sets: List[GPUModelSet]) ->
 
 
 def setup_multi_gpu_models(reranker_model_name: str,
+                           relevant_path: str,
                            models_per_gpu: int = 1, logger=None) -> List[GPUModelSet]:
     """Setup model sets across all available GPUs, with multiple model instances per GPU if desired"""
     from models import get_reranker_model
@@ -436,7 +436,7 @@ def setup_multi_gpu_models(reranker_model_name: str,
             logger.info(f"[GPU {gpu_id}] Loading models (instance {instance+1}/{models_per_gpu})")
             reranker_tokenizer, reranker_model = get_reranker_model(model_name=reranker_model_name,
                                                                   gpu_id=gpu_id)
-            model_set = GPUModelSet(gpu_id, reranker_tokenizer, reranker_model, logger)
+            model_set = GPUModelSet(gpu_id, reranker_tokenizer, reranker_model, relevant_path, logger)
             model_sets.append(model_set)
             logger.info(f"[GPU {gpu_id}] Successfully loaded models (instance {instance+1}/{models_per_gpu})")
     return model_sets

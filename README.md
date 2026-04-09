@@ -8,10 +8,9 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
 
 1. Create and activate a virtual environment:
    ```bash
-   python -m venv .venv
+   uv venv --python 3.12.3 .venv
    source .venv/bin/activate
-   pip install -U pip
-   pip install -r requirements.txt
+   uv pip install -r requirements-lancedb.txt
    ```
 2. Prepare `.env` (based on `.env.example.base` or `.env.example.large`).
 3. Set vector DB backend:
@@ -24,6 +23,10 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
      ```bash
      export VECTOR_DB_BACKEND=qdrant
      export QDRANT_URL=http://localhost:6333
+     ```
+     Install dependencies with:
+     ```bash
+     uv pip install -r requirements.txt
      ```
 
 ### 2) Docker Compose (optional local convenience setup)
@@ -74,9 +77,9 @@ If you want to quickly verify that the full pipeline wiring works, you can run i
 
 ```bash
 # 0) Environment
-python -m venv .venv
+uv venv --python 3.12.3 .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+uv pip install -r requirements-lancedb.txt
 
 # 1) Use LanceDB (no Docker required)
 export VECTOR_DB_BACKEND=lancedb
@@ -93,7 +96,7 @@ python app_code/to_huggingface_dataset.py \
 # 3) Ingest corpus to vector DB (small, fast models)
 python app_code/add_documents_to_db.py \
   --dataset_path ./.smoke/corpus.parquet \
-  --dense_model_name sentence-transformers/all-MiniLM-L6-v2 \
+  --dense_model_name sdadas/mmlw-retrieval-roberta-base \
   --batch_size 8 \
   --database_collection_name smoke_documents
 
@@ -105,12 +108,12 @@ python app_code/add_positives_ranks.py \
   --output_path ./.smoke/relevant_with_score.parquet \
   --chunk_size 64 \
   --reranker_batch_size 8 \
-  --reranker_model_name cross-encoder/ms-marco-MiniLM-L-6-v2
+  --reranker_model_name sdadas/polish-reranker-base-ranknet
 
 # 5) Mine negatives
 python app_code/find_negatives.py \
-  --dense_model_name sentence-transformers/all-MiniLM-L6-v2 \
-  --reranker_model_name cross-encoder/ms-marco-MiniLM-L-6-v2 \
+  --dense_model_name sdadas/mmlw-retrieval-roberta-base \
+  --reranker_model_name sdadas/polish-reranker-base-ranknet \
   --embedding_batch_size 8 \
   --reranker_batch_size 8 \
   --database_collection_name smoke_documents \
@@ -118,6 +121,19 @@ python app_code/find_negatives.py \
   --relevant_path ./.smoke/relevant_with_score.parquet \
   --output_path ./.smoke/negatives.parquet \
   --top_k 20
+
+# 6) Build FlagEmbedding JSONL
+python app_code/create_flag_embedding_jsonl.py \
+  --corpus_path ./.smoke/corpus.parquet \
+  --queries_path ./.smoke/queries.parquet \
+  --relevant_path ./.smoke/relevant_with_score.parquet \
+  --negatives_path ./.smoke/negatives.parquet \
+  --output_path ./.smoke/train.jsonl \
+  --num_negatives 5 \
+  --corpus_sqlite_path ./.smoke/corpus.sqlite \
+  --negcount_sqlite_path ./.smoke/negcount.sqlite \
+  --query_chunk_size 64 \
+  --oversample_factor 5
 ```
 
 Expected smoke-test artifacts:

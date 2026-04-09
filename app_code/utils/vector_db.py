@@ -178,7 +178,7 @@ class LanceDBBackend(VectorBackend):
     def count(self) -> int:
         if self.table is None:
             return 0
-        return self.table.to_lance().count_rows()
+        return self.table.count_rows()
 
     def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]:
         if self.table is None:
