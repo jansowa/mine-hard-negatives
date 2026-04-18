@@ -46,6 +46,8 @@ This starts the `executable` container and optional `vdb` service based on Qdran
    python app_code/msmarco_to_huggingface_dataset.py
    # or
    python app_code/clips_mqa_to_huggingface_dataset.py
+   # or
+   python app_code/natural_questions_to_huggingface_dataset.py
    ```
 2. Load documents into vector DB:
    ```bash
