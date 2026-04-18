@@ -22,6 +22,12 @@ class VectorBackend(ABC):
     def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]:
         ...
 
+    def search_many_offsets(self, query_text: str, k: int, offsets: list[int]) -> dict[int, list[Document]]:
+        return {
+            offset: self.search(query_text=query_text, k=k, offset=offset)
+            for offset in offsets
+        }
+
     @abstractmethod
     def random_sample(self, k: int) -> list[Document]:
         ...
@@ -29,6 +35,9 @@ class VectorBackend(ABC):
     @abstractmethod
     def existing_document_ids(self) -> set[str]:
         ...
+
+    def ensure_indexes(self) -> None:
+        return None
 
 
 class QdrantBackend(VectorBackend):
@@ -140,7 +149,10 @@ class LanceDBBackend(VectorBackend):
         self.table = self._load_table_if_exists(collection_name)
 
     def _load_table_if_exists(self, collection_name: str):
-        table_names = set(self.db.table_names())
+        if hasattr(self.db, "list_tables"):
+            table_names = set(self.db.list_tables())
+        else:
+            table_names = set(self.db.table_names())
         if collection_name in table_names:
             return self.db.open_table(collection_name)
         return None
@@ -189,7 +201,7 @@ class LanceDBBackend(VectorBackend):
 
         # Prefer hybrid query: dense + BM25 FTS.
         try:
-            hits = self.table.search(query_type="hybrid", query=query_text, vector=vector).limit(limit).to_list()
+            hits = self.table.search(query_type="hybrid").vector(vector).text(query_text).limit(limit).to_list()
         except Exception:
             hits = self.table.search(vector).limit(limit).to_list()
 
@@ -199,6 +211,32 @@ class LanceDBBackend(VectorBackend):
             docs.append(Document(page_content=hit.get("text", ""), metadata={"document_id": doc_id}))
 
         return docs[:k]
+
+    def search_many_offsets(self, query_text: str, k: int, offsets: list[int]) -> dict[int, list[Document]]:
+        if self.table is None:
+            return {offset: [] for offset in offsets}
+
+        offsets = sorted(set(offsets))
+        if not offsets:
+            return {}
+
+        vector = self.dense_embeddings.embed_query(query_text)
+        limit = max(offsets) + k
+
+        # Prefer hybrid query: dense + BM25 FTS.
+        try:
+            hits = self.table.search(query_type="hybrid").vector(vector).text(query_text).limit(limit).to_list()
+        except Exception:
+            hits = self.table.search(vector).limit(limit).to_list()
+
+        out: dict[int, list[Document]] = {}
+        for offset in offsets:
+            docs = []
+            for hit in hits[offset:offset + k]:
+                doc_id = str(hit.get("document_id", ""))
+                docs.append(Document(page_content=hit.get("text", ""), metadata={"document_id": doc_id}))
+            out[offset] = docs[:k]
+        return out
 
     def random_sample(self, k: int) -> list[Document]:
         if self.table is None:
@@ -218,6 +256,37 @@ class LanceDBBackend(VectorBackend):
             str(row.get("document_id"))
             for row in self.table.to_list()
         }
+
+    def ensure_indexes(self) -> None:
+        if self.table is None or self.count() == 0:
+            return
+
+        existing = []
+        try:
+            existing = list(self.table.list_indices())
+        except Exception:
+            existing = []
+
+        index_text = "\n".join(repr(index).lower() for index in existing)
+        has_vector_index = "vector" in index_text or "ivf" in index_text or "hnsw" in index_text
+        has_fts_index = "fts" in index_text or "text" in index_text
+
+        if not has_vector_index:
+            try:
+                self.table.create_index(
+                    metric="cosine",
+                    vector_column_name="vector",
+                    index_type="IVF_FLAT",
+                    replace=False,
+                )
+            except Exception:
+                pass
+
+        if not has_fts_index:
+            try:
+                self.table.create_fts_index("text", replace=False)
+            except Exception:
+                pass
 
 
 def create_vector_backend(

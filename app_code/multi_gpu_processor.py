@@ -54,6 +54,14 @@ class GPUModelSet:
     def _search_with_offset(self, backend, query_text: str, limit: int, offset: int):
         return backend.search(query_text=query_text, k=limit, offset=offset)
 
+    def _search_many_offsets(self, backend, query_text: str, limit: int, offsets: List[int]):
+        if hasattr(backend, "search_many_offsets"):
+            return backend.search_many_offsets(query_text=query_text, k=limit, offsets=offsets)
+        return {
+            offset: self._search_with_offset(backend, query_text, limit, offset)
+            for offset in offsets
+        }
+
     def _random_sample(self, backend, limit: int):
         return backend.random_sample(k=limit)
 
@@ -68,8 +76,14 @@ class GPUModelSet:
         NEG_TARGET = 20
         CHUNK = 128
         MAX_ITERS = 10
+        OFFSET_GROUP_SIZE = config("SEARCH_MANY_OFFSETS_GROUP_SIZE", cast=int, default=2)
 
-        results: List[Tuple] = []
+        offsets = [0 if n == 0 else 2 ** (n + 7) for n in range(MAX_ITERS)]
+        offset_groups = [
+            offsets[i:i + max(1, OFFSET_GROUP_SIZE)]
+            for i in range(0, len(offsets), max(1, OFFSET_GROUP_SIZE))
+        ]
+        states = []
 
         for query_data in query_batch:
             qtext = query_data["text"]
@@ -79,60 +93,103 @@ class GPUModelSet:
             s_pos = float(query_data["positive_ranking"])
             u_pos = float(self._percentile(np.array([s_pos]))[0])
 
-            seen_ids: set[str] = set([pos_doc_id])
-            collected_docs = []
-            neg_count = 0
+            states.append({
+                "qtext": qtext,
+                "qid": qid,
+                "u_pos": u_pos,
+                "seen_ids": set([pos_doc_id]),
+                "collected_docs": [],
+                "neg_count": 0,
+                "done": False,
+                "docs_by_offset": {},
+            })
 
-            for n in range(MAX_ITERS):
-                offset = 0 if n == 0 else 2 ** (n + 7)
-                docs = self._search_with_offset(backend, qtext, CHUNK, offset)
+        for offset_group in offset_groups:
+            for state in states:
+                if not state["done"]:
+                    state["docs_by_offset"].update(
+                        self._search_many_offsets(backend, state["qtext"], CHUNK, offset_group)
+                    )
 
-                batch_docs = []
-                for d in docs:
-                    did = d.metadata.get("document_id")
-                    if did is None:
+            for offset in offset_group:
+                rerank_queries = []
+                rerank_docs = []
+                rerank_state_doc = []
+
+                for state in states:
+                    if state["done"]:
                         continue
-                    did = str(did)
-                    if did in seen_ids:
-                        continue
-                    seen_ids.add(did)
-                    batch_docs.append(d)
 
-                if not batch_docs:
+                    batch_docs = []
+                    for d in state["docs_by_offset"].get(offset, []):
+                        did = d.metadata.get("document_id")
+                        if did is None:
+                            continue
+                        did = str(did)
+                        if did in state["seen_ids"]:
+                            continue
+                        state["seen_ids"].add(did)
+                        batch_docs.append(d)
+
+                    for d in batch_docs:
+                        rerank_queries.append(state["qtext"])
+                        rerank_docs.append(d.page_content)
+                        rerank_state_doc.append((state, d))
+
+                if not rerank_docs:
                     continue
 
                 batch_scores = rerank_function(
                     self.reranker_tokenizer,
                     self.reranker_model,
-                    qtext,
-                    [d.page_content for d in batch_docs],
+                    rerank_queries,
+                    rerank_docs,
                     batch_size=reranker_batch_size
                 )
 
                 u_docs = self._percentile(np.array(batch_scores, dtype=float))
-                for d, s, u_d in zip(batch_docs, batch_scores, u_docs):
-                    collected_docs.append((qid, str(d.metadata["document_id"]), float(s)))
-                    if self._is_negative_percentile(u_pos, float(u_d)):
-                        neg_count += 1
+                for (state, d), s, u_d in zip(rerank_state_doc, batch_scores, u_docs):
+                    state["collected_docs"].append((state["qid"], str(d.metadata["document_id"]), float(s)))
+                    if self._is_negative_percentile(state["u_pos"], float(u_d)):
+                        state["neg_count"] += 1
 
-                if neg_count >= NEG_TARGET:
-                    break
+                for state in states:
+                    if state["neg_count"] >= NEG_TARGET:
+                        state["done"] = True
 
-            if neg_count < NEG_TARGET:
-                rand_docs = self._random_sample(backend, CHUNK)
-                rand_docs = [d for d in rand_docs if str(d.metadata.get("document_id", "")) not in seen_ids]
-                if rand_docs:
-                    rand_scores = rerank_function(
-                        self.reranker_tokenizer,
-                        self.reranker_model,
-                        qtext,
-                        [d.page_content for d in rand_docs],
-                        batch_size=reranker_batch_size
-                    )
-                    for d, s in zip(rand_docs, rand_scores):
-                        collected_docs.append((qid, str(d.metadata.get("document_id", "")), float(s)))
+            if all(state["done"] for state in states):
+                break
 
-            results.extend(collected_docs)
+        random_queries = []
+        random_docs = []
+        random_state_doc = []
+        for state in states:
+            if state["neg_count"] >= NEG_TARGET:
+                continue
+            rand_docs = self._random_sample(backend, CHUNK)
+            for d in rand_docs:
+                did = str(d.metadata.get("document_id", ""))
+                if did in state["seen_ids"]:
+                    continue
+                state["seen_ids"].add(did)
+                random_queries.append(state["qtext"])
+                random_docs.append(d.page_content)
+                random_state_doc.append((state, d))
+
+        if random_docs:
+            rand_scores = rerank_function(
+                self.reranker_tokenizer,
+                self.reranker_model,
+                random_queries,
+                random_docs,
+                batch_size=reranker_batch_size
+            )
+            for (state, d), s in zip(random_state_doc, rand_scores):
+                state["collected_docs"].append((state["qid"], str(d.metadata.get("document_id", "")), float(s)))
+
+        results: List[Tuple] = []
+        for state in states:
+            results.extend(state["collected_docs"])
 
         self.total_queries += len(query_batch)
         return results
@@ -206,7 +263,7 @@ class MultiGPUNegativeFinder:
             self.logger.error(f"[WORKER {worker_id}] Error saving result to JSONL: {e}")
             raise
     
-    def create_batches(self, queries: List[Dict]) -> None:
+    def create_batches(self, queries: List[Dict], query_batch_size: int = 1) -> None:
         """Add individual queries to queue for processing, filtering out already processed ones if resuming"""
         # Filter out already processed queries if resuming
         if self.resume:
@@ -217,13 +274,14 @@ class MultiGPUNegativeFinder:
             if filtered_count > 0:
                 self.logger.info(f"[RESUME] Filtered out {filtered_count} already processed queries")
         
-        self.total_batches = len(queries)  # Each query is now a "batch" of size 1
+        query_batch_size = max(1, query_batch_size)
+        self.total_batches = (len(queries) + query_batch_size - 1) // query_batch_size
         self.total_queries = len(queries)
         
-        for i, query in enumerate(queries):
-            self.query_queue.put((i, [query]))  # Each "batch" contains one query
+        for i in range(0, len(queries), query_batch_size):
+            self.query_queue.put((i, queries[i:i + query_batch_size]))
         
-        self.logger.info(f"[MAIN] Created {self.total_batches} individual query tasks")
+        self.logger.info(f"[MAIN] Created {self.total_batches} query tasks (batch size {query_batch_size})")
         self.logger.info(f"[MAIN] Total queries to process: {self.total_queries}")
     
     def worker(self, worker_id: int, model_set: GPUModelSet, vector_store, rerank_function: Callable, 
@@ -248,13 +306,13 @@ class MultiGPUNegativeFinder:
                     self.save_result_to_jsonl(worker_id, query_id_result, document_id, ranking)
                     results_count += 1
                 
-                # Update progress for the single query
+                # Update progress for the query batch
                 if self.progress_bar is not None:
-                    self.progress_bar.update(1)
+                    self.progress_bar.update(len(query_batch))
                 
-                # Update processed queries count and log progress every 10 queries
+                # Update processed queries count and log progress every 1000 queries
                 with self.queries_lock:
-                    self.processed_queries += 1
+                    self.processed_queries += len(query_batch)
                     if self.processed_queries % 1000 == 0:
                         current_time = time.time()
                         elapsed_time = current_time - self.start_time if self.start_time else 0
@@ -295,12 +353,12 @@ class MultiGPUNegativeFinder:
         
         self.logger.info(f"[GPU {model_set.gpu_id}] Worker finished. Total results saved: {results_count}")
     
-    def process_all(self, queries: List[Dict], vector_store, rerank_function: Callable, 
-                   top_k: int, reranker_batch_size: int) -> int:
+    def process_all(self, queries: List[Dict], vector_store, rerank_function: Callable,
+                   top_k: int, reranker_batch_size: int, query_batch_size: int = 1) -> int:
         """Process all queries using available GPU model sets"""
         self.logger.info(f"[MAIN] Starting processing of {len(queries)} queries across {len(self.model_sets)} GPUs")
         
-        self.create_batches(queries)
+        self.create_batches(queries, query_batch_size=query_batch_size)
         
         # Start worker threads for each GPU model set
         threads = []

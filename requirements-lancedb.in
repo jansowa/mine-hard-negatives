@@ -1,0 +1,15 @@
+accelerate
+datasets
+FlagEmbedding
+langchain-core
+langchain-huggingface
+lancedb
+numpy
+pandas
+polars
+pytest
+python-decouple
+rapidfuzz
+simhash
+torch
+transformers==4.51

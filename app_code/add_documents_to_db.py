@@ -26,6 +26,9 @@ def filter_dataset_by_missing_ids_ds(
     def _pred(batch):
         return [str(x) not in existing_ids for x in batch["id"]]
 
+    if num_proc <= 1:
+        return ds.filter(_pred, batched=True, batch_size=batch_size)
+
     return ds.filter(_pred, batched=True, batch_size=batch_size, num_proc=num_proc)
 
 
@@ -96,12 +99,18 @@ def process_file(
     print(f"Will add from selected window (after filtering): {len(ds_filtered)}")
 
     if len(ds_filtered) == 0:
+        print("Ensuring vector/text indexes where supported...")
+        backend.ensure_indexes()
+        print("Index check completed.")
         print("Nothing to add. Exiting.")
         return
 
     print(f"Number of points before adding documents: {backend.count()}")
     add_documents_from_dataset(ds_filtered, batch_size, backend, total_hint=len(ds_filtered))
     print(f"Number of points after adding documents: {backend.count()}")
+    print("Ensuring vector/text indexes where supported...")
+    backend.ensure_indexes()
+    print("Index check completed.")
 
 
 if __name__ == "__main__":

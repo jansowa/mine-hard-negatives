@@ -41,6 +41,7 @@ def find_negatives_multigpu(
     output_path: str,
     top_k: int,
     force_resume: bool = None,
+    query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
 ):
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
@@ -134,6 +135,7 @@ def find_negatives_multigpu(
             rerank,
             top_k,
             reranker_batch_size,
+            query_batch_size,
         )
         logger.info(f"Successfully processed {completed_batches} batches")
         progress_bar.close()
@@ -157,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"))
     parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
     parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int))
+    parser.add_argument("--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4))
     parser.add_argument("--resume", action="store_true", default=None)
     parser.add_argument("--no-resume", dest="resume", action="store_false", default=None)
 
@@ -174,4 +177,5 @@ if __name__ == "__main__":
         args.output_path,
         args.top_k,
         args.resume,
+        args.query_batch_size,
     )
