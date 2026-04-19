@@ -83,6 +83,14 @@ Document ingest resumes by default. On startup the script scans existing `docume
 
 If an older LanceDB table was created with many tiny appends, run one ingest with `--compact_existing rebuild` after stopping any active writer. This rebuilds the current table into a compact table and leaves the old table directory as a timestamped backup.
 
+### Negative mining performance notes
+
+`find_negatives.py` writes worker JSONL files incrementally for crash-safe resume, then streams those files into the final Parquet output. Tune the Parquet consolidation chunk with `NEGATIVES_PARQUET_ROW_GROUP_SIZE` if needed; the default is `100000` rows.
+
+For timing diagnostics, run mining with `--profile-timing` or set `NEGATIVE_PROFILE_TIMING=true`. This prints aggregate hot-path timings for search, reranking, JSONL writes, random fallback sampling, and Parquet writes. Leave profiling disabled for final throughput measurements.
+
+With LanceDB, query embeddings are cached during negative mining to avoid recomputing the same query vector across offset groups. Control this with `LANCEDB_QUERY_VECTOR_CACHE_SIZE`; set it to `0` to disable the cache. LanceDB random fallback sampling also caches the table rows after the first fallback sample in a run.
+
 ## Quick end-to-end smoke test (sample JSONL)
 
 If you want to quickly verify that the full pipeline wiring works, you can run it on the tiny sample file already in the repo: `app_code/data/input.jsonl`.

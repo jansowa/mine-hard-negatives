@@ -1,11 +1,14 @@
 import sys
 from pathlib import Path
+import json
+
+import pandas as pd
 
 from langchain_core.documents import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 
-from multi_gpu_processor import GPUModelSet
+from multi_gpu_processor import GPUModelSet, MultiGPUNegativeFinder
 
 
 class FakeBackend:
@@ -35,6 +38,13 @@ def _build_model_set_for_test():
     return model_set
 
 
+def _build_processor_model_set_for_test():
+    model_set = GPUModelSet.__new__(GPUModelSet)
+    model_set.gpu_id = 0
+    model_set.total_queries = 0
+    return model_set
+
+
 def test_process_query_batch_uses_backend_and_collects_docs():
     model_set = _build_model_set_for_test()
     backend = FakeBackend()
@@ -59,3 +69,35 @@ def test_process_query_batch_uses_backend_and_collects_docs():
     assert backend.search_calls >= 1
     assert len(results) >= 2
     assert all(row[0] == "q1" for row in results)
+
+
+def test_consolidate_worker_files_streams_to_parquet(tmp_path):
+    output_path = tmp_path / "negatives.parquet"
+    processor = MultiGPUNegativeFinder(
+        [_build_processor_model_set_for_test()],
+        output_path=str(output_path),
+        profile_timing=True,
+    )
+    processor.parquet_row_group_size = 2
+
+    rows = [
+        {"query_id": "q1", "document_id": "d1", "ranking": 0.1},
+        {"query_id": "q1", "document_id": "d2", "ranking": 0.2},
+        {"query_id": "q2", "document_id": "d3", "ranking": 0.3},
+    ]
+    with open(processor.worker_files[0], "w") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    processor.consolidate_worker_files()
+
+    df = pd.read_parquet(output_path)
+    got = {
+        (row.query_id, row.document_id, round(float(row.ranking), 6))
+        for row in df.itertuples(index=False)
+    }
+    expected = {
+        (row["query_id"], row["document_id"], round(float(row["ranking"]), 6))
+        for row in rows
+    }
+    assert got == expected

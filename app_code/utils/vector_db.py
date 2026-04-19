@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import random
 import shutil
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from datetime import timedelta
 from pathlib import Path
 from typing import Iterable
@@ -173,6 +175,11 @@ class LanceDBBackend(VectorBackend):
         self.nprobes = config("LANCEDB_NPROBES", cast=int, default=20)
         self.refine_factor = config("LANCEDB_REFINE_FACTOR", cast=int, default=2)
         self.target_partition_size = config("LANCEDB_TARGET_PARTITION_SIZE", cast=int, default=4096)
+        self.query_vector_cache_size = config("LANCEDB_QUERY_VECTOR_CACHE_SIZE", cast=int, default=10_000)
+        self._query_vector_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_vector_cache_lock = threading.Lock()
+        self._random_sample_rows_cache = None
+        self._random_sample_rows_lock = threading.Lock()
         self.db = lancedb.connect(self.lancedb_path)
         self.table = self._load_table_if_exists(collection_name)
 
@@ -215,6 +222,7 @@ class LanceDBBackend(VectorBackend):
 
     def set_dense_embeddings(self, dense_embeddings) -> None:
         self.dense_embeddings = dense_embeddings
+        self._clear_query_vector_cache()
 
     def upsert_embeddings(self, document_ids: list[str], texts: list[str], vectors) -> None:
         if not document_ids:
@@ -283,6 +291,8 @@ class LanceDBBackend(VectorBackend):
         self.upsert_embeddings(document_ids=document_ids, texts=texts, vectors=vectors)
 
     def _add_lancedb_rows(self, rows) -> None:
+        self._clear_random_sample_cache()
+        self._clear_query_vector_cache()
         if self.table is None:
             table_dir = self._table_dir(self.collection_name)
             if table_dir.exists():
@@ -307,7 +317,7 @@ class LanceDBBackend(VectorBackend):
         if self.dense_embeddings is None:
             raise ValueError("Dense embeddings must be configured before LanceDB search")
 
-        vector = self.dense_embeddings.embed_query(query_text)
+        vector = self._embed_query_cached(query_text)
         limit = max(k + offset, k)
 
         # Prefer hybrid query: dense + BM25 FTS.
@@ -343,7 +353,7 @@ class LanceDBBackend(VectorBackend):
         if not offsets:
             return {}
 
-        vector = self.dense_embeddings.embed_query(query_text)
+        vector = self._embed_query_cached(query_text)
         limit = max(offsets) + k
 
         # Prefer hybrid query: dense + BM25 FTS.
@@ -374,13 +384,47 @@ class LanceDBBackend(VectorBackend):
     def random_sample(self, k: int) -> list[Document]:
         if self.table is None:
             return []
-        rows = self.table.to_arrow().select(["document_id", "text"]).to_pylist()
+        rows = self._random_sample_rows()
         if len(rows) <= k:
             sample = rows
         else:
             sample = random.sample(rows, k)
 
         return [Document(page_content=row.get("text", ""), metadata={"document_id": str(row.get("document_id", ""))}) for row in sample]
+
+    def _embed_query_cached(self, query_text: str):
+        if self.query_vector_cache_size <= 0:
+            return self.dense_embeddings.embed_query(query_text)
+
+        with self._query_vector_cache_lock:
+            vector = self._query_vector_cache.get(query_text)
+            if vector is not None:
+                self._query_vector_cache.move_to_end(query_text)
+                return vector
+
+        vector = self.dense_embeddings.embed_query(query_text)
+
+        with self._query_vector_cache_lock:
+            self._query_vector_cache[query_text] = vector
+            self._query_vector_cache.move_to_end(query_text)
+            while len(self._query_vector_cache) > self.query_vector_cache_size:
+                self._query_vector_cache.popitem(last=False)
+
+        return vector
+
+    def _random_sample_rows(self):
+        with self._random_sample_rows_lock:
+            if self._random_sample_rows_cache is None:
+                self._random_sample_rows_cache = self.table.to_arrow().select(["document_id", "text"]).to_pylist()
+            return self._random_sample_rows_cache
+
+    def _clear_query_vector_cache(self) -> None:
+        with self._query_vector_cache_lock:
+            self._query_vector_cache.clear()
+
+    def _clear_random_sample_cache(self) -> None:
+        with self._random_sample_rows_lock:
+            self._random_sample_rows_cache = None
 
     def existing_document_ids(self) -> set[str]:
         if self.table is None:
@@ -544,6 +588,8 @@ class LanceDBBackend(VectorBackend):
 
         self.db = lancedb.connect(self.lancedb_path)
         self.table = self._load_table_if_exists(self.collection_name)
+        self._clear_query_vector_cache()
+        self._clear_random_sample_cache()
 
     def _table_dir(self, collection_name: str) -> Path:
         return Path(self.lancedb_path) / f"{collection_name}.lance"

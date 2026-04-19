@@ -42,6 +42,7 @@ def find_negatives_multigpu(
     top_k: int,
     force_resume: bool = None,
     query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
+    profile_timing: bool = config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False),
 ):
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
@@ -115,6 +116,7 @@ def find_negatives_multigpu(
         progress_bar=None,
         logger=logger,
         resume=resume,
+        profile_timing=profile_timing,
     )
 
     if resume:
@@ -160,6 +162,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
     parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int))
     parser.add_argument("--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4))
+    parser.add_argument("--profile-timing", dest="profile_timing", action="store_true", default=None)
+    parser.add_argument("--no-profile-timing", dest="profile_timing", action="store_false", default=None)
     parser.add_argument("--resume", action="store_true", default=None)
     parser.add_argument("--no-resume", dest="resume", action="store_false", default=None)
 
@@ -178,4 +182,5 @@ if __name__ == "__main__":
         args.top_k,
         args.resume,
         args.query_batch_size,
+        config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False) if args.profile_timing is None else args.profile_timing,
     )

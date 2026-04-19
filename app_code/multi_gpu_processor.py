@@ -1,6 +1,7 @@
 import threading
 from queue import Queue, Empty
 import time
+from collections import defaultdict
 from typing import List, Callable, Dict, Tuple
 import logging
 import torch
@@ -9,6 +10,69 @@ import os
 import pandas as pd
 import numpy as np
 from decouple import config
+
+
+class TimingStats:
+    """Thread-safe aggregate timings, enabled only when explicitly requested."""
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._stats = defaultdict(lambda: {"seconds": 0.0, "calls": 0, "items": 0})
+
+    def record(self, name: str, seconds: float, items: int = 0) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            row = self._stats[name]
+            row["seconds"] += float(seconds)
+            row["calls"] += 1
+            row["items"] += int(items)
+
+    def add_items(self, name: str, items: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            row = self._stats[name]
+            row["items"] += int(items)
+
+    def log(self, logger: logging.Logger) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            snapshot = {
+                name: dict(values)
+                for name, values in sorted(self._stats.items())
+            }
+
+        if not snapshot:
+            logger.info("[TIMING] No timing samples collected")
+            return
+
+        logger.info("[TIMING] === Hot Path Timings ===")
+        for name, values in snapshot.items():
+            seconds = values["seconds"]
+            calls = values["calls"]
+            items = values["items"]
+            bits = [f"[TIMING] {name}: {seconds:.3f}s", f"calls={calls}"]
+            if calls:
+                bits.append(f"avg_call={seconds / calls:.6f}s")
+            if items:
+                bits.append(f"items={items}")
+                if seconds > 0:
+                    bits.append(f"items/s={items / seconds:.1f}")
+            logger.info(" | ".join(bits))
+
+
+def _now_if_enabled(timing_stats: TimingStats | None) -> float | None:
+    if timing_stats is not None and timing_stats.enabled:
+        return time.perf_counter()
+    return None
+
+
+def _record_elapsed(timing_stats: TimingStats | None, name: str, started_at: float | None, items: int = 0) -> None:
+    if started_at is not None and timing_stats is not None:
+        timing_stats.record(name, time.perf_counter() - started_at, items=items)
 
 
 
@@ -66,7 +130,8 @@ class GPUModelSet:
         return backend.random_sample(k=limit)
 
     def process_query_batch(self, query_batch: List[Dict], backend, rerank_function: Callable,
-                            reranker_batch_size: int) -> List[Tuple]:
+                            reranker_batch_size: int,
+                            timing_stats: TimingStats | None = None) -> List[Tuple]:
         """
         Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
         until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
@@ -107,9 +172,11 @@ class GPUModelSet:
         for offset_group in offset_groups:
             for state in states:
                 if not state["done"]:
+                    started_at = _now_if_enabled(timing_stats)
                     state["docs_by_offset"].update(
                         self._search_many_offsets(backend, state["qtext"], CHUNK, offset_group)
                     )
+                    _record_elapsed(timing_stats, "search_many_offsets", started_at, items=len(offset_group))
 
             for offset in offset_group:
                 rerank_queries = []
@@ -139,6 +206,7 @@ class GPUModelSet:
                 if not rerank_docs:
                     continue
 
+                started_at = _now_if_enabled(timing_stats)
                 batch_scores = rerank_function(
                     self.reranker_tokenizer,
                     self.reranker_model,
@@ -146,6 +214,7 @@ class GPUModelSet:
                     rerank_docs,
                     batch_size=reranker_batch_size
                 )
+                _record_elapsed(timing_stats, "rerank", started_at, items=len(rerank_docs))
 
                 u_docs = self._percentile(np.array(batch_scores, dtype=float))
                 for (state, d), s, u_d in zip(rerank_state_doc, batch_scores, u_docs):
@@ -166,7 +235,9 @@ class GPUModelSet:
         for state in states:
             if state["neg_count"] >= NEG_TARGET:
                 continue
+            started_at = _now_if_enabled(timing_stats)
             rand_docs = self._random_sample(backend, CHUNK)
+            _record_elapsed(timing_stats, "random_sample", started_at, items=len(rand_docs))
             for d in rand_docs:
                 did = str(d.metadata.get("document_id", ""))
                 if did in state["seen_ids"]:
@@ -177,6 +248,7 @@ class GPUModelSet:
                 random_state_doc.append((state, d))
 
         if random_docs:
+            started_at = _now_if_enabled(timing_stats)
             rand_scores = rerank_function(
                 self.reranker_tokenizer,
                 self.reranker_model,
@@ -184,6 +256,7 @@ class GPUModelSet:
                 random_docs,
                 batch_size=reranker_batch_size
             )
+            _record_elapsed(timing_stats, "rerank_random", started_at, items=len(random_docs))
             for (state, d), s in zip(random_state_doc, rand_scores):
                 state["collected_docs"].append((state["qid"], str(d.metadata.get("document_id", "")), float(s)))
 
@@ -199,7 +272,8 @@ class MultiGPUNegativeFinder:
     """Manages distribution of query processing across multiple GPU model sets"""
     
     def __init__(self, model_sets: List[GPUModelSet], 
-                 output_path: str = None, progress_bar=None, logger=None, resume: bool = False):
+                 output_path: str = None, progress_bar=None, logger=None, resume: bool = False,
+                 profile_timing: bool = False):
         self.model_sets = model_sets
         self.query_queue = Queue()
         self.completed_batches = 0  # Now tracks completed queries
@@ -212,6 +286,8 @@ class MultiGPUNegativeFinder:
         self.logger = logger or logging.getLogger(__name__)
         self.resume = resume
         self.start_time = None  # Track overall processing start time
+        self.timing_stats = TimingStats(enabled=profile_timing)
+        self.parquet_row_group_size = max(1, config("NEGATIVES_PARQUET_ROW_GROUP_SIZE", cast=int, default=100_000))
         
         # Create individual worker output paths
         self.output_dir = os.path.dirname(output_path) if output_path else "."
@@ -249,18 +325,29 @@ class MultiGPUNegativeFinder:
     
     def save_result_to_jsonl(self, worker_id: int, query_id: int, document_id: int, ranking: float) -> None:
         """Save a single result to worker's JSONL file"""
-        
-        result = {
-            "query_id": str(query_id),
-            "document_id": str(document_id),
-            "ranking": float(ranking)
-        }
-        
+        with open(self.worker_files[worker_id], 'a') as f:
+            self.write_results_to_jsonl(f, [(query_id, document_id, ranking)])
+
+    def write_results_to_jsonl(self, handle, results: List[Tuple]) -> None:
+        """Write a batch of results to an already-open JSONL handle."""
+        if not results:
+            return
+
+        started_at = _now_if_enabled(self.timing_stats)
+        lines = []
+        for query_id, document_id, ranking in results:
+            result = {
+                "query_id": str(query_id),
+                "document_id": str(document_id),
+                "ranking": float(ranking)
+            }
+            lines.append(json.dumps(result) + '\n')
+
         try:
-            with open(self.worker_files[worker_id], 'a') as f:
-                f.write(json.dumps(result) + '\n')
+            handle.writelines(lines)
+            _record_elapsed(self.timing_stats, "jsonl_write", started_at, items=len(results))
         except Exception as e:
-            self.logger.error(f"[WORKER {worker_id}] Error saving result to JSONL: {e}")
+            self.logger.error(f"Error saving results to JSONL: {e}")
             raise
     
     def create_batches(self, queries: List[Dict], query_batch_size: int = 1) -> None:
@@ -288,68 +375,70 @@ class MultiGPUNegativeFinder:
                top_k: int, reranker_batch_size: int) -> None:
         """Worker function for each GPU model set"""
         results_count = 0
-        
-        while True:
-            try:
-                # Get next query from queue (non-blocking with timeout)
-                query_id, query_batch = self.query_queue.get(timeout=1)
-                
-                # Process the single query (query_batch contains only 1 query)
-                start_time = time.time()
-                batch_results = model_set.process_query_batch(
-                    query_batch, vector_store, rerank_function, reranker_batch_size
-                )
-                processing_time = time.time() - start_time
-                
-                # Save each result immediately to worker's JSONL file
-                for query_id_result, document_id, ranking in batch_results:
-                    self.save_result_to_jsonl(worker_id, query_id_result, document_id, ranking)
-                    results_count += 1
-                
-                # Update progress for the query batch
-                if self.progress_bar is not None:
-                    self.progress_bar.update(len(query_batch))
-                
-                # Update processed queries count and log progress every 1000 queries
-                with self.queries_lock:
-                    self.processed_queries += len(query_batch)
-                    if self.processed_queries % 1000 == 0:
-                        current_time = time.time()
-                        elapsed_time = current_time - self.start_time if self.start_time else 0
-                        
-                        # Calculate estimated time to finish
-                        if self.processed_queries > 0:
-                            queries_per_second = self.processed_queries / elapsed_time if elapsed_time > 0 else 0
-                            remaining_queries = self.total_queries - self.processed_queries
-                            eta_seconds = remaining_queries / queries_per_second if queries_per_second > 0 else 0
-                            
-                            # Format time strings
-                            elapsed_str = f"{int(elapsed_time//3600)}h {int((elapsed_time%3600)//60)}m {int(elapsed_time%60)}s"
-                            eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m {int(eta_seconds%60)}s"
-                            
-                            self.logger.info(f"[PROGRESS] Processed {self.processed_queries}/{self.total_queries} queries "
-                                           f"({self.processed_queries/self.total_queries*100:.1f}%) | "
-                                           f"Elapsed: {elapsed_str} | ETA: {eta_str}")
-                        else:
-                            elapsed_str = f"{int(elapsed_time//3600)}h {int((elapsed_time%3600)//60)}m {int(elapsed_time%60)}s"
-                            self.logger.info(f"[PROGRESS] Processed {self.processed_queries}/{self.total_queries} queries "
-                                           f"({self.processed_queries/self.total_queries*100:.1f}%) | "
-                                           f"Elapsed: {elapsed_str} | ETA: calculating...")
-                
-                self.completed_batches += 1
-                
-                self.logger.debug(f"[GPU {model_set.gpu_id}] Query {query_id} completed "
-                          f"in {processing_time:.2f}s, saved {len(batch_results)} results "
-                          f"({self.completed_batches}/{self.total_batches} total)")
-                
-                self.query_queue.task_done()
-                
-            except Empty:
-                self.logger.info(f"[GPU {model_set.gpu_id}] Worker found no more queries to process... quitting")
-                break
-            except Exception as e:
-                self.logger.error(f"[GPU {model_set.gpu_id}] Worker error:", exc_info=True)
-                break
+
+        with open(self.worker_files[worker_id], 'a') as output_handle:
+            while True:
+                try:
+                    # Get next query from queue (non-blocking with timeout)
+                    query_id, query_batch = self.query_queue.get(timeout=1)
+
+                    start_time = time.time()
+                    batch_results = model_set.process_query_batch(
+                        query_batch,
+                        vector_store,
+                        rerank_function,
+                        reranker_batch_size,
+                        timing_stats=self.timing_stats,
+                    )
+                    processing_time = time.time() - start_time
+
+                    self.write_results_to_jsonl(output_handle, batch_results)
+                    results_count += len(batch_results)
+
+                    # Update progress for the query batch
+                    if self.progress_bar is not None:
+                        self.progress_bar.update(len(query_batch))
+
+                    # Update processed queries count and log progress every 1000 queries
+                    with self.queries_lock:
+                        self.processed_queries += len(query_batch)
+                        if self.processed_queries % 1000 == 0:
+                            current_time = time.time()
+                            elapsed_time = current_time - self.start_time if self.start_time else 0
+
+                            # Calculate estimated time to finish
+                            if self.processed_queries > 0:
+                                queries_per_second = self.processed_queries / elapsed_time if elapsed_time > 0 else 0
+                                remaining_queries = self.total_queries - self.processed_queries
+                                eta_seconds = remaining_queries / queries_per_second if queries_per_second > 0 else 0
+
+                                # Format time strings
+                                elapsed_str = f"{int(elapsed_time//3600)}h {int((elapsed_time%3600)//60)}m {int(elapsed_time%60)}s"
+                                eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m {int(eta_seconds%60)}s"
+
+                                self.logger.info(f"[PROGRESS] Processed {self.processed_queries}/{self.total_queries} queries "
+                                               f"({self.processed_queries/self.total_queries*100:.1f}%) | "
+                                               f"Elapsed: {elapsed_str} | ETA: {eta_str}")
+                            else:
+                                elapsed_str = f"{int(elapsed_time//3600)}h {int((elapsed_time%3600)//60)}m {int(elapsed_time%60)}s"
+                                self.logger.info(f"[PROGRESS] Processed {self.processed_queries}/{self.total_queries} queries "
+                                               f"({self.processed_queries/self.total_queries*100:.1f}%) | "
+                                               f"Elapsed: {elapsed_str} | ETA: calculating...")
+
+                    self.completed_batches += 1
+
+                    self.logger.debug(f"[GPU {model_set.gpu_id}] Query {query_id} completed "
+                              f"in {processing_time:.2f}s, saved {len(batch_results)} results "
+                              f"({self.completed_batches}/{self.total_batches} total)")
+
+                    self.query_queue.task_done()
+
+                except Empty:
+                    self.logger.info(f"[GPU {model_set.gpu_id}] Worker found no more queries to process... quitting")
+                    break
+                except Exception as e:
+                    self.logger.error(f"[GPU {model_set.gpu_id}] Worker error:", exc_info=True)
+                    break
         
         self.logger.info(f"[GPU {model_set.gpu_id}] Worker finished. Total results saved: {results_count}")
     
@@ -401,47 +490,92 @@ class MultiGPUNegativeFinder:
     
     def consolidate_worker_files(self) -> None:
         """Consolidate all worker JSONL files into final parquet file"""
-        
+
         self.logger.info("[MAIN] Consolidating worker files into final parquet...")
-        
-        all_results = []
+
         total_results = 0
+        temp_output_path = f"{self.output_path}.tmp"
+        writer = None
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        schema = pa.schema([
+            ("query_id", pa.string()),
+            ("document_id", pa.string()),
+            ("ranking", pa.float32()),
+        ])
+
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
+
+        def write_buffer(rows: list[dict]) -> None:
+            nonlocal writer, total_results
+            if not rows:
+                return
+            started_at = _now_if_enabled(self.timing_stats)
+            table = pa.table(
+                {
+                    "query_id": pa.array([row["query_id"] for row in rows], type=pa.string()),
+                    "document_id": pa.array([row["document_id"] for row in rows], type=pa.string()),
+                    "ranking": pa.array([row["ranking"] for row in rows], type=pa.float32()),
+                },
+                schema=schema,
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(temp_output_path, schema=schema, compression="zstd", use_dictionary=True)
+            writer.write_table(table)
+            total_results += len(rows)
+            _record_elapsed(self.timing_stats, "parquet_write", started_at, items=len(rows))
         
-        # Read all worker files (preserving them for manual recovery if needed)
-        for i, worker_file in enumerate(self.worker_files):
-            if os.path.exists(worker_file):
-                worker_results = 0
-                try:
-                    with open(worker_file, 'r') as f:
-                        for line in f:
-                            if line.strip():
-                                result = json.loads(line.strip())
-                                all_results.append(result)
-                                worker_results += 1
-                    
-                    total_results += worker_results
-                    self.logger.info(f"[MAIN] Worker {i}: {worker_results} results")
-                    
-                except Exception as e:
-                    self.logger.error(f"[MAIN] Error reading worker file {worker_file}: {e}")
-            else:
-                self.logger.warning(f"[MAIN] Worker file {worker_file} not found")
-        
-        if all_results:
-            try:
-                # Convert to DataFrame and save as parquet
-                df = pd.DataFrame(all_results)
-                df = df.astype({"query_id": "string", "document_id": "string", "ranking": "float32"})
-                df.to_parquet(self.output_path, index=False)
+        try:
+            # Read all worker files (preserving them for manual recovery if needed)
+            for i, worker_file in enumerate(self.worker_files):
+                if os.path.exists(worker_file):
+                    worker_results = 0
+                    buffer = []
+                    try:
+                        with open(worker_file, 'r') as f:
+                            for line in f:
+                                if line.strip():
+                                    result = json.loads(line.strip())
+                                    buffer.append({
+                                        "query_id": str(result["query_id"]),
+                                        "document_id": str(result["document_id"]),
+                                        "ranking": float(result["ranking"]),
+                                    })
+                                    worker_results += 1
+                                    if len(buffer) >= self.parquet_row_group_size:
+                                        write_buffer(buffer)
+                                        buffer = []
+                        write_buffer(buffer)
+
+                        self.logger.info(f"[MAIN] Worker {i}: {worker_results} results")
+
+                    except Exception as e:
+                        self.logger.error(f"[MAIN] Error reading worker file {worker_file}: {e}")
+                        raise
+                else:
+                    self.logger.warning(f"[MAIN] Worker file {worker_file} not found")
+
+            if writer is not None:
+                writer.close()
+                os.replace(temp_output_path, self.output_path)
                 self.logger.info(f"[MAIN] Saved {total_results} results to {self.output_path}")
                 self.logger.info(f"[MAIN] Worker files preserved at: {', '.join(self.worker_files)}")
-                        
-            except Exception as e:
-                self.logger.error(f"[MAIN] Error creating parquet file: {e}")
-                self.logger.info(f"[MAIN] Worker files preserved for manual recovery")
-                raise
-        else:
-            self.logger.warning("[MAIN] No results found to consolidate")
+            else:
+                self.logger.warning("[MAIN] No results found to consolidate")
+        except Exception as e:
+            try:
+                if writer is not None:
+                    writer.close()
+            except Exception:
+                pass
+            if os.path.exists(temp_output_path):
+                os.remove(temp_output_path)
+            self.logger.error(f"[MAIN] Error creating parquet file: {e}")
+            self.logger.info("[MAIN] Worker files preserved for manual recovery")
+            raise
     
     def print_statistics(self, total_time: float) -> None:
         """Print processing statistics"""
@@ -454,6 +588,8 @@ class MultiGPUNegativeFinder:
             self.logger.info(f"[GPU {model_set.gpu_id}] "
                       f"{model_set.total_queries} queries processed, "
                       f"avg {avg_time_per_query:.2f}s/query")
+
+        self.timing_stats.log(self.logger)
 
 
 def should_resume_processing(output_path: str, model_sets: List[GPUModelSet]) -> bool:

@@ -8,6 +8,15 @@ import numpy as np
 import torch
 
 try:
+    from tensorrt import TensorRTDenseEmbeddings, TensorRTReranker, is_tensorrt_model_path
+except ImportError:
+    TensorRTDenseEmbeddings = None
+    TensorRTReranker = None
+
+    def is_tensorrt_model_path(_model_name: str) -> bool:
+        return False
+
+try:
     from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
 except ImportError:
     class SparseEmbeddings:
@@ -64,6 +73,9 @@ def get_sparse_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_S
 
 def get_dense_model(model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0,
                     prompt="") -> HuggingFaceEmbeddings:
+    if is_tensorrt_model_path(model_name):
+        return TensorRTDenseEmbeddings(model_name, batch_size=batch_size, prompt=prompt, gpu_id=gpu_id)
+
     embeddings = HuggingFaceEmbeddings(model_name=model_name,
                                        model_kwargs={'model_kwargs': {
                                             'torch_dtype': torch.bfloat16,
@@ -84,6 +96,13 @@ def is_llm_lightweight_reranker(model_name: str) -> bool:
 
 
 def get_reranker_model(model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2"), gpu_id: int = 0):
+    if is_tensorrt_model_path(model_name):
+        return None, TensorRTReranker(
+            model_name,
+            batch_size=config("RERANKER_BATCH_SIZE", cast=int, default=16),
+            gpu_id=gpu_id,
+        )
+
     if is_flag_embedding_reranker(model_name):
         from FlagEmbedding import FlagAutoReranker
         devices = [f"cuda:{gpu_id}"]
@@ -110,6 +129,9 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
     else:
         texts = [[q, answer] for q, answer in zip(query, answers)]
 
+    if hasattr(model, "score_pairs"):
+        return model.score_pairs([(q, a) for q, a in texts], batch_size=batch_size)
+
     results = []
     if is_flag_embedding_reranker(model_name):
         additional_params = dict()
@@ -131,7 +153,8 @@ def rerank(tokenizer, model, query: Tuple[str, list[str]], answers: list[str], b
             truncation=True,
             return_tensors="pt"
         ).to("cuda")
-        output = model(**tokens)
+        with torch.inference_mode():
+            output = model(**tokens)
         batch_results = output.logits.detach().cpu().float().numpy()
         results.append(batch_results)
 
