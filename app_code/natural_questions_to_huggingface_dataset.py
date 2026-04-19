@@ -5,7 +5,6 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable, Optional
 
 import pyarrow as pa
@@ -15,7 +14,7 @@ from decouple import config
 from huggingface_hub import hf_hub_download
 
 BATCH_SIZE = 10_000
-DEFAULT_INPUT_PATH = str(Path(__file__).resolve().parent / "data" / "natural-questions.jsonl")
+DEFAULT_NATURAL_QUESTIONS_DATASET = "jansowa/natural-questions-hard-negatives-pl"
 QUERY_ID_RE = re.compile(r"(\d+)$")
 
 
@@ -115,7 +114,7 @@ def iter_jsonl_gz(path: str) -> Iterable[dict]:
 
 
 def write_natural_questions_parquets(
-    input_path: str,
+    rows: Iterable[dict],
     queries_writer: pq.ParquetWriter,
     corpus_writer: pq.ParquetWriter,
     relevant_writer: pq.ParquetWriter,
@@ -124,6 +123,7 @@ def write_natural_questions_parquets(
     relevant_schema: pa.Schema,
     nq_doc_id_start: int,
     batch_size: int,
+    source_name: str = "Natural Questions dataset",
 ) -> NaturalQuestionsStats:
     stats = NaturalQuestionsStats()
     next_doc_id = nq_doc_id_start
@@ -132,60 +132,53 @@ def write_natural_questions_parquets(
     corpus_batch: list[dict] = []
     relevant_batch: list[dict] = []
 
-    with open(input_path, "r", encoding="utf-8") as input_file:
-        for line_number, line in enumerate(input_file, start=1):
-            if not line.strip():
-                continue
+    for row_number, item in enumerate(rows, start=1):
+        stats.processed_rows += 1
 
-            stats.processed_rows += 1
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                stats.skipped_bad_json += 1
-                print(f"  Skipping line {line_number}: invalid JSON.")
-                continue
+        query_id = extract_trailing_query_id(item.get("id"))
+        if query_id is None:
+            stats.skipped_bad_id += 1
+            continue
 
-            query_id = extract_trailing_query_id(item.get("id"))
-            if query_id is None:
-                stats.skipped_bad_id += 1
-                continue
+        query_text = (item.get("query") or "").strip()
+        if not query_text:
+            stats.skipped_empty_query += 1
+            continue
 
-            query_text = (item.get("query") or "").strip()
-            if not query_text:
-                stats.skipped_empty_query += 1
-                continue
+        texts = item.get("texts")
+        labels = item.get("labels")
+        if not isinstance(texts, list) or not isinstance(labels, list) or len(texts) != len(labels):
+            stats.skipped_bad_texts_or_labels += 1
+            continue
 
-            texts = item.get("texts")
-            labels = item.get("labels")
-            if not isinstance(texts, list) or not isinstance(labels, list) or len(texts) != len(labels):
-                stats.skipped_bad_texts_or_labels += 1
-                continue
+        queries_batch.append({"id": query_id, "text": query_text})
+        stats.written_queries += 1
 
-            queries_batch.append({"id": query_id, "text": query_text})
-            stats.written_queries += 1
+        for text, label in zip(texts, labels):
+            doc_id = str(next_doc_id)
+            next_doc_id += 1
 
-            for text, label in zip(texts, labels):
-                doc_id = str(next_doc_id)
-                next_doc_id += 1
+            corpus_batch.append({"id": doc_id, "text": str(text or "")})
+            stats.written_corpus_docs += 1
 
-                corpus_batch.append({"id": doc_id, "text": str(text or "")})
-                stats.written_corpus_docs += 1
+            if label == 1:
+                relevant_batch.append({"query_id": query_id, "document_id": doc_id})
+                stats.written_relevant_pairs += 1
 
-                if label == 1:
-                    relevant_batch.append({"query_id": query_id, "document_id": doc_id})
-                    stats.written_relevant_pairs += 1
+            if len(corpus_batch) >= batch_size:
+                write_batch(corpus_writer, corpus_batch, corpus_schema)
+                print(f"  Written {stats.written_corpus_docs} Natural Questions corpus docs...")
 
-                if len(corpus_batch) >= batch_size:
-                    write_batch(corpus_writer, corpus_batch, corpus_schema)
-                    print(f"  Written {stats.written_corpus_docs} Natural Questions corpus docs...")
+            if len(relevant_batch) >= batch_size:
+                write_batch(relevant_writer, relevant_batch, relevant_schema)
+                print(f"  Written {stats.written_relevant_pairs} relevant pairs...")
 
-                if len(relevant_batch) >= batch_size:
-                    write_batch(relevant_writer, relevant_batch, relevant_schema)
-                    print(f"  Written {stats.written_relevant_pairs} relevant pairs...")
+        if len(queries_batch) >= batch_size:
+            write_batch(queries_writer, queries_batch, queries_schema)
+            print(f"  Written {stats.written_queries} queries from {source_name}...")
 
-            if len(queries_batch) >= batch_size:
-                write_batch(queries_writer, queries_batch, queries_schema)
-                print(f"  Written {stats.written_queries} queries...")
+        if row_number % (batch_size * 10) == 0:
+            print(f"  Processed {row_number} rows from {source_name}...")
 
     write_batch(queries_writer, queries_batch, queries_schema)
     write_batch(corpus_writer, corpus_batch, corpus_schema)
@@ -211,8 +204,23 @@ def load_used_corpus_ids(dataset_name: str, hf_token: Optional[str]) -> set[str]
     return used_ids
 
 
+def load_natural_questions_dataset(
+    dataset_name: str,
+    split: str,
+    hf_token: Optional[str],
+) -> Iterable[dict]:
+    try:
+        return load_dataset(dataset_name, split=split, token=hf_token)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load private Natural Questions dataset {dataset_name!r}. "
+            "Set HF_TOKEN to a token with access to the dataset."
+        ) from exc
+
+
 def main(
-    input_path: str,
+    natural_questions_dataset: str,
+    natural_questions_split: str,
     queries_path: str,
     corpus_path: str,
     relevant_path: str,
@@ -238,9 +246,19 @@ def main(
         corpus_writer = pq.ParquetWriter(corpus_path, corpus_schema)
         relevant_writer = pq.ParquetWriter(relevant_path, relevant_schema)
 
-        print(f"Processing Natural Questions JSONL: {input_path}")
+        print(
+            "Loading Natural Questions from private dataset: "
+            f"{natural_questions_dataset} ({natural_questions_split})"
+        )
+        natural_questions_rows = load_natural_questions_dataset(
+            dataset_name=natural_questions_dataset,
+            split=natural_questions_split,
+            hf_token=hf_token,
+        )
+
+        print("Processing Natural Questions rows...")
         nq_stats = write_natural_questions_parquets(
-            input_path=input_path,
+            rows=natural_questions_rows,
             queries_writer=queries_writer,
             corpus_writer=corpus_writer,
             relevant_writer=relevant_writer,
@@ -249,6 +267,7 @@ def main(
             relevant_schema=relevant_schema,
             nq_doc_id_start=nq_doc_id_start,
             batch_size=batch_size,
+            source_name=natural_questions_dataset,
         )
         print(
             "Finished Natural Questions. "
@@ -322,7 +341,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert translated Natural Questions plus sampled Polish MS MARCO docs to Parquet."
     )
-    parser.add_argument("--input_path", type=str, default=DEFAULT_INPUT_PATH)
+    parser.add_argument(
+        "--natural_questions_dataset",
+        type=str,
+        default=DEFAULT_NATURAL_QUESTIONS_DATASET,
+    )
+    parser.add_argument("--natural_questions_split", type=str, default="train")
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"))
     parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"))
@@ -336,7 +360,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(
-        input_path=args.input_path,
+        natural_questions_dataset=args.natural_questions_dataset,
+        natural_questions_split=args.natural_questions_split,
         queries_path=args.queries_path,
         corpus_path=args.corpus_path,
         relevant_path=args.relevant_path,
