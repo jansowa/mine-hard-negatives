@@ -87,6 +87,8 @@ If an older LanceDB table was created with many tiny appends, run one ingest wit
 
 `find_negatives.py` writes worker JSONL files incrementally for crash-safe resume, then streams those files into the final Parquet output. Tune the Parquet consolidation chunk with `NEGATIVES_PARQUET_ROW_GROUP_SIZE` if needed; the default is `100000` rows.
 
+If `--embedding_batch_size` or `--reranker_batch_size` is omitted, `find_negatives.py` auto-tunes that batch size at startup. Explicit CLI values skip startup tuning. The embedder and reranker are tuned separately with `--auto_embedding_batch_size_*` and `--auto_reranker_batch_size_*` options; both tuners stop growing candidates when CUDA memory headroom looks too small, and reranking retries with a smaller batch if a recoverable CUDA OOM still happens during mining.
+
 For timing diagnostics, run mining with `--profile-timing` or set `NEGATIVE_PROFILE_TIMING=true`. This prints aggregate hot-path timings for search, reranking, JSONL writes, random fallback sampling, and Parquet writes. Leave profiling disabled for final throughput measurements.
 
 With LanceDB, query embeddings are cached during negative mining to avoid recomputing the same query vector across offset groups. Control this with `LANCEDB_QUERY_VECTOR_CACHE_SIZE`; set it to `0` to disable the cache. LanceDB random fallback sampling also caches the table rows after the first fallback sample in a run.
