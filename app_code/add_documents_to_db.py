@@ -1,5 +1,4 @@
 import argparse
-import os
 
 from datasets import Dataset
 from decouple import config
@@ -21,7 +20,7 @@ def filter_dataset_by_missing_ids_ds(
         return ds
 
     if num_proc is None:
-        num_proc = max(os.cpu_count() or 1, 1)
+        num_proc = 1
 
     def _pred(batch):
         return [str(x) not in existing_ids for x in batch["id"]]
@@ -37,10 +36,15 @@ def add_documents_from_dataset(
     batch_size: int,
     backend: VectorBackend,
     total_hint: int | None = None,
+    db_write_batch_size: int | None = None,
 ) -> None:
     total = total_hint if total_hint is not None else len(ds)
+    write_batch_size = db_write_batch_size or batch_size
+    if write_batch_size <= 0:
+        raise ValueError("db_write_batch_size must be greater than 0")
+
     with tqdm(total=total, desc="Adding documents to vector database") as pbar:
-        for batch in ds.iter(batch_size=batch_size):
+        for batch in ds.iter(batch_size=write_batch_size):
             documents: list[Document] = []
             for content, doc_id in zip(batch["text"], batch["id"]):
                 if not content:
@@ -57,10 +61,18 @@ def process_file(
     dense_model_name: str,
     sparse_model_name: str,
     batch_size: int,
+    db_write_batch_size: int,
     database_collection_name: str,
     skip: int = 0,
     offset: int | None = None,
+    resume: bool = True,
+    compact_existing: str = "none",
 ) -> None:
+    if batch_size <= 0:
+        raise ValueError("--batch_size must be greater than 0")
+    if db_write_batch_size <= 0:
+        raise ValueError("--db_write_batch_size must be greater than 0")
+
     ds_all = Dataset.from_parquet(dataset_path)
     total_in_parquet = len(ds_all)
 
@@ -74,14 +86,16 @@ def process_file(
     end_idx = total_in_parquet if offset is None else min(total_in_parquet, skip + max(offset, 0))
     ds_window = ds_all.select(list(range(skip, end_idx)))
 
-    dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
     backend_type = get_vector_db_backend()
 
-    sparse_embeddings = None
-    dense_dim_size = None
     if backend_type == "qdrant":
+        dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
         sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=batch_size)
         dense_dim_size = len(dense_embeddings.embed_query("text"))
+    else:
+        dense_embeddings = None
+        sparse_embeddings = None
+        dense_dim_size = None
 
     backend = create_vector_backend(
         collection_name=database_collection_name,
@@ -90,26 +104,56 @@ def process_file(
         dense_dim_size=dense_dim_size,
     )
 
-    existing_ids = backend.existing_document_ids()
-    ds_filtered = filter_dataset_by_missing_ids_ds(ds_window, existing_ids)
+    if compact_existing != "none":
+        print(f"Preparing existing backend table with compact_existing={compact_existing!r}...")
+        backend.compact_existing(compact_existing)
+        backend.print_storage_stats()
+
+    if resume:
+        print("Scanning existing document_id values for resume...")
+        existing_ids = backend.existing_document_ids()
+        ds_filtered = filter_dataset_by_missing_ids_ds(ds_window, existing_ids)
+    else:
+        existing_ids = set()
+        ds_filtered = ds_window
 
     print(f"Corpus items in parquet: {total_in_parquet}")
     print(f"Selected window (skip={skip}, offset={offset}): {len(ds_window)}")
+    print(f"Resume enabled: {resume}")
     print(f"Already present in backend ({database_collection_name}): {len(existing_ids)}")
     print(f"Will add from selected window (after filtering): {len(ds_filtered)}")
+    print(f"Embedding batch size: {batch_size}")
+    effective_db_write_batch_size = db_write_batch_size if backend_type == "lancedb" else batch_size
+    print(f"DB write batch size: {effective_db_write_batch_size}")
 
     if len(ds_filtered) == 0:
+        print("Optimizing backend where supported...")
+        backend.optimize()
         print("Ensuring vector/text indexes where supported...")
         backend.ensure_indexes()
+        backend.print_storage_stats()
         print("Index check completed.")
         print("Nothing to add. Exiting.")
         return
 
+    if backend_type == "lancedb":
+        dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
+        backend.set_dense_embeddings(dense_embeddings)
+
     print(f"Number of points before adding documents: {backend.count()}")
-    add_documents_from_dataset(ds_filtered, batch_size, backend, total_hint=len(ds_filtered))
+    add_documents_from_dataset(
+        ds_filtered,
+        batch_size,
+        backend,
+        total_hint=len(ds_filtered),
+        db_write_batch_size=effective_db_write_batch_size,
+    )
     print(f"Number of points after adding documents: {backend.count()}")
+    print("Optimizing backend where supported...")
+    backend.optimize()
     print("Ensuring vector/text indexes where supported...")
     backend.ensure_indexes()
+    backend.print_storage_stats()
     print("Index check completed.")
 
 
@@ -119,9 +163,18 @@ if __name__ == "__main__":
     parser.add_argument("--dense_model_name", type=str, default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, default=config("SPLADE_MODEL_NAME"))
     parser.add_argument("--batch_size", type=int, default=config("EMBEDDER_BATCH_SIZE", cast=int))
+    parser.add_argument(
+        "--db_write_batch_size",
+        type=int,
+        default=config("LANCEDB_DB_WRITE_BATCH_SIZE", cast=int, default=4096),
+    )
     parser.add_argument("--database_collection_name", type=str, default="all_documents")
     parser.add_argument("--skip", type=int, default=0)
     parser.add_argument("--offset", type=int, default=None)
+    parser.add_argument("--resume", dest="resume", action="store_true")
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.set_defaults(resume=config("ADD_DOCUMENTS_RESUME", cast=bool, default=True))
+    parser.add_argument("--compact_existing", choices=["none", "optimize", "rebuild"], default="none")
     args = parser.parse_args()
 
     process_file(
@@ -129,7 +182,10 @@ if __name__ == "__main__":
         dense_model_name=args.dense_model_name,
         sparse_model_name=args.sparse_model_name,
         batch_size=args.batch_size,
+        db_write_batch_size=args.db_write_batch_size,
         database_collection_name=args.database_collection_name,
         skip=args.skip,
         offset=args.offset,
+        resume=args.resume,
+        compact_existing=args.compact_existing,
     )

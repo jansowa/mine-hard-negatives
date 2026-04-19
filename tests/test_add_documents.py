@@ -7,13 +7,16 @@ from langchain_core.documents import Document
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 
 from add_documents_to_db import add_documents_from_dataset, filter_dataset_by_missing_ids_ds
+from utils.vector_db import LanceDBBackend
 
 
 class FakeBackend:
     def __init__(self):
         self.added = []
+        self.calls = []
 
     def upsert_documents(self, documents):
+        self.calls.append(list(documents))
         self.added.extend(documents)
 
 
@@ -33,3 +36,30 @@ def test_add_documents_from_dataset_skips_empty_content():
     assert len(backend.added) == 1
     assert isinstance(backend.added[0], Document)
     assert backend.added[0].metadata["document_id"] == "1"
+
+
+def test_add_documents_from_dataset_uses_db_write_batch_size():
+    ds = Dataset.from_dict({"id": [str(i) for i in range(5)], "text": [f"text {i}" for i in range(5)]})
+    backend = FakeBackend()
+
+    add_documents_from_dataset(ds, batch_size=1, db_write_batch_size=2, backend=backend)
+
+    assert [len(call) for call in backend.calls] == [2, 2, 1]
+
+
+def test_normalise_vectors_does_not_count_rows_per_document():
+    backend = LanceDBBackend.__new__(LanceDBBackend)
+    backend.count = lambda: (_ for _ in ()).throw(AssertionError("count_rows should not be called"))
+
+    assert backend._normalise_vectors([[1.0, 2.0], [3.0, 4.0]]) == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_normalise_vectors_rejects_inconsistent_dimensions():
+    backend = LanceDBBackend.__new__(LanceDBBackend)
+
+    try:
+        backend._normalise_vectors([[1.0, 2.0], [3.0]])
+    except ValueError as exc:
+        assert "Inconsistent dense embedding dimensions" in str(exc)
+    else:
+        raise AssertionError("Expected inconsistent dimensions to be rejected")

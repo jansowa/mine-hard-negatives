@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import os
 import random
+import shutil
+import time
 from abc import ABC, abstractmethod
+from datetime import timedelta
+from pathlib import Path
 from typing import Iterable
 
+from decouple import config
 from langchain_core.documents import Document
 
 from config import get_lancedb_path, get_qdrant_url, get_vector_db_backend
@@ -37,6 +43,18 @@ class VectorBackend(ABC):
         ...
 
     def ensure_indexes(self) -> None:
+        return None
+
+    def optimize(self) -> None:
+        return None
+
+    def compact_existing(self, mode: str = "none") -> None:
+        return None
+
+    def print_storage_stats(self) -> None:
+        return None
+
+    def set_dense_embeddings(self, dense_embeddings) -> None:
         return None
 
 
@@ -145,32 +163,77 @@ class LanceDBBackend(VectorBackend):
 
         self.collection_name = collection_name
         self.dense_embeddings = dense_embeddings
-        self.db = lancedb.connect(lancedb_path or get_lancedb_path())
+        self.lancedb_path = lancedb_path or get_lancedb_path()
+        self.nprobes = config("LANCEDB_NPROBES", cast=int, default=20)
+        self.refine_factor = config("LANCEDB_REFINE_FACTOR", cast=int, default=2)
+        self.target_partition_size = config("LANCEDB_TARGET_PARTITION_SIZE", cast=int, default=4096)
+        self.db = lancedb.connect(self.lancedb_path)
         self.table = self._load_table_if_exists(collection_name)
 
     def _load_table_if_exists(self, collection_name: str):
         if hasattr(self.db, "list_tables"):
-            table_names = set(self.db.list_tables())
+            raw_table_names = self.db.list_tables()
         else:
-            table_names = set(self.db.table_names())
+            raw_table_names = self.db.table_names()
+
+        table_names = set()
+        if hasattr(raw_table_names, "tables"):
+            table_names.update(str(name) for name in raw_table_names.tables)
+
+        for item in raw_table_names:
+            if isinstance(item, str):
+                table_names.add(item)
+            elif isinstance(item, (list, tuple)) and item:
+                key = str(item[0])
+                value = item[1] if len(item) > 1 else None
+                if key == "tables" and isinstance(value, list):
+                    table_names.update(str(name) for name in value)
+                elif key not in {"tables", "page_token"}:
+                    table_names.add(key)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("table_name")
+                if name:
+                    table_names.add(str(name))
+            elif hasattr(item, "name"):
+                table_names.add(str(item.name))
+
         if collection_name in table_names:
             return self.db.open_table(collection_name)
+
+        try:
+            return self.db.open_table(collection_name)
+        except Exception:
+            pass
+
         return None
 
-    def _ensure_dimensionality(self, vector: Iterable[float]) -> list[float]:
-        values = list(vector)
-        if self.count() == 0:
+    def set_dense_embeddings(self, dense_embeddings) -> None:
+        self.dense_embeddings = dense_embeddings
+
+    @staticmethod
+    def _normalise_vectors(vectors: Iterable[Iterable[float]]) -> list[list[float]]:
+        values = [list(vector) for vector in vectors]
+        if not values:
             return values
-        if len(values) == 0:
+
+        dim = len(values[0])
+        if dim == 0:
             raise ValueError("Dense embedding returned empty vector")
+
+        for vector in values:
+            if len(vector) != dim:
+                raise ValueError(f"Inconsistent dense embedding dimensions in one batch: {dim} and {len(vector)}")
+
         return values
 
     def upsert_documents(self, documents: list[Document]) -> None:
         if not documents:
             return
+        if self.dense_embeddings is None:
+            raise ValueError("Dense embeddings must be configured before adding LanceDB documents")
 
         texts = [d.page_content for d in documents]
-        vectors = self.dense_embeddings.embed_documents(texts)
+        vectors = self._normalise_vectors(self.dense_embeddings.embed_documents(texts))
 
         rows = []
         for doc, vector in zip(documents, vectors):
@@ -178,11 +241,19 @@ class LanceDBBackend(VectorBackend):
                 {
                     "document_id": str(doc.metadata.get("document_id")),
                     "text": doc.page_content,
-                    "vector": self._ensure_dimensionality(vector),
+                    "vector": vector,
                 }
             )
 
         if self.table is None:
+            table_dir = self._table_dir(self.collection_name)
+            if table_dir.exists():
+                self._reconnect()
+            if self.table is None and table_dir.exists():
+                raise RuntimeError(
+                    f"LanceDB table directory exists but table {self.collection_name!r} could not be opened. "
+                    "Refusing to overwrite existing data."
+                )
             self.table = self.db.create_table(self.collection_name, data=rows, mode="overwrite")
         else:
             self.table.add(rows)
@@ -195,15 +266,27 @@ class LanceDBBackend(VectorBackend):
     def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]:
         if self.table is None:
             return []
+        if self.dense_embeddings is None:
+            raise ValueError("Dense embeddings must be configured before LanceDB search")
 
         vector = self.dense_embeddings.embed_query(query_text)
         limit = max(k + offset, k)
 
         # Prefer hybrid query: dense + BM25 FTS.
         try:
-            hits = self.table.search(query_type="hybrid").vector(vector).text(query_text).limit(limit).to_list()
+            hits = (
+                self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
+                .select(["document_id", "text"])
+                .limit(limit)
+                .to_list()
+            )
         except Exception:
-            hits = self.table.search(vector).limit(limit).to_list()
+            hits = (
+                self._tune_query(self.table.search(vector))
+                .select(["document_id", "text"])
+                .limit(limit)
+                .to_list()
+            )
 
         docs = []
         for hit in hits[offset:offset + k]:
@@ -215,6 +298,8 @@ class LanceDBBackend(VectorBackend):
     def search_many_offsets(self, query_text: str, k: int, offsets: list[int]) -> dict[int, list[Document]]:
         if self.table is None:
             return {offset: [] for offset in offsets}
+        if self.dense_embeddings is None:
+            raise ValueError("Dense embeddings must be configured before LanceDB search")
 
         offsets = sorted(set(offsets))
         if not offsets:
@@ -225,9 +310,19 @@ class LanceDBBackend(VectorBackend):
 
         # Prefer hybrid query: dense + BM25 FTS.
         try:
-            hits = self.table.search(query_type="hybrid").vector(vector).text(query_text).limit(limit).to_list()
+            hits = (
+                self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
+                .select(["document_id", "text"])
+                .limit(limit)
+                .to_list()
+            )
         except Exception:
-            hits = self.table.search(vector).limit(limit).to_list()
+            hits = (
+                self._tune_query(self.table.search(vector))
+                .select(["document_id", "text"])
+                .limit(limit)
+                .to_list()
+            )
 
         out: dict[int, list[Document]] = {}
         for offset in offsets:
@@ -241,7 +336,7 @@ class LanceDBBackend(VectorBackend):
     def random_sample(self, k: int) -> list[Document]:
         if self.table is None:
             return []
-        rows = self.table.to_list()
+        rows = self.table.to_arrow().select(["document_id", "text"]).to_pylist()
         if len(rows) <= k:
             sample = rows
         else:
@@ -252,10 +347,43 @@ class LanceDBBackend(VectorBackend):
     def existing_document_ids(self) -> set[str]:
         if self.table is None:
             return set()
-        return {
-            str(row.get("document_id"))
-            for row in self.table.to_list()
-        }
+
+        existing: set[str] = set()
+        for batch in self._document_id_batches():
+            existing.update(str(doc_id) for doc_id in self._batch_document_ids(batch) if doc_id is not None)
+        return existing
+
+    @staticmethod
+    def _batch_document_ids(batch) -> list:
+        if hasattr(batch, "column_names") and "document_id" in batch.column_names:
+            return batch.column(batch.column_names.index("document_id")).to_pylist()
+        if hasattr(batch, "schema"):
+            index = batch.schema.get_field_index("document_id")
+            if index >= 0:
+                return batch.column(index).to_pylist()
+        return batch.column("document_id").to_pylist()
+
+    def _document_id_batches(self):
+        try:
+            dataset = self.table.to_lance()
+            if hasattr(dataset, "to_batches"):
+                try:
+                    yield from dataset.to_batches(columns=["document_id"], batch_size=100_000)
+                    return
+                except TypeError:
+                    yield from dataset.to_batches(columns=["document_id"])
+                    return
+        except Exception:
+            pass
+
+        yield from self.table.to_arrow().select(["document_id"]).to_batches(max_chunksize=100_000)
+
+    def _tune_query(self, query):
+        if self.nprobes and hasattr(query, "nprobes"):
+            query = query.nprobes(self.nprobes)
+        if self.refine_factor and hasattr(query, "refine_factor"):
+            query = query.refine_factor(self.refine_factor)
+        return query
 
     def ensure_indexes(self) -> None:
         if self.table is None or self.count() == 0:
@@ -273,20 +401,148 @@ class LanceDBBackend(VectorBackend):
 
         if not has_vector_index:
             try:
+                print(
+                    "Creating LanceDB vector index "
+                    f"(IVF_FLAT, metric=cosine, target_partition_size={self.target_partition_size})..."
+                )
                 self.table.create_index(
                     metric="cosine",
                     vector_column_name="vector",
                     index_type="IVF_FLAT",
                     replace=False,
+                    target_partition_size=self.target_partition_size,
                 )
-            except Exception:
-                pass
+                print("LanceDB vector index created.")
+            except Exception as exc:
+                print(f"WARNING: LanceDB vector index was not created ({type(exc).__name__}: {exc})")
 
         if not has_fts_index:
             try:
+                print("Creating LanceDB FTS index on 'text'...")
                 self.table.create_fts_index("text", replace=False)
-            except Exception:
-                pass
+                print("LanceDB FTS index created.")
+            except Exception as exc:
+                print(f"WARNING: LanceDB FTS index was not created ({type(exc).__name__}: {exc})")
+
+        try:
+            print("LanceDB indices:")
+            for index in self.table.list_indices():
+                print(f"  - {index}")
+        except Exception as exc:
+            print(f"WARNING: LanceDB indices could not be listed ({type(exc).__name__}: {exc})")
+
+    def optimize(self) -> None:
+        if self.table is None or self.count() == 0:
+            return
+
+        print("Optimizing LanceDB table (compaction + pruning old versions)...")
+        self.table.optimize(cleanup_older_than=timedelta(days=0), delete_unverified=False)
+        try:
+            self.table.checkout_latest()
+        except Exception:
+            self.table = self.db.open_table(self.collection_name)
+        print("LanceDB optimize completed.")
+
+    def compact_existing(self, mode: str = "none") -> None:
+        if mode == "none" or self.table is None:
+            return
+        if mode == "optimize":
+            self.optimize()
+            return
+        if mode != "rebuild":
+            raise ValueError("--compact_existing must be one of: none, optimize, rebuild")
+
+        self._rebuild_table_safely()
+
+    def _rebuild_table_safely(self) -> None:
+        table_dir = self._table_dir(self.collection_name)
+        if not table_dir.exists():
+            print(f"LanceDB table directory not found for rebuild: {table_dir}")
+            return
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        tmp_name = f"{self.collection_name}__rebuild_{timestamp}"
+        tmp_dir = self._table_dir(tmp_name)
+        backup_dir = table_dir.with_name(f"{table_dir.name}.backup-{timestamp}")
+
+        if tmp_dir.exists() or backup_dir.exists():
+            raise FileExistsError(f"Rebuild target already exists: {tmp_dir} or {backup_dir}")
+
+        print(f"Rebuilding LanceDB table {self.collection_name!r} into compact table {tmp_name!r}...")
+        data = self.table.to_arrow()
+        expected_count = data.num_rows
+        expected_ids = set(str(doc_id) for doc_id in data.column("document_id").to_pylist() if doc_id is not None)
+
+        rebuilt = self.db.create_table(tmp_name, data=data, mode="overwrite")
+        rebuilt_count = rebuilt.count_rows()
+        if rebuilt_count != expected_count:
+            raise RuntimeError(f"Rebuilt table row count mismatch: {rebuilt_count} != {expected_count}")
+
+        try:
+            self.table = None
+            shutil.move(str(table_dir), str(backup_dir))
+            shutil.move(str(tmp_dir), str(table_dir))
+            self._reconnect()
+            actual_count = self.count()
+            actual_ids = self.existing_document_ids()
+            if actual_count != expected_count or actual_ids != expected_ids:
+                raise RuntimeError(
+                    "Rebuilt table validation failed: "
+                    f"count {actual_count}/{expected_count}, ids {len(actual_ids)}/{len(expected_ids)}"
+                )
+        except Exception:
+            if table_dir.exists() and backup_dir.exists():
+                failed_dir = table_dir.with_name(f"{table_dir.name}.failed-rebuild-{timestamp}")
+                shutil.move(str(table_dir), str(failed_dir))
+            if backup_dir.exists() and not table_dir.exists():
+                shutil.move(str(backup_dir), str(table_dir))
+            self._reconnect()
+            raise
+
+        print(f"LanceDB rebuild completed. Old table backup: {backup_dir}")
+
+    def _reconnect(self) -> None:
+        import lancedb
+
+        self.db = lancedb.connect(self.lancedb_path)
+        self.table = self._load_table_if_exists(self.collection_name)
+
+    def _table_dir(self, collection_name: str) -> Path:
+        return Path(self.lancedb_path) / f"{collection_name}.lance"
+
+    def print_storage_stats(self) -> None:
+        root = self._table_dir(self.collection_name)
+        if not root.exists():
+            return
+
+        print("LanceDB storage stats:")
+        for rel in ("data", "_versions", "_transactions"):
+            path = root / rel
+            if path.exists():
+                size = self._directory_size(path)
+                files = sum(1 for item in path.rglob("*") if item.is_file())
+                print(f"  {rel}: {files} files, {self._format_bytes(size)}")
+        print(f"  total: {self._format_bytes(self._directory_size(root))}")
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        total = 0
+        for dirpath, _, filenames in os.walk(path):
+            for filename in filenames:
+                try:
+                    total += (Path(dirpath) / filename).stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    @staticmethod
+    def _format_bytes(size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if value < 1024 or unit == "TiB":
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} TiB"
 
 
 def create_vector_backend(

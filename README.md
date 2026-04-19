@@ -71,6 +71,14 @@ This starts the `executable` container and optional `vdb` service based on Qdran
 - `VECTOR_DB_BACKEND=lancedb` uses dense retrieval + LanceDB BM25/hybrid.
 - `VECTOR_DB_BACKEND=qdrant` keeps dense+sparse (SPLADE) flow.
 
+### LanceDB ingest notes
+
+For LanceDB, `add_documents_to_db.py` keeps the embedding batch size separate from the database write batch size. Use `--batch_size` for model/GPU batching and `--db_write_batch_size` for larger LanceDB appends. The default LanceDB write batch is `4096`, which avoids creating many tiny Lance table versions.
+
+Document ingest resumes by default. On startup the script scans existing `document_id` values and only embeds missing documents. Pass `--no-resume` only when intentionally rebuilding a fresh table.
+
+If an older LanceDB table was created with many tiny appends, run one ingest with `--compact_existing rebuild` after stopping any active writer. This rebuilds the current table into a compact table and leaves the old table directory as a timestamped backup.
+
 ## Quick end-to-end smoke test (sample JSONL)
 
 If you want to quickly verify that the full pipeline wiring works, you can run it on the tiny sample file already in the repo: `app_code/data/input.jsonl`.
@@ -100,6 +108,8 @@ python app_code/add_documents_to_db.py \
   --dataset_path ./.smoke/corpus.parquet \
   --dense_model_name sdadas/mmlw-retrieval-roberta-base \
   --batch_size 8 \
+  --db_write_batch_size 4096 \
+  --resume \
   --database_collection_name smoke_documents
 
 # 4) Score positives
