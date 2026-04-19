@@ -161,6 +161,9 @@ class QdrantBackend(VectorBackend):
 
 
 class LanceDBBackend(VectorBackend):
+    HYBRID_SELECT_COLUMNS = ["document_id", "text", "_distance", "_score"]
+    VECTOR_SELECT_COLUMNS = ["document_id", "text", "_distance"]
+
     def __init__(self, collection_name: str, dense_embeddings, lancedb_path: str | None = None) -> None:
         import lancedb
 
@@ -311,14 +314,14 @@ class LanceDBBackend(VectorBackend):
         try:
             hits = (
                 self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
-                .select(["document_id", "text"])
+                .select(self.HYBRID_SELECT_COLUMNS)
                 .limit(limit)
                 .to_list()
             )
         except Exception:
             hits = (
                 self._tune_query(self.table.search(vector))
-                .select(["document_id", "text"])
+                .select(self.VECTOR_SELECT_COLUMNS)
                 .limit(limit)
                 .to_list()
             )
@@ -347,14 +350,14 @@ class LanceDBBackend(VectorBackend):
         try:
             hits = (
                 self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
-                .select(["document_id", "text"])
+                .select(self.HYBRID_SELECT_COLUMNS)
                 .limit(limit)
                 .to_list()
             )
         except Exception:
             hits = (
                 self._tune_query(self.table.search(vector))
-                .select(["document_id", "text"])
+                .select(self.VECTOR_SELECT_COLUMNS)
                 .limit(limit)
                 .to_list()
             )
