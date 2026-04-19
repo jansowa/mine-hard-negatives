@@ -1,4 +1,6 @@
 import argparse
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from datasets import Dataset
 from decouple import config
@@ -56,22 +58,228 @@ def add_documents_from_dataset(
                 pbar.update(len(documents))
 
 
+def set_dense_embedding_batch_size(dense_embeddings, batch_size: int) -> None:
+    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
+    if isinstance(encode_kwargs, dict):
+        encode_kwargs["batch_size"] = batch_size
+
+
+def embed_dense_documents(dense_embeddings, texts: list[str]):
+    client = getattr(dense_embeddings, "_client", None)
+    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
+    if client is not None and isinstance(encode_kwargs, dict) and hasattr(client, "encode"):
+        texts = [text.replace("\n", " ") for text in texts]
+        return client.encode(
+            texts,
+            show_progress_bar=getattr(dense_embeddings, "show_progress", False),
+            **encode_kwargs,
+        )
+
+    return dense_embeddings.embed_documents(texts)
+
+
+def parse_batch_size_candidates(raw_candidates: str | None, minimum: int, maximum: int) -> list[int]:
+    if raw_candidates:
+        candidates = [int(item.strip()) for item in raw_candidates.split(",") if item.strip()]
+    else:
+        candidates = []
+        value = minimum
+        while value <= maximum:
+            candidates.append(value)
+            value *= 2
+        if maximum not in candidates:
+            candidates.append(maximum)
+
+    candidates = sorted({candidate for candidate in candidates if candidate > 0})
+    if not candidates:
+        raise ValueError("Auto batch-size candidates must contain at least one positive integer")
+    return candidates
+
+
+def collect_text_sample(ds: Dataset, sample_size: int) -> list[str]:
+    if sample_size <= 0:
+        return []
+
+    sample: list[str] = []
+    batch_size = min(max(sample_size, 1), 10_000)
+    for batch in ds.iter(batch_size=batch_size):
+        for text in batch["text"]:
+            if text:
+                sample.append(text)
+                if len(sample) >= sample_size:
+                    return sample
+    return sample
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or exc.__class__.__name__ == "OutOfMemoryError"
+
+
+def clear_cuda_cache() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        return
+
+
+def synchronize_cuda() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        return
+
+
+def benchmark_dense_batch_size(
+    dense_embeddings,
+    sample_texts: list[str],
+    candidates: list[int],
+) -> int:
+    if not sample_texts:
+        return candidates[0]
+
+    print(f"Auto-tuning embedding batch size on {len(sample_texts)} sample documents...")
+    results: list[tuple[float, int]] = []
+
+    warmup_size = min(len(sample_texts), candidates[0])
+    if warmup_size:
+        try:
+            set_dense_embedding_batch_size(dense_embeddings, candidates[0])
+            embed_dense_documents(dense_embeddings, sample_texts[:warmup_size])
+            synchronize_cuda()
+        except Exception as exc:
+            if is_cuda_oom(exc):
+                clear_cuda_cache()
+            else:
+                print(f"WARNING: batch-size warmup failed ({type(exc).__name__}: {exc})")
+
+    for candidate in candidates:
+        set_dense_embedding_batch_size(dense_embeddings, candidate)
+        clear_cuda_cache()
+        started_at = time.perf_counter()
+        try:
+            embed_dense_documents(dense_embeddings, sample_texts)
+            synchronize_cuda()
+        except Exception as exc:
+            clear_cuda_cache()
+            if is_cuda_oom(exc):
+                print(f"  batch_size={candidate}: OOM, stopping candidate search")
+                break
+            print(f"  batch_size={candidate}: failed ({type(exc).__name__}: {exc})")
+            continue
+
+        elapsed = max(time.perf_counter() - started_at, 1e-9)
+        docs_per_second = len(sample_texts) / elapsed
+        print(f"  batch_size={candidate}: {docs_per_second:.1f} docs/s ({elapsed:.2f}s)")
+        results.append((docs_per_second, candidate))
+
+    if not results:
+        raise RuntimeError("Could not find a working embedding batch size")
+
+    best_speed = max(speed for speed, _ in results)
+    selected = min(candidate for speed, candidate in results if speed >= best_speed * 0.98)
+    set_dense_embedding_batch_size(dense_embeddings, selected)
+    print(f"Selected embedding batch size: {selected}")
+    return selected
+
+
+def write_lancedb_embedding_batch(
+    backend: VectorBackend,
+    document_ids: list[str],
+    texts: list[str],
+    vectors,
+) -> int:
+    backend.upsert_embeddings(document_ids=document_ids, texts=texts, vectors=vectors)
+    return len(texts)
+
+
+def add_documents_to_lancedb_from_dataset(
+    ds: Dataset,
+    dense_embeddings,
+    backend: VectorBackend,
+    total_hint: int | None = None,
+    db_write_batch_size: int | None = None,
+    async_write: bool = True,
+) -> None:
+    total = total_hint if total_hint is not None else len(ds)
+    write_batch_size = db_write_batch_size or config("LANCEDB_DB_WRITE_BATCH_SIZE", cast=int, default=4096)
+    if write_batch_size <= 0:
+        raise ValueError("db_write_batch_size must be greater than 0")
+
+    executor = ThreadPoolExecutor(max_workers=1) if async_write else None
+    pending_write = None
+
+    try:
+        with tqdm(total=total, desc="Adding documents to LanceDB") as pbar:
+            for batch in ds.iter(batch_size=write_batch_size):
+                document_ids: list[str] = []
+                texts: list[str] = []
+                for content, doc_id in zip(batch["text"], batch["id"]):
+                    if not content:
+                        continue
+                    document_ids.append(str(doc_id))
+                    texts.append(content)
+
+                if not texts:
+                    continue
+
+                vectors = embed_dense_documents(dense_embeddings, texts)
+
+                if pending_write is not None:
+                    pbar.update(pending_write.result())
+                    pending_write = None
+
+                if executor is None:
+                    backend.upsert_embeddings(document_ids=document_ids, texts=texts, vectors=vectors)
+                    pbar.update(len(texts))
+                else:
+                    pending_write = executor.submit(
+                        write_lancedb_embedding_batch,
+                        backend,
+                        document_ids,
+                        texts,
+                        vectors,
+                    )
+
+            if pending_write is not None:
+                pbar.update(pending_write.result())
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+
 def process_file(
     dataset_path: str,
     dense_model_name: str,
     sparse_model_name: str,
-    batch_size: int,
+    batch_size: int | None,
     db_write_batch_size: int,
     database_collection_name: str,
     skip: int = 0,
     offset: int | None = None,
     resume: bool = True,
     compact_existing: str = "none",
+    auto_batch_size_candidates: str | None = None,
+    auto_batch_size_min: int = 8,
+    auto_batch_size_max: int = 256,
+    auto_batch_size_sample_size: int = 512,
+    lancedb_async_write: bool = True,
 ) -> None:
-    if batch_size <= 0:
+    if batch_size is not None and batch_size <= 0:
         raise ValueError("--batch_size must be greater than 0")
     if db_write_batch_size <= 0:
         raise ValueError("--db_write_batch_size must be greater than 0")
+    if auto_batch_size_min <= 0 or auto_batch_size_max <= 0:
+        raise ValueError("--auto_batch_size_min and --auto_batch_size_max must be greater than 0")
+    if auto_batch_size_min > auto_batch_size_max:
+        raise ValueError("--auto_batch_size_min cannot be greater than --auto_batch_size_max")
 
     ds_all = Dataset.from_parquet(dataset_path)
     total_in_parquet = len(ds_all)
@@ -84,13 +292,15 @@ def process_file(
         return
 
     end_idx = total_in_parquet if offset is None else min(total_in_parquet, skip + max(offset, 0))
-    ds_window = ds_all.select(list(range(skip, end_idx)))
+    ds_window = ds_all.select(range(skip, end_idx))
 
     backend_type = get_vector_db_backend()
+    effective_batch_size = batch_size
 
     if backend_type == "qdrant":
-        dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
-        sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=batch_size)
+        effective_batch_size = batch_size or config("EMBEDDER_BATCH_SIZE", cast=int)
+        dense_embeddings = get_dense_model(dense_model_name, batch_size=effective_batch_size)
+        sparse_embeddings = get_sparse_model(sparse_model_name, batch_size=effective_batch_size)
         dense_dim_size = len(dense_embeddings.embed_query("text"))
     else:
         dense_embeddings = None
@@ -122,9 +332,7 @@ def process_file(
     print(f"Resume enabled: {resume}")
     print(f"Already present in backend ({database_collection_name}): {len(existing_ids)}")
     print(f"Will add from selected window (after filtering): {len(ds_filtered)}")
-    print(f"Embedding batch size: {batch_size}")
-    effective_db_write_batch_size = db_write_batch_size if backend_type == "lancedb" else batch_size
-    print(f"DB write batch size: {effective_db_write_batch_size}")
+    effective_db_write_batch_size = db_write_batch_size if backend_type == "lancedb" else effective_batch_size
 
     if len(ds_filtered) == 0:
         print("Optimizing backend where supported...")
@@ -137,17 +345,44 @@ def process_file(
         return
 
     if backend_type == "lancedb":
-        dense_embeddings = get_dense_model(dense_model_name, batch_size=batch_size)
+        initial_batch_size = batch_size or auto_batch_size_min
+        dense_embeddings = get_dense_model(dense_model_name, batch_size=initial_batch_size)
+        if batch_size is None:
+            candidates = parse_batch_size_candidates(
+                auto_batch_size_candidates,
+                minimum=auto_batch_size_min,
+                maximum=auto_batch_size_max,
+            )
+            sample_texts = collect_text_sample(ds_filtered, auto_batch_size_sample_size)
+            effective_batch_size = benchmark_dense_batch_size(dense_embeddings, sample_texts, candidates)
+        else:
+            effective_batch_size = batch_size
+            set_dense_embedding_batch_size(dense_embeddings, effective_batch_size)
         backend.set_dense_embeddings(dense_embeddings)
 
+    print(f"Embedding batch size: {effective_batch_size}")
+    print(f"DB write batch size: {effective_db_write_batch_size}")
+    if backend_type == "lancedb":
+        print(f"LanceDB async write: {lancedb_async_write}")
+
     print(f"Number of points before adding documents: {backend.count()}")
-    add_documents_from_dataset(
-        ds_filtered,
-        batch_size,
-        backend,
-        total_hint=len(ds_filtered),
-        db_write_batch_size=effective_db_write_batch_size,
-    )
+    if backend_type == "lancedb":
+        add_documents_to_lancedb_from_dataset(
+            ds_filtered,
+            dense_embeddings,
+            backend,
+            total_hint=len(ds_filtered),
+            db_write_batch_size=effective_db_write_batch_size,
+            async_write=lancedb_async_write,
+        )
+    else:
+        add_documents_from_dataset(
+            ds_filtered,
+            effective_batch_size,
+            backend,
+            total_hint=len(ds_filtered),
+            db_write_batch_size=effective_db_write_batch_size,
+        )
     print(f"Number of points after adding documents: {backend.count()}")
     print("Optimizing backend where supported...")
     backend.optimize()
@@ -162,7 +397,16 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default=config("CORPUS_PATH"))
     parser.add_argument("--dense_model_name", type=str, default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, default=config("SPLADE_MODEL_NAME"))
-    parser.add_argument("--batch_size", type=int, default=config("EMBEDDER_BATCH_SIZE", cast=int))
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Embedding microbatch size. If omitted for LanceDB, a short benchmark selects it automatically.",
+    )
+    parser.add_argument("--auto_batch_size_candidates", type=str, default=None)
+    parser.add_argument("--auto_batch_size_min", type=int, default=8)
+    parser.add_argument("--auto_batch_size_max", type=int, default=256)
+    parser.add_argument("--auto_batch_size_sample_size", type=int, default=512)
     parser.add_argument(
         "--db_write_batch_size",
         type=int,
@@ -175,6 +419,14 @@ if __name__ == "__main__":
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.set_defaults(resume=config("ADD_DOCUMENTS_RESUME", cast=bool, default=True))
     parser.add_argument("--compact_existing", choices=["none", "optimize", "rebuild"], default="none")
+    parser.add_argument(
+        "--lancedb_async_write",
+        dest="lancedb_async_write",
+        action="store_true",
+        help="Overlap embedding of the next large chunk with LanceDB writing of the previous chunk.",
+    )
+    parser.add_argument("--no_lancedb_async_write", dest="lancedb_async_write", action="store_false")
+    parser.set_defaults(lancedb_async_write=config("LANCEDB_ASYNC_WRITE", cast=bool, default=True))
     args = parser.parse_args()
 
     process_file(
@@ -188,4 +440,9 @@ if __name__ == "__main__":
         offset=args.offset,
         resume=args.resume,
         compact_existing=args.compact_existing,
+        auto_batch_size_candidates=args.auto_batch_size_candidates,
+        auto_batch_size_min=args.auto_batch_size_min,
+        auto_batch_size_max=args.auto_batch_size_max,
+        auto_batch_size_sample_size=args.auto_batch_size_sample_size,
+        lancedb_async_write=args.lancedb_async_write,
     )

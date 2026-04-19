@@ -73,7 +73,11 @@ This starts the `executable` container and optional `vdb` service based on Qdran
 
 ### LanceDB ingest notes
 
-For LanceDB, `add_documents_to_db.py` keeps the embedding batch size separate from the database write batch size. Use `--batch_size` for model/GPU batching and `--db_write_batch_size` for larger LanceDB appends. The default LanceDB write batch is `4096`, which avoids creating many tiny Lance table versions.
+For LanceDB, `add_documents_to_db.py` keeps the embedding batch size separate from the database write batch size. Use `--batch_size` for model/GPU microbatching and `--db_write_batch_size` for larger LanceDB appends. The default LanceDB write batch is `4096`, which avoids creating many tiny Lance table versions.
+
+If `--batch_size` is omitted for LanceDB, the script runs a short startup benchmark and selects the embedding microbatch size automatically. Tune the search range with `--auto_batch_size_min`, `--auto_batch_size_max`, `--auto_batch_size_candidates`, and `--auto_batch_size_sample_size`. This does not change the LanceDB append size: writes still use `--db_write_batch_size`.
+
+LanceDB ingest overlaps embedding with database writes by default (`LANCEDB_ASYNC_WRITE=true`). The writer flushes one large completed append while the GPU starts embedding the next large chunk. Disable this with `--no_lancedb_async_write` if debugging write failures.
 
 Document ingest resumes by default. On startup the script scans existing `document_id` values and only embeds missing documents. Pass `--no-resume` only when intentionally rebuilding a fresh table.
 

@@ -6,7 +6,11 @@ from langchain_core.documents import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 
-from add_documents_to_db import add_documents_from_dataset, filter_dataset_by_missing_ids_ds
+from add_documents_to_db import (
+    add_documents_from_dataset,
+    add_documents_to_lancedb_from_dataset,
+    filter_dataset_by_missing_ids_ds,
+)
 from utils.vector_db import LanceDBBackend
 
 
@@ -18,6 +22,32 @@ class FakeBackend:
     def upsert_documents(self, documents):
         self.calls.append(list(documents))
         self.added.extend(documents)
+
+
+class FakeLanceBackend:
+    def __init__(self):
+        self.calls = []
+
+    def upsert_embeddings(self, document_ids, texts, vectors):
+        self.calls.append((list(document_ids), list(texts), vectors))
+
+
+class FakeSentenceTransformerClient:
+    def __init__(self):
+        self.batch_sizes = []
+
+    def encode(self, texts, show_progress_bar=False, **kwargs):
+        import numpy as np
+
+        self.batch_sizes.append(kwargs["batch_size"])
+        return np.zeros((len(texts), 2), dtype=np.float32)
+
+
+class FakeDenseEmbeddings:
+    def __init__(self, batch_size):
+        self.encode_kwargs = {"batch_size": batch_size}
+        self.show_progress = False
+        self._client = FakeSentenceTransformerClient()
 
 
 def test_filter_dataset_by_missing_ids_ds_removes_existing_ids():
@@ -45,6 +75,23 @@ def test_add_documents_from_dataset_uses_db_write_batch_size():
     add_documents_from_dataset(ds, batch_size=1, db_write_batch_size=2, backend=backend)
 
     assert [len(call) for call in backend.calls] == [2, 2, 1]
+
+
+def test_lancedb_fast_path_keeps_write_batches_larger_than_gpu_microbatches():
+    ds = Dataset.from_dict({"id": [str(i) for i in range(5)], "text": [f"text {i}" for i in range(5)]})
+    embeddings = FakeDenseEmbeddings(batch_size=2)
+    backend = FakeLanceBackend()
+
+    add_documents_to_lancedb_from_dataset(
+        ds,
+        embeddings,
+        backend,
+        db_write_batch_size=3,
+        async_write=False,
+    )
+
+    assert [len(call[0]) for call in backend.calls] == [3, 2]
+    assert embeddings._client.batch_sizes == [2, 2]
 
 
 def test_normalise_vectors_does_not_count_rows_per_document():

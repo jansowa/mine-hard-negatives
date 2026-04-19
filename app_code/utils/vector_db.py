@@ -20,6 +20,9 @@ class VectorBackend(ABC):
     def upsert_documents(self, documents: list[Document]) -> None:
         ...
 
+    def upsert_embeddings(self, document_ids: list[str], texts: list[str], vectors) -> None:
+        raise NotImplementedError("This backend does not support precomputed dense embedding upserts")
+
     @abstractmethod
     def count(self) -> int:
         ...
@@ -210,6 +213,21 @@ class LanceDBBackend(VectorBackend):
     def set_dense_embeddings(self, dense_embeddings) -> None:
         self.dense_embeddings = dense_embeddings
 
+    def upsert_embeddings(self, document_ids: list[str], texts: list[str], vectors) -> None:
+        if not document_ids:
+            return
+        if len(document_ids) != len(texts):
+            raise ValueError(f"document_ids/texts length mismatch: {len(document_ids)} != {len(texts)}")
+
+        vector_array = self._vectors_to_numpy(vectors)
+        if vector_array.shape[0] != len(texts):
+            raise ValueError(f"texts/vectors length mismatch: {len(texts)} != {vector_array.shape[0]}")
+        if vector_array.shape[1] == 0:
+            raise ValueError("Dense embedding returned empty vector")
+
+        data = self._arrow_rows(document_ids=document_ids, texts=texts, vectors=vector_array)
+        self._add_lancedb_rows(data)
+
     @staticmethod
     def _normalise_vectors(vectors: Iterable[Iterable[float]]) -> list[list[float]]:
         values = [list(vector) for vector in vectors]
@@ -226,6 +244,30 @@ class LanceDBBackend(VectorBackend):
 
         return values
 
+    @staticmethod
+    def _vectors_to_numpy(vectors):
+        import numpy as np
+
+        array = np.asarray(vectors, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(f"Dense embeddings must be a 2D array, got shape {array.shape}")
+        return array
+
+    @staticmethod
+    def _arrow_rows(document_ids: list[str], texts: list[str], vectors):
+        import pyarrow as pa
+
+        dim = vectors.shape[1]
+        vector_values = pa.array(vectors.reshape(-1), type=pa.float32())
+        vector_column = pa.FixedSizeListArray.from_arrays(vector_values, dim)
+        return pa.table(
+            {
+                "document_id": pa.array([str(doc_id) for doc_id in document_ids], type=pa.string()),
+                "text": pa.array(texts, type=pa.string()),
+                "vector": vector_column,
+            }
+        )
+
     def upsert_documents(self, documents: list[Document]) -> None:
         if not documents:
             return
@@ -234,17 +276,10 @@ class LanceDBBackend(VectorBackend):
 
         texts = [d.page_content for d in documents]
         vectors = self._normalise_vectors(self.dense_embeddings.embed_documents(texts))
+        document_ids = [str(doc.metadata.get("document_id")) for doc in documents]
+        self.upsert_embeddings(document_ids=document_ids, texts=texts, vectors=vectors)
 
-        rows = []
-        for doc, vector in zip(documents, vectors):
-            rows.append(
-                {
-                    "document_id": str(doc.metadata.get("document_id")),
-                    "text": doc.page_content,
-                    "vector": vector,
-                }
-            )
-
+    def _add_lancedb_rows(self, rows) -> None:
         if self.table is None:
             table_dir = self._table_dir(self.collection_name)
             if table_dir.exists():
