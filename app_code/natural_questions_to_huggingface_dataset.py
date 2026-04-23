@@ -14,7 +14,7 @@ from decouple import config
 from huggingface_hub import hf_hub_download
 
 BATCH_SIZE = 10_000
-DEFAULT_NATURAL_QUESTIONS_DATASET = "jansowa/natural-questions-hard-negatives-pl"
+DEFAULT_NATURAL_QUESTIONS_DATASET = "embedder-training/natural-questions-hard-negatives-pl"
 QUERY_ID_RE = re.compile(r"(\d+)$")
 
 
