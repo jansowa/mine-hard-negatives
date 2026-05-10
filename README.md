@@ -26,7 +26,7 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
      ```
      Install dependencies with:
      ```bash
-     uv pip install -r requirements.txt
+     uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements.txt
      ```
 
 ### 2) Docker Compose (optional local convenience setup)
@@ -36,6 +36,26 @@ docker compose up -d
 ```
 
 This starts the `executable` container and optional `vdb` service based on Qdrant.
+
+## Updating Requirements
+
+The `.in` files are the source of truth. Compile pinned requirements with `uv`:
+
+```bash
+uv pip compile requirements-lancedb.in -o requirements-lancedb.txt \
+  --python-version 3.12.3 \
+  --torch-backend cu124 \
+  --build-constraint build-constraints.txt \
+  --emit-index-url \
+  --emit-find-links
+
+uv pip compile requirements.in -o requirements.txt \
+  --python-version 3.12.3 \
+  --torch-backend cu124 \
+  --build-constraint build-constraints.txt \
+  --emit-index-url \
+  --emit-find-links
+```
 
 ## Pipeline
 
