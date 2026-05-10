@@ -9,11 +9,7 @@ from decouple import config
 BATCH_SIZE = 10_000
 
 
-def main(
-    queries_path: str,
-    corpus_path: str,
-    relevant_path: str
-) -> None:
+def main(queries_path: str, corpus_path: str, relevant_path: str) -> None:
     # Ensure output directories exist
     for path in [queries_path, corpus_path, relevant_path]:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -127,26 +123,22 @@ if __name__ == "__main__":
         type=str,
         required=False,
         help="Ścieżka docelowa dla pliku queries (parquet)",
-        default=config("QUERIES_PATH")
+        default=config("QUERIES_PATH"),
     )
     parser.add_argument(
         "--corpus_path",
         type=str,
         required=False,
         help="Ścieżka docelowa dla pliku corpus (parquet)",
-        default=config("CORPUS_PATH")
+        default=config("CORPUS_PATH"),
     )
     parser.add_argument(
         "--relevant_path",
         type=str,
         required=False,
         help="Ścieżka docelowa dla pliku relevant (parquet)",
-        default=config("RELEVANT_PATH")
+        default=config("RELEVANT_PATH"),
     )
     args = parser.parse_args()
 
-    main(
-        queries_path=args.queries_path,
-        corpus_path=args.corpus_path,
-        relevant_path=args.relevant_path
-    )
+    main(queries_path=args.queries_path, corpus_path=args.corpus_path, relevant_path=args.relevant_path)

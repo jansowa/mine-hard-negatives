@@ -100,10 +100,7 @@ def test_write_natural_questions_parquets_uses_string_ids_and_labels(tmp_path):
 
 
 def test_reservoir_sample_msmarco_docs_filters_used_ids_and_is_deterministic():
-    docs = [
-        {"_id": str(i), "text": f"text {i}"}
-        for i in range(10)
-    ]
+    docs = [{"_id": str(i), "text": f"text {i}"} for i in range(10)]
 
     sample_1, eligible_seen_1, skipped_used_1 = reservoir_sample_msmarco_docs(
         docs=docs,

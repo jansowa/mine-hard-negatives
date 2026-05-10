@@ -428,11 +428,12 @@ def validate_batch_size_options(
         raise ValueError(f"--{option_name}_batch_size must be greater than 0")
     if minimum <= 0 or maximum <= 0:
         raise ValueError(
-            f"--auto_{option_name}_batch_size_min and "
-            f"--auto_{option_name}_batch_size_max must be greater than 0"
+            f"--auto_{option_name}_batch_size_min and --auto_{option_name}_batch_size_max must be greater than 0"
         )
     if minimum > maximum:
-        raise ValueError(f"--auto_{option_name}_batch_size_min cannot be greater than --auto_{option_name}_batch_size_max")
+        raise ValueError(
+            f"--auto_{option_name}_batch_size_min cannot be greater than --auto_{option_name}_batch_size_max"
+        )
     if sample_size < 0:
         raise ValueError(f"--auto_{option_name}_batch_size_sample_size must be greater than or equal to 0")
     if not 0 < memory_utilization <= 1:
@@ -453,19 +454,27 @@ def find_negatives_multigpu(
     force_resume: bool = None,
     query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
     profile_timing: bool = config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False),
-    auto_embedding_batch_size_candidates: str | None = config("NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_CANDIDATES", default=None),
+    auto_embedding_batch_size_candidates: str | None = config(
+        "NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_CANDIDATES", default=None
+    ),
     auto_embedding_batch_size_min: int = config("NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_MIN", cast=int, default=1),
     auto_embedding_batch_size_max: int = config("NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_MAX", cast=int, default=64),
-    auto_embedding_batch_size_sample_size: int = config("NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=64),
+    auto_embedding_batch_size_sample_size: int = config(
+        "NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=64
+    ),
     auto_embedding_batch_size_memory_utilization: float = config(
         "NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_MEMORY_UTILIZATION",
         cast=float,
         default=0.70,
     ),
-    auto_reranker_batch_size_candidates: str | None = config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_CANDIDATES", default=None),
+    auto_reranker_batch_size_candidates: str | None = config(
+        "NEGATIVE_AUTO_RERANKER_BATCH_SIZE_CANDIDATES", default=None
+    ),
     auto_reranker_batch_size_min: int = config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_MIN", cast=int, default=1),
     auto_reranker_batch_size_max: int = config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_MAX", cast=int, default=64),
-    auto_reranker_batch_size_sample_size: int = config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=128),
+    auto_reranker_batch_size_sample_size: int = config(
+        "NEGATIVE_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=128
+    ),
     auto_reranker_batch_size_memory_utilization: float = config(
         "NEGATIVE_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
         cast=float,
@@ -659,7 +668,9 @@ if __name__ == "__main__":
         default=None,
         help="Explicit embedder batch size. If omitted, a short startup benchmark selects it automatically.",
     )
-    parser.add_argument("--reranker_model_name", type=str, default=config("CANDIDATE_RERANKER_NAME", default=config("RERANKER_NAME")))
+    parser.add_argument(
+        "--reranker_model_name", type=str, default=config("CANDIDATE_RERANKER_NAME", default=config("RERANKER_NAME"))
+    )
     parser.add_argument(
         "--reranker_batch_size",
         type=int,
@@ -716,12 +727,22 @@ if __name__ == "__main__":
         type=float,
         default=config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION", cast=float, default=0.70),
     )
-    parser.add_argument("--database_collection_name", type=str, default=config("DATABASE_COLLECTION_NAME", default="all_documents"))
+    parser.add_argument(
+        "--database_collection_name", type=str, default=config("DATABASE_COLLECTION_NAME", default="all_documents")
+    )
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
-    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_CANDIDATE_SCORE_PATH", default=config("RELEVANT_WITH_SCORE_PATH")))
-    parser.add_argument("--output_path", type=str, default=config("NEGATIVE_CANDIDATES_PATH", default=config("NEGATIVES_PATH")))
+    parser.add_argument(
+        "--relevant_path",
+        type=str,
+        default=config("RELEVANT_WITH_CANDIDATE_SCORE_PATH", default=config("RELEVANT_WITH_SCORE_PATH")),
+    )
+    parser.add_argument(
+        "--output_path", type=str, default=config("NEGATIVE_CANDIDATES_PATH", default=config("NEGATIVES_PATH"))
+    )
     parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int))
-    parser.add_argument("--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4))
+    parser.add_argument(
+        "--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4)
+    )
     parser.add_argument(
         "--ranking_column",
         type=str,
@@ -754,7 +775,9 @@ if __name__ == "__main__":
         args.top_k,
         args.resume,
         args.query_batch_size,
-        config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False) if args.profile_timing is None else args.profile_timing,
+        config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False)
+        if args.profile_timing is None
+        else args.profile_timing,
         args.auto_embedding_batch_size_candidates,
         args.auto_embedding_batch_size_min,
         args.auto_embedding_batch_size_max,

@@ -198,7 +198,7 @@ if __name__ == "__main__":
         type=int,
         required=False,
         help="Max docs in corpus parquet. All docs referenced by qrels are always included. "
-             "If <=0 or unset, writes full corpus.",
+        "If <=0 or unset, writes full corpus.",
         default=1_500_000,
     )
     parser.add_argument(

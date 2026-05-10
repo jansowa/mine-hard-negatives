@@ -6,12 +6,7 @@ import pyarrow.parquet as pq
 from decouple import config
 
 
-def main(
-    input_file_path: str,
-    queries_path: str,
-    corpus_path: str,
-    relevant_path: str
-) -> None:
+def main(input_file_path: str, queries_path: str, corpus_path: str, relevant_path: str) -> None:
     query_id: int = 0
     corpus_id: int = 0
 
@@ -23,7 +18,7 @@ def main(
     corpus_writer = None
     relevant_writer = None
 
-    with open(input_file_path, 'r', encoding='utf-8') as infile:
+    with open(input_file_path, "r", encoding="utf-8") as infile:
         for line in infile:
             data: dict = json.loads(line)
             messages: list = data.get("messages", [])
@@ -64,16 +59,41 @@ def main(
 
     print("Datasets have been saved in Parquet format (streaming).")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Processing the input file to Parquet (queries, corpus, relevant)")
-    parser.add_argument("--input_file_path", type=str, required=False, help="Path to the input file (jsonl)", default=config("INPUT_FILE_PATH"))
-    parser.add_argument("--queries_path", type=str, required=False, help="Output path for the queries file (parquet)", default=config("QUERIES_PATH"))
-    parser.add_argument("--corpus_path", type=str, required=False, help="Output path for the corpus file (parquet)", default=config("CORPUS_PATH"))
-    parser.add_argument("--relevant_path", type=str, required=False, help="Output path for the relevant file (parquet)", default=config("RELEVANT_PATH"))
+    parser.add_argument(
+        "--input_file_path",
+        type=str,
+        required=False,
+        help="Path to the input file (jsonl)",
+        default=config("INPUT_FILE_PATH"),
+    )
+    parser.add_argument(
+        "--queries_path",
+        type=str,
+        required=False,
+        help="Output path for the queries file (parquet)",
+        default=config("QUERIES_PATH"),
+    )
+    parser.add_argument(
+        "--corpus_path",
+        type=str,
+        required=False,
+        help="Output path for the corpus file (parquet)",
+        default=config("CORPUS_PATH"),
+    )
+    parser.add_argument(
+        "--relevant_path",
+        type=str,
+        required=False,
+        help="Output path for the relevant file (parquet)",
+        default=config("RELEVANT_PATH"),
+    )
     args = parser.parse_args()
     main(
         input_file_path=args.input_file_path,
         queries_path=args.queries_path,
         corpus_path=args.corpus_path,
-        relevant_path=args.relevant_path
+        relevant_path=args.relevant_path,
     )

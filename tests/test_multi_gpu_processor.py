@@ -136,14 +136,8 @@ def test_consolidate_worker_files_streams_to_parquet(tmp_path):
     processor.consolidate_worker_files()
 
     df = pd.read_parquet(output_path)
-    got = {
-        (row.query_id, row.document_id, round(float(row.ranking), 6))
-        for row in df.itertuples(index=False)
-    }
-    expected = {
-        (row["query_id"], row["document_id"], round(float(row["ranking"]), 6))
-        for row in rows
-    }
+    got = {(row.query_id, row.document_id, round(float(row.ranking), 6)) for row in df.itertuples(index=False)}
+    expected = {(row["query_id"], row["document_id"], round(float(row["ranking"]), 6)) for row in rows}
     assert got == expected
 
 

@@ -19,33 +19,25 @@ from config import get_lancedb_path, get_qdrant_url, get_vector_db_backend
 
 class VectorBackend(ABC):
     @abstractmethod
-    def upsert_documents(self, documents: list[Document]) -> None:
-        ...
+    def upsert_documents(self, documents: list[Document]) -> None: ...
 
     def upsert_embeddings(self, document_ids: list[str], texts: list[str], vectors) -> None:
         raise NotImplementedError("This backend does not support precomputed dense embedding upserts")
 
     @abstractmethod
-    def count(self) -> int:
-        ...
+    def count(self) -> int: ...
 
     @abstractmethod
-    def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]:
-        ...
+    def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]: ...
 
     def search_many_offsets(self, query_text: str, k: int, offsets: list[int]) -> dict[int, list[Document]]:
-        return {
-            offset: self.search(query_text=query_text, k=k, offset=offset)
-            for offset in offsets
-        }
+        return {offset: self.search(query_text=query_text, k=k, offset=offset) for offset in offsets}
 
     @abstractmethod
-    def random_sample(self, k: int) -> list[Document]:
-        ...
+    def random_sample(self, k: int) -> list[Document]: ...
 
     @abstractmethod
-    def existing_document_ids(self) -> set[str]:
-        ...
+    def existing_document_ids(self) -> set[str]: ...
 
     def ensure_indexes(self) -> None:
         return None
@@ -83,9 +75,7 @@ class QdrantBackend(VectorBackend):
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config={"dense": VectorParams(size=dense_dim_size, distance=Distance.COSINE)},
-                sparse_vectors_config={
-                    "sparse": SparseVectorParams(index=models.SparseIndexParams(on_disk=False))
-                },
+                sparse_vectors_config={"sparse": SparseVectorParams(index=models.SparseIndexParams(on_disk=False))},
             )
 
         self.vector_store = QdrantVectorStore(
@@ -344,15 +334,10 @@ class LanceDBBackend(VectorBackend):
             )
         except Exception:
             retrieval_source = "vector"
-            hits = (
-                self._tune_query(self.table.search(vector))
-                .select(self.VECTOR_SELECT_COLUMNS)
-                .limit(limit)
-                .to_list()
-            )
+            hits = self._tune_query(self.table.search(vector)).select(self.VECTOR_SELECT_COLUMNS).limit(limit).to_list()
 
         docs = []
-        for local_rank, hit in enumerate(hits[offset:offset + k]):
+        for local_rank, hit in enumerate(hits[offset : offset + k]):
             doc_id = str(hit.get("document_id", ""))
             docs.append(
                 Document(
@@ -393,17 +378,12 @@ class LanceDBBackend(VectorBackend):
             )
         except Exception:
             retrieval_source = "vector"
-            hits = (
-                self._tune_query(self.table.search(vector))
-                .select(self.VECTOR_SELECT_COLUMNS)
-                .limit(limit)
-                .to_list()
-            )
+            hits = self._tune_query(self.table.search(vector)).select(self.VECTOR_SELECT_COLUMNS).limit(limit).to_list()
 
         out: dict[int, list[Document]] = {}
         for offset in offsets:
             docs = []
-            for local_rank, hit in enumerate(hits[offset:offset + k]):
+            for local_rank, hit in enumerate(hits[offset : offset + k]):
                 doc_id = str(hit.get("document_id", ""))
                 docs.append(
                     Document(

@@ -118,10 +118,7 @@ def consolidate_worker_jsonl(worker_file: str, output_path: str, schema: pa.Sche
         nonlocal writer, total_rows
         if not buffer:
             return
-        normalised = [
-            {name: row.get(name) for name in schema.names}
-            for row in buffer
-        ]
+        normalised = [{name: row.get(name) for name in schema.names} for row in buffer]
         table = pa.Table.from_pylist(normalised, schema=schema)
         if writer is None:
             writer = pq.ParquetWriter(temp_output_path, schema=schema, compression="zstd", use_dictionary=True)
@@ -226,7 +223,9 @@ def rerank_candidates(
                 if already_scored:
                     packed = (
                         _pack_pair(query_id, document_id)
-                        for query_id, document_id in zip(candidates_df["query_id"].values, candidates_df["document_id"].values)
+                        for query_id, document_id in zip(
+                            candidates_df["query_id"].values, candidates_df["document_id"].values
+                        )
                     )
                     candidates_df = candidates_df.loc[[key not in already_scored for key in packed]]
                 if candidates_df.empty:
@@ -272,11 +271,17 @@ def rerank_candidates(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Final-rerank lightweight negative candidates.")
-    parser.add_argument("--candidates_path", type=str, default=config("NEGATIVE_CANDIDATES_PATH", default="data/negative_candidates.parquet"))
+    parser.add_argument(
+        "--candidates_path",
+        type=str,
+        default=config("NEGATIVE_CANDIDATES_PATH", default="data/negative_candidates.parquet"),
+    )
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"))
     parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
-    parser.add_argument("--reranker_model_name", type=str, default=config("FINAL_RERANKER_NAME", default=config("RERANKER_NAME")))
+    parser.add_argument(
+        "--reranker_model_name", type=str, default=config("FINAL_RERANKER_NAME", default=config("RERANKER_NAME"))
+    )
     parser.add_argument(
         "--reranker_batch_size",
         type=int,

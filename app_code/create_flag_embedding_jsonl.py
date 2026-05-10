@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 
 # --------------------------- SQLite utils ---------------------------
 
+
 def sqlite_connect(db_path: str) -> sqlite3.Connection:
     d = os.path.dirname(db_path)
     if d:
@@ -27,6 +28,7 @@ def sqlite_connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA mmap_size=3000000000;")
     return conn
 
+
 def ensure_corpus_db(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS corpus(
@@ -36,6 +38,7 @@ def ensure_corpus_db(conn: sqlite3.Connection):
     """)
     conn.commit()
 
+
 def ensure_negcount_db(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS neg_count(
@@ -44,6 +47,7 @@ def ensure_negcount_db(conn: sqlite3.Connection):
         );
     """)
     conn.commit()
+
 
 def bulk_upsert_corpus(conn: sqlite3.Connection, rows, batch_size: int = 50_000):
     cur = conn.cursor()
@@ -57,19 +61,21 @@ def bulk_upsert_corpus(conn: sqlite3.Connection, rows, batch_size: int = 50_000)
             cur.execute("BEGIN")
     conn.commit()
 
+
 def fetch_texts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 2000) -> Dict[str, str]:
     res: Dict[str, str] = {}
     if not ids:
         return res
     cur = conn.cursor()
     for i in range(0, len(ids), batch):
-        chunk = ids[i:i+batch]
-        q = "SELECT id, text FROM corpus WHERE id IN ({})".format(",".join(["?"]*len(chunk)))
+        chunk = ids[i : i + batch]
+        q = "SELECT id, text FROM corpus WHERE id IN ({})".format(",".join(["?"] * len(chunk)))
         cur.execute(q, chunk)
         rows = cur.fetchall()
         if rows:
             res.update({rid: txt for rid, txt in rows})
     return res
+
 
 def fetch_counts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 5000) -> Dict[str, int]:
     res: Dict[str, int] = {}
@@ -77,13 +83,14 @@ def fetch_counts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 50
         return res
     cur = conn.cursor()
     for i in range(0, len(ids), batch):
-        chunk = ids[i:i+batch]
-        q = "SELECT doc_id, c FROM neg_count WHERE doc_id IN ({})".format(",".join(["?"]*len(chunk)))
+        chunk = ids[i : i + batch]
+        q = "SELECT doc_id, c FROM neg_count WHERE doc_id IN ({})".format(",".join(["?"] * len(chunk)))
         cur.execute(q, chunk)
         rows = cur.fetchall()
         if rows:
             res.update({rid: c for rid, c in rows})
     return res
+
 
 def inc_counts_batch(conn: sqlite3.Connection, ids: List[str]):
     if not ids:
@@ -91,12 +98,13 @@ def inc_counts_batch(conn: sqlite3.Connection, ids: List[str]):
     cnt = Counter(ids)
     cur = conn.cursor()
     cur.executemany(
-        "INSERT INTO neg_count(doc_id, c) VALUES(?, ?) "
-        "ON CONFLICT(doc_id) DO UPDATE SET c = c + excluded.c",
-        list(cnt.items())
+        "INSERT INTO neg_count(doc_id, c) VALUES(?, ?) ON CONFLICT(doc_id) DO UPDATE SET c = c + excluded.c",
+        list(cnt.items()),
     )
 
+
 # --------------------------- ECDF helpers ---------------------------
+
 
 def build_ecdf(sorted_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     n = len(sorted_values)
@@ -106,8 +114,10 @@ def build_ecdf(sorted_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     ecdf_y = np.linspace(0.0, 1.0, n) if n > 1 else np.array([1.0])
     return ecdf_x, ecdf_y
 
+
 def percentile_from_ecdf(v: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: np.ndarray):
     return np.interp(v, ecdf_x, ecdf_y, left=0.0, right=1.0)
+
 
 def inv_percentile_from_ecdf(p: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: np.ndarray):
     p = np.clip(p, 0.0, 1.0)
@@ -116,12 +126,13 @@ def inv_percentile_from_ecdf(p: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: 
     idx = np.clip(idx, 0, len(ecdf_x) - 1)
     return ecdf_x[idx]
 
+
 # --------------------------- Build corpus SQLite ---------------------------
 
-def build_or_load_corpus_sqlite(corpus_path: str,
-                                corpus_sqlite_path: str,
-                                id_col="id", text_col="text",
-                                block_rows: int = 1_000_000):
+
+def build_or_load_corpus_sqlite(
+    corpus_path: str, corpus_sqlite_path: str, id_col="id", text_col="text", block_rows: int = 1_000_000
+):
     conn = sqlite_connect(corpus_sqlite_path)
     ensure_corpus_db(conn)
 
@@ -130,10 +141,7 @@ def build_or_load_corpus_sqlite(corpus_path: str,
         conn.close()
         return
 
-    ds = pl.scan_parquet(corpus_path).select([
-        pl.col(id_col).cast(pl.Utf8),
-        pl.col(text_col).cast(pl.Utf8)
-    ])
+    ds = pl.scan_parquet(corpus_path).select([pl.col(id_col).cast(pl.Utf8), pl.col(text_col).cast(pl.Utf8)])
 
     df = ds.collect()
 
@@ -148,7 +156,9 @@ def build_or_load_corpus_sqlite(corpus_path: str,
 
     conn.close()
 
+
 # --------------------------- Główny pipeline ---------------------------
+
 
 def process_negatives_streaming(
     corpus_path: str,
@@ -194,11 +204,13 @@ def process_negatives_streaming(
 
     rel = (
         pl.scan_parquet(relevant_path)
-        .select([
-            pl.col("query_id"),
-            pl.col("document_id"),
-            pl.col(positive_score_column).alias("positive_ranking"),
-        ])
+        .select(
+            [
+                pl.col("query_id"),
+                pl.col("document_id"),
+                pl.col(positive_score_column).alias("positive_ranking"),
+            ]
+        )
         .with_columns(
             pl.col("query_id").cast(pl.Utf8),
             pl.col("document_id").cast(pl.Utf8),
@@ -207,11 +219,7 @@ def process_negatives_streaming(
     )
 
     pos_scores_all = np.sort(
-        rel.select(pl.col("positive_ranking"))
-        .collect()["positive_ranking"]
-        .drop_nulls()
-        .to_numpy()
-        .copy()
+        rel.select(pl.col("positive_ranking")).collect()["positive_ranking"].drop_nulls().to_numpy().copy()
     )
     if pos_scores_all.size == 0:
         raise ValueError("Brak wartości 'positive_ranking' w pliku RELEVANT_WITH_SCORE_PATH.")
@@ -228,13 +236,13 @@ def process_negatives_streaming(
 
     pos_grouped = (
         rel.group_by("query_id")
-           .agg(
-               pl.col("document_id").implode().alias("pos_ids"),
-               pl.col("positive_ranking").implode().alias("pos_scores"),
-               pl.col("positive_ranking").min().alias("min_score"),
-           )
-           .with_columns(pl.col("min_score").cast(pl.Float64))
-           .collect()
+        .agg(
+            pl.col("document_id").implode().alias("pos_ids"),
+            pl.col("positive_ranking").implode().alias("pos_scores"),
+            pl.col("positive_ranking").min().alias("min_score"),
+        )
+        .with_columns(pl.col("min_score").cast(pl.Float64))
+        .collect()
     )
 
     min_scores = pos_grouped["min_score"].to_numpy()
@@ -243,25 +251,28 @@ def process_negatives_streaming(
     thr2 = inv_percentile_from_ecdf(u_floor, ecdf_x, ecdf_y)
     thresholds = np.maximum(thr1, thr2)
 
-    thr_df = pl.DataFrame({
-        "query_id": pos_grouped["query_id"],
-        "pos_ids": pos_grouped["pos_ids"],
-        "pos_scores": pos_grouped["pos_scores"],
-        "min_score": pos_grouped["min_score"],
-        "u_pos": pl.Series(u_pos),
-        "threshold_rank": pl.Series(thresholds),
-    })
+    thr_df = pl.DataFrame(
+        {
+            "query_id": pos_grouped["query_id"],
+            "pos_ids": pos_grouped["pos_ids"],
+            "pos_scores": pos_grouped["pos_scores"],
+            "min_score": pos_grouped["min_score"],
+            "u_pos": pl.Series(u_pos),
+            "threshold_rank": pl.Series(thresholds),
+        }
+    )
 
     pos_map: Dict[str, Tuple[List[str], List[float]]] = {
-        qid: (row["pos_ids"], row["pos_scores"])
-        for qid, row in zip(thr_df["query_id"], thr_df.iter_rows(named=True))
+        qid: (row["pos_ids"], row["pos_scores"]) for qid, row in zip(thr_df["query_id"], thr_df.iter_rows(named=True))
     }
 
-    neg_scan = pl.scan_parquet(negatives_path).select([
-        pl.col("query_id").cast(pl.Utf8),
-        pl.col("document_id").cast(pl.Utf8),
-        pl.col(negative_score_column).cast(pl.Float64).alias("ranking"),
-    ])
+    neg_scan = pl.scan_parquet(negatives_path).select(
+        [
+            pl.col("query_id").cast(pl.Utf8),
+            pl.col("document_id").cast(pl.Utf8),
+            pl.col(negative_score_column).cast(pl.Float64).alias("ranking"),
+        ]
+    )
 
     all_qids = thr_df["query_id"].to_list()
     total_q = len(all_qids)
@@ -277,16 +288,10 @@ def process_negatives_streaming(
 
         K = num_negatives * oversample_factor
         candidates = (
-            neg_scan
-            .join(thr_chunk.lazy(), on="query_id", how="inner")
+            neg_scan.join(thr_chunk.lazy(), on="query_id", how="inner")
             .filter(pl.col("ranking") <= pl.col("threshold_rank"))
             .group_by("query_id")
-            .agg(
-                pl.struct(["document_id", "ranking"])
-                  .sort_by("ranking", descending=True)
-                  .head(K)
-                  .alias("pairs")
-            )
+            .agg(pl.struct(["document_id", "ranking"]).sort_by("ranking", descending=True).head(K).alias("pairs"))
             .collect()
         )
 
@@ -359,6 +364,7 @@ def process_negatives_streaming(
 
 # --------------------------- CLI ---------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Create JSONL for FlagEmbedding (streaming, top-K, reuse-capped, low-memory)."
@@ -382,21 +388,43 @@ def main():
         help="Score column to read from negatives_path.",
     )
 
-    parser.add_argument("--beta", type=float, default=config("BETA", cast=float, default=0.5),
-                        help="Warunek: u_doc <= max(beta * u_pos, u_floor) (liczone przez ECDF).")
-    parser.add_argument("--u_floor", type=float, default=config("U_FLOOR", cast=float, default=0.05),
-                        help="Minimalny percentyl dla negatywu.")
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=config("BETA", cast=float, default=0.5),
+        help="Warunek: u_doc <= max(beta * u_pos, u_floor) (liczone przez ECDF).",
+    )
+    parser.add_argument(
+        "--u_floor",
+        type=float,
+        default=config("U_FLOOR", cast=float, default=0.05),
+        help="Minimalny percentyl dla negatywu.",
+    )
 
-    parser.add_argument("--max_neg_reuse", type=int, default=config("MAX_NEG_REUSE", cast=int, default=1000),
-                        help="Maks. liczba użyć dokumentu jako negatywu w całym JSONL.")
+    parser.add_argument(
+        "--max_neg_reuse",
+        type=int,
+        default=config("MAX_NEG_REUSE", cast=int, default=1000),
+        help="Maks. liczba użyć dokumentu jako negatywu w całym JSONL.",
+    )
 
     parser.add_argument("--corpus_sqlite_path", type=str, default=config("CORPUS_SQLITE_PATH", default="corpus.sqlite"))
-    parser.add_argument("--negcount_sqlite_path", type=str, default=config("NEGCOUNT_SQLITE_PATH", default="negcount.sqlite"))
+    parser.add_argument(
+        "--negcount_sqlite_path", type=str, default=config("NEGCOUNT_SQLITE_PATH", default="negcount.sqlite")
+    )
 
-    parser.add_argument("--query_chunk_size", type=int, default=config("QUERY_CHUNK_SIZE", cast=int, default=10_000),
-                        help="Ile query_id przetwarzać w jednym przebiegu.")
-    parser.add_argument("--oversample_factor", type=int, default=config("OVERSAMPLE_FACTOR", cast=int, default=5),
-                        help="Ile nadpróbkować top-negatywów per query przed limitem reuse.")
+    parser.add_argument(
+        "--query_chunk_size",
+        type=int,
+        default=config("QUERY_CHUNK_SIZE", cast=int, default=10_000),
+        help="Ile query_id przetwarzać w jednym przebiegu.",
+    )
+    parser.add_argument(
+        "--oversample_factor",
+        type=int,
+        default=config("OVERSAMPLE_FACTOR", cast=int, default=5),
+        help="Ile nadpróbkować top-negatywów per query przed limitem reuse.",
+    )
 
     args = parser.parse_args()
 

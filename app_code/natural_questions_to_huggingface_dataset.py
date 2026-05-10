@@ -247,8 +247,7 @@ def main(
         relevant_writer = pq.ParquetWriter(relevant_path, relevant_schema)
 
         print(
-            "Loading Natural Questions from private dataset: "
-            f"{natural_questions_dataset} ({natural_questions_split})"
+            f"Loading Natural Questions from private dataset: {natural_questions_dataset} ({natural_questions_split})"
         )
         natural_questions_rows = load_natural_questions_dataset(
             dataset_name=natural_questions_dataset,
@@ -346,19 +345,27 @@ if __name__ == "__main__":
         type=str,
         default=config("NATURAL_QUESTIONS_DATASET", default=DEFAULT_NATURAL_QUESTIONS_DATASET),
     )
-    parser.add_argument("--natural_questions_split", type=str, default=config("NATURAL_QUESTIONS_SPLIT", default="train"))
+    parser.add_argument(
+        "--natural_questions_split", type=str, default=config("NATURAL_QUESTIONS_SPLIT", default="train")
+    )
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"))
     parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"))
-    parser.add_argument("--msmarco_extra_docs", type=int, default=config("MSMARCO_EXTRA_DOCS", cast=int, default=1_500_000))
+    parser.add_argument(
+        "--msmarco_extra_docs", type=int, default=config("MSMARCO_EXTRA_DOCS", cast=int, default=1_500_000)
+    )
     parser.add_argument("--nq_doc_id_start", type=int, default=config("NQ_DOC_ID_START", cast=int, default=10_000_000))
     parser.add_argument("--seed", type=int, default=config("NATURAL_QUESTIONS_SEED", cast=int, default=42))
     parser.add_argument("--skip_used_corpus_filter", dest="skip_used_corpus_filter", action="store_true")
     parser.add_argument("--use_used_corpus_filter", dest="skip_used_corpus_filter", action="store_false")
     parser.set_defaults(skip_used_corpus_filter=config("SKIP_USED_CORPUS_FILTER", cast=bool, default=False))
-    parser.add_argument("--used_corpus_dataset", type=str, default=config("USED_CORPUS_DATASET", default="minehard/negatives2"))
+    parser.add_argument(
+        "--used_corpus_dataset", type=str, default=config("USED_CORPUS_DATASET", default="minehard/negatives2")
+    )
     parser.add_argument("--hf_token", type=str, default=config("HF_TOKEN", default=None))
-    parser.add_argument("--batch_size", type=int, default=config("NATURAL_QUESTIONS_BATCH_SIZE", cast=int, default=BATCH_SIZE))
+    parser.add_argument(
+        "--batch_size", type=int, default=config("NATURAL_QUESTIONS_BATCH_SIZE", cast=int, default=BATCH_SIZE)
+    )
     args = parser.parse_args()
 
     main(
