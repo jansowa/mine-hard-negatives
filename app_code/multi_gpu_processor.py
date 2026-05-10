@@ -2,7 +2,7 @@ import threading
 from queue import Queue, Empty
 import time
 from collections import defaultdict
-from typing import List, Callable, Dict, Tuple
+from typing import List, Callable, Dict
 import logging
 import torch
 import json
@@ -75,13 +75,43 @@ def _record_elapsed(timing_stats: TimingStats | None, name: str, started_at: flo
         timing_stats.record(name, time.perf_counter() - started_at, items=items)
 
 
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    return float(value)
+
+
+def _optional_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    return int(value)
+
+
+def _result_value(row: dict, key: str, default=None):
+    value = row.get(key, default)
+    if value is None:
+        return default
+    return value
+
+
 
 class GPUModelSet:
     """Represents a set of models (dense, sparse, reranker) running on a specific GPU"""
     
     def __init__(self, gpu_id: int, reranker_tokenizer, reranker_model, relevant_path: str, logger=None,
                  skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int, default=100),
-                 beta: float = 0.4, u_floor: float = 0.1):
+                 beta: float = 0.4, u_floor: float = 0.1,
+                 positive_score_column: str = "positive_ranking"):
 
         self.gpu_id = gpu_id
         self.reranker_tokenizer = reranker_tokenizer
@@ -90,19 +120,24 @@ class GPUModelSet:
         self.total_queries = 0
         self.logger = logger or logging.getLogger(__name__)
         self.skip_if_not_in_top_k = skip_if_not_in_top_k
+        self.positive_score_column = positive_score_column
 
         relevant_df = pd.read_parquet(relevant_path)
 
-        if not {"query_id","document_id","positive_ranking"}.issubset(relevant_df.columns):
-            raise ValueError("Required columns are missing in Parquet for 'relevant with score'.")
+        required_columns = {"query_id", "document_id", positive_score_column}
+        if not required_columns.issubset(relevant_df.columns):
+            missing = ", ".join(sorted(required_columns - set(relevant_df.columns)))
+            raise ValueError(f"Required columns are missing in Parquet for 'relevant with score': {missing}")
 
-        scores = np.sort(relevant_df["positive_ranking"].dropna().to_numpy(copy=True))
+        scores = np.sort(relevant_df[positive_score_column].dropna().to_numpy(copy=True))
+        if len(scores) == 0:
+            raise ValueError(f"No non-null values found in positive score column {positive_score_column!r}")
         self._ecdf_x = scores
         n = len(scores)
         self._ecdf_y = np.linspace(0.0, 1.0, n) if n > 1 else np.array([1.0])
 
         self.pos_score_by_qd = {
-            (str(row["query_id"]), str(row["document_id"])): float(row["positive_ranking"])
+            (str(row["query_id"]), str(row["document_id"])): float(row[positive_score_column])
             for _, row in relevant_df.iterrows()
         }
 
@@ -129,14 +164,36 @@ class GPUModelSet:
     def _random_sample(self, backend, limit: int):
         return backend.random_sample(k=limit)
 
+    def _positive_score(self, query_data: Dict) -> float:
+        if "positive_score" in query_data:
+            return float(query_data["positive_score"])
+        positive_score_column = getattr(self, "positive_score_column", "positive_ranking")
+        if positive_score_column in query_data:
+            return float(query_data[positive_score_column])
+        return float(query_data["positive_ranking"])
+
+    def _build_result(self, state: Dict, document, score: float, percentile: float, selected: bool) -> dict:
+        metadata = getattr(document, "metadata", {}) or {}
+        return {
+            "query_id": state["qid"],
+            "document_id": str(metadata.get("document_id", "")),
+            "ranking": float(score),
+            "candidate_percentile": float(percentile),
+            "candidate_selected": bool(selected),
+            "retrieval_rank": _optional_int(metadata.get("retrieval_rank")),
+            "retrieval_offset": _optional_int(metadata.get("retrieval_offset")),
+            "retrieval_score": _optional_float(metadata.get("retrieval_score")),
+            "retrieval_source": metadata.get("retrieval_source"),
+        }
+
     def process_query_batch(self, query_batch: List[Dict], backend, rerank_function: Callable,
                             reranker_batch_size: int,
-                            timing_stats: TimingStats | None = None) -> List[Tuple]:
+                            timing_stats: TimingStats | None = None) -> List[Dict]:
         """
         Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
         until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
         or completes 10 iterations; then it fetches an additional random 128 and stops.
-        Returns all (query_id, doc_id, score) collected during the process for each query.
+        Returns every scored candidate collected during the process for each query.
         """
         NEG_TARGET = 20
         CHUNK = 128
@@ -155,7 +212,7 @@ class GPUModelSet:
             qid = str(query_data["query_id"])
             pos_doc_id = str(query_data["document_id"])
 
-            s_pos = float(query_data["positive_ranking"])
+            s_pos = self._positive_score(query_data)
             u_pos = float(self._percentile(np.array([s_pos]))[0])
 
             states.append({
@@ -218,8 +275,9 @@ class GPUModelSet:
 
                 u_docs = self._percentile(np.array(batch_scores, dtype=float))
                 for (state, d), s, u_d in zip(rerank_state_doc, batch_scores, u_docs):
-                    state["collected_docs"].append((state["qid"], str(d.metadata["document_id"]), float(s)))
-                    if self._is_negative_percentile(state["u_pos"], float(u_d)):
+                    selected = self._is_negative_percentile(state["u_pos"], float(u_d))
+                    state["collected_docs"].append(self._build_result(state, d, float(s), float(u_d), selected))
+                    if selected:
                         state["neg_count"] += 1
 
                 for state in states:
@@ -257,10 +315,12 @@ class GPUModelSet:
                 batch_size=reranker_batch_size
             )
             _record_elapsed(timing_stats, "rerank_random", started_at, items=len(random_docs))
-            for (state, d), s in zip(random_state_doc, rand_scores):
-                state["collected_docs"].append((state["qid"], str(d.metadata.get("document_id", "")), float(s)))
+            u_docs = self._percentile(np.array(rand_scores, dtype=float))
+            for (state, d), s, u_d in zip(random_state_doc, rand_scores, u_docs):
+                selected = self._is_negative_percentile(state["u_pos"], float(u_d))
+                state["collected_docs"].append(self._build_result(state, d, float(s), float(u_d), selected))
 
-        results: List[Tuple] = []
+        results: List[Dict] = []
         for state in states:
             results.extend(state["collected_docs"])
 
@@ -273,7 +333,9 @@ class MultiGPUNegativeFinder:
     
     def __init__(self, model_sets: List[GPUModelSet], 
                  output_path: str = None, progress_bar=None, logger=None, resume: bool = False,
-                 profile_timing: bool = False):
+                 profile_timing: bool = False, ranking_column: str = "ranking"):
+        if not ranking_column:
+            raise ValueError("ranking_column must not be empty")
         self.model_sets = model_sets
         self.query_queue = Queue()
         self.completed_batches = 0  # Now tracks completed queries
@@ -288,6 +350,8 @@ class MultiGPUNegativeFinder:
         self.start_time = None  # Track overall processing start time
         self.timing_stats = TimingStats(enabled=profile_timing)
         self.parquet_row_group_size = max(1, config("NEGATIVES_PARQUET_ROW_GROUP_SIZE", cast=int, default=100_000))
+        self.ranking_column = ranking_column
+        self.extended_output = ranking_column != "ranking"
         
         # Create individual worker output paths
         self.output_dir = os.path.dirname(output_path) if output_path else "."
@@ -328,20 +392,41 @@ class MultiGPUNegativeFinder:
         with open(self.worker_files[worker_id], 'a') as f:
             self.write_results_to_jsonl(f, [(query_id, document_id, ranking)])
 
-    def write_results_to_jsonl(self, handle, results: List[Tuple]) -> None:
+    def _normalise_result(self, result: dict | tuple) -> dict:
+        if isinstance(result, dict):
+            score = result.get(self.ranking_column, result.get("ranking"))
+            row = {
+                "query_id": str(result["query_id"]),
+                "document_id": str(result["document_id"]),
+                self.ranking_column: float(score),
+            }
+            if self.extended_output:
+                row.update({
+                    "candidate_percentile": _optional_float(result.get("candidate_percentile")),
+                    "candidate_selected": bool(result.get("candidate_selected", False)),
+                    "retrieval_rank": _optional_int(result.get("retrieval_rank")),
+                    "retrieval_offset": _optional_int(result.get("retrieval_offset")),
+                    "retrieval_score": _optional_float(result.get("retrieval_score")),
+                    "retrieval_source": _result_value(result, "retrieval_source"),
+                })
+            return row
+
+        query_id, document_id, ranking = result[:3]
+        return {
+            "query_id": str(query_id),
+            "document_id": str(document_id),
+            self.ranking_column: float(ranking),
+        }
+
+    def write_results_to_jsonl(self, handle, results: List[dict | tuple]) -> None:
         """Write a batch of results to an already-open JSONL handle."""
         if not results:
             return
 
         started_at = _now_if_enabled(self.timing_stats)
         lines = []
-        for query_id, document_id, ranking in results:
-            result = {
-                "query_id": str(query_id),
-                "document_id": str(document_id),
-                "ranking": float(ranking)
-            }
-            lines.append(json.dumps(result) + '\n')
+        for result in results:
+            lines.append(json.dumps(self._normalise_result(result)) + '\n')
 
         try:
             handle.writelines(lines)
@@ -503,8 +588,20 @@ class MultiGPUNegativeFinder:
         schema = pa.schema([
             ("query_id", pa.string()),
             ("document_id", pa.string()),
-            ("ranking", pa.float32()),
+            (self.ranking_column, pa.float32()),
         ])
+        if self.extended_output:
+            schema = pa.schema([
+                ("query_id", pa.string()),
+                ("document_id", pa.string()),
+                (self.ranking_column, pa.float32()),
+                ("candidate_percentile", pa.float32()),
+                ("candidate_selected", pa.bool_()),
+                ("retrieval_rank", pa.int32()),
+                ("retrieval_offset", pa.int32()),
+                ("retrieval_score", pa.float32()),
+                ("retrieval_source", pa.string()),
+            ])
 
         if os.path.exists(temp_output_path):
             os.remove(temp_output_path)
@@ -518,7 +615,33 @@ class MultiGPUNegativeFinder:
                 {
                     "query_id": pa.array([row["query_id"] for row in rows], type=pa.string()),
                     "document_id": pa.array([row["document_id"] for row in rows], type=pa.string()),
-                    "ranking": pa.array([row["ranking"] for row in rows], type=pa.float32()),
+                    self.ranking_column: pa.array([row[self.ranking_column] for row in rows], type=pa.float32()),
+                    **({
+                        "candidate_percentile": pa.array(
+                            [row.get("candidate_percentile") for row in rows],
+                            type=pa.float32(),
+                        ),
+                        "candidate_selected": pa.array(
+                            [row.get("candidate_selected", False) for row in rows],
+                            type=pa.bool_(),
+                        ),
+                        "retrieval_rank": pa.array(
+                            [row.get("retrieval_rank") for row in rows],
+                            type=pa.int32(),
+                        ),
+                        "retrieval_offset": pa.array(
+                            [row.get("retrieval_offset") for row in rows],
+                            type=pa.int32(),
+                        ),
+                        "retrieval_score": pa.array(
+                            [row.get("retrieval_score") for row in rows],
+                            type=pa.float32(),
+                        ),
+                        "retrieval_source": pa.array(
+                            [row.get("retrieval_source") for row in rows],
+                            type=pa.string(),
+                        ),
+                    } if self.extended_output else {}),
                 },
                 schema=schema,
             )
@@ -539,11 +662,7 @@ class MultiGPUNegativeFinder:
                             for line in f:
                                 if line.strip():
                                     result = json.loads(line.strip())
-                                    buffer.append({
-                                        "query_id": str(result["query_id"]),
-                                        "document_id": str(result["document_id"]),
-                                        "ranking": float(result["ranking"]),
-                                    })
+                                    buffer.append(self._normalise_result(result))
                                     worker_results += 1
                                     if len(buffer) >= self.parquet_row_group_size:
                                         write_buffer(buffer)
@@ -611,7 +730,8 @@ def should_resume_processing(output_path: str, model_sets: List[GPUModelSet]) ->
 
 def setup_multi_gpu_models(reranker_model_name: str,
                            relevant_path: str,
-                           models_per_gpu: int = 1, logger=None) -> List[GPUModelSet]:
+                           models_per_gpu: int = 1, logger=None,
+                           positive_score_column: str = "positive_ranking") -> List[GPUModelSet]:
     """Setup model sets across all available GPUs, with multiple model instances per GPU if desired"""
     from models import get_reranker_model
     
@@ -630,7 +750,14 @@ def setup_multi_gpu_models(reranker_model_name: str,
             logger.info(f"[GPU {gpu_id}] Loading models (instance {instance+1}/{models_per_gpu})")
             reranker_tokenizer, reranker_model = get_reranker_model(model_name=reranker_model_name,
                                                                   gpu_id=gpu_id)
-            model_set = GPUModelSet(gpu_id, reranker_tokenizer, reranker_model, relevant_path, logger)
+            model_set = GPUModelSet(
+                gpu_id,
+                reranker_tokenizer,
+                reranker_model,
+                relevant_path,
+                logger,
+                positive_score_column=positive_score_column,
+            )
             model_sets.append(model_set)
             logger.info(f"[GPU {gpu_id}] Successfully loaded models (instance {instance+1}/{models_per_gpu})")
     return model_sets

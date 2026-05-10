@@ -471,6 +471,8 @@ def find_negatives_multigpu(
         cast=float,
         default=0.70,
     ),
+    ranking_column: str = config("NEGATIVE_RANKING_COLUMN", default="ranking"),
+    positive_score_column: str = config("NEGATIVE_POSITIVE_SCORE_COLUMN", default="positive_ranking"),
 ):
     validate_batch_size_options(
         embedding_batch_size,
@@ -492,6 +494,10 @@ def find_negatives_multigpu(
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         raise RuntimeError("No CUDA devices available")
+    if not ranking_column:
+        raise ValueError("--ranking_column must not be empty")
+    if not positive_score_column:
+        raise ValueError("--positive_score_column must not be empty")
 
     logger.info(f"{num_gpus} GPUs available for processing")
     logger.info("Loading queries and relevance data")
@@ -502,14 +508,17 @@ def find_negatives_multigpu(
     relevant_df["query_id"] = relevant_df["query_id"].astype("string")
     relevant_df["document_id"] = relevant_df["document_id"].astype("string")
 
-    best_relevant_df = relevant_df.loc[relevant_df.groupby("query_id")["positive_ranking"].idxmax()]
+    if positive_score_column not in relevant_df.columns:
+        raise ValueError(f"Positive score column {positive_score_column!r} is missing from {relevant_path}")
+
+    best_relevant_df = relevant_df.loc[relevant_df.groupby("query_id")[positive_score_column].idxmax()]
     positives_df = queries_df.merge(best_relevant_df, left_on="id", right_on="query_id").drop(columns="id")
 
     queries_list = [
         {
             "query_id": row["query_id"],
             "document_id": row["document_id"],
-            "positive_ranking": row["positive_ranking"],
+            "positive_score": row[positive_score_column],
             "text": row["text"],
         }
         for _, row in positives_df.iterrows()
@@ -553,6 +562,7 @@ def find_negatives_multigpu(
         relevant_path,
         models_per_gpu=1,
         logger=logger,
+        positive_score_column=positive_score_column,
     )
 
     rerank_function = partial(rerank, model_name=reranker_model_name)
@@ -606,6 +616,7 @@ def find_negatives_multigpu(
         logger=logger,
         resume=resume,
         profile_timing=profile_timing,
+        ranking_column=ranking_column,
     )
 
     if resume:
@@ -648,7 +659,7 @@ if __name__ == "__main__":
         default=None,
         help="Explicit embedder batch size. If omitted, a short startup benchmark selects it automatically.",
     )
-    parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"))
+    parser.add_argument("--reranker_model_name", type=str, default=config("CANDIDATE_RERANKER_NAME", default=config("RERANKER_NAME")))
     parser.add_argument(
         "--reranker_batch_size",
         type=int,
@@ -705,12 +716,24 @@ if __name__ == "__main__":
         type=float,
         default=config("NEGATIVE_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION", cast=float, default=0.70),
     )
-    parser.add_argument("--database_collection_name", type=str, default="all_documents")
+    parser.add_argument("--database_collection_name", type=str, default=config("DATABASE_COLLECTION_NAME", default="all_documents"))
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
-    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"))
-    parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
+    parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_WITH_CANDIDATE_SCORE_PATH", default=config("RELEVANT_WITH_SCORE_PATH")))
+    parser.add_argument("--output_path", type=str, default=config("NEGATIVE_CANDIDATES_PATH", default=config("NEGATIVES_PATH")))
     parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int))
     parser.add_argument("--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4))
+    parser.add_argument(
+        "--ranking_column",
+        type=str,
+        default=config("NEGATIVE_RANKING_COLUMN", default="ranking"),
+        help="Output score column name. Use candidate_ranking for the optional first reranking stage.",
+    )
+    parser.add_argument(
+        "--positive_score_column",
+        type=str,
+        default=config("NEGATIVE_POSITIVE_SCORE_COLUMN", default="positive_ranking"),
+        help="Positive score column used to build the percentile threshold distribution.",
+    )
     parser.add_argument("--profile-timing", dest="profile_timing", action="store_true", default=None)
     parser.add_argument("--no-profile-timing", dest="profile_timing", action="store_false", default=None)
     parser.add_argument("--resume", action="store_true", default=None)
@@ -742,4 +765,6 @@ if __name__ == "__main__":
         args.auto_reranker_batch_size_max,
         args.auto_reranker_batch_size_sample_size,
         args.auto_reranker_batch_size_memory_utilization,
+        ranking_column=args.ranking_column,
+        positive_score_column=args.positive_score_column,
     )

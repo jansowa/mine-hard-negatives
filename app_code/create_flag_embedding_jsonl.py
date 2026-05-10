@@ -164,7 +164,13 @@ def process_negatives_streaming(
     negcount_sqlite_path: str,
     query_chunk_size: int,
     oversample_factor: int,
+    positive_score_column: str = "positive_ranking",
+    negative_score_column: str = "ranking",
 ):
+    if not positive_score_column:
+        raise ValueError("positive_score_column must not be empty")
+    if not negative_score_column:
+        raise ValueError("negative_score_column must not be empty")
 
     try:
         pl.enable_string_cache()
@@ -188,7 +194,11 @@ def process_negatives_streaming(
 
     rel = (
         pl.scan_parquet(relevant_path)
-        .select(["query_id", "document_id", "positive_ranking"])
+        .select([
+            pl.col("query_id"),
+            pl.col("document_id"),
+            pl.col(positive_score_column).alias("positive_ranking"),
+        ])
         .with_columns(
             pl.col("query_id").cast(pl.Utf8),
             pl.col("document_id").cast(pl.Utf8),
@@ -250,7 +260,7 @@ def process_negatives_streaming(
     neg_scan = pl.scan_parquet(negatives_path).select([
         pl.col("query_id").cast(pl.Utf8),
         pl.col("document_id").cast(pl.Utf8),
-        pl.col("ranking").cast(pl.Float64),
+        pl.col(negative_score_column).cast(pl.Float64).alias("ranking"),
     ])
 
     all_qids = thr_df["query_id"].to_list()
@@ -359,6 +369,18 @@ def main():
     parser.add_argument("--negatives_path", type=str, default=config("NEGATIVES_PATH"))
     parser.add_argument("--output_path", type=str, default=config("OUTPUT_PATH"))
     parser.add_argument("--num_negatives", type=int, default=config("NUM_NEGATIVES", cast=int, default=5))
+    parser.add_argument(
+        "--positive_score_column",
+        type=str,
+        default=config("POSITIVE_SCORE_COLUMN", default="positive_ranking"),
+        help="Score column to read from relevant_path.",
+    )
+    parser.add_argument(
+        "--negative_score_column",
+        type=str,
+        default=config("NEGATIVE_SCORE_COLUMN", default="ranking"),
+        help="Score column to read from negatives_path.",
+    )
 
     parser.add_argument("--beta", type=float, default=config("BETA", cast=float, default=0.5),
                         help="Warunek: u_doc <= max(beta * u_pos, u_floor) (liczone przez ECDF).")
@@ -388,6 +410,8 @@ def main():
         negatives_path=args.negatives_path,
         output_path=args.output_path,
         num_negatives=args.num_negatives,
+        positive_score_column=args.positive_score_column,
+        negative_score_column=args.negative_score_column,
         beta=args.beta,
         u_floor=args.u_floor,
         max_neg_reuse=args.max_neg_reuse,

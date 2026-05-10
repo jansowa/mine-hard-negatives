@@ -105,7 +105,15 @@ class QdrantBackend(VectorBackend):
         return self.client.count(collection_name=self.collection_name, exact=True).count
 
     def search(self, query_text: str, k: int, offset: int = 0) -> list[Document]:
-        return self.vector_store.similarity_search(query=query_text, k=k, offset=offset)
+        docs = self.vector_store.similarity_search(query=query_text, k=k, offset=offset)
+        for local_rank, doc in enumerate(docs):
+            metadata = dict(doc.metadata or {})
+            metadata.setdefault("retrieval_rank", offset + local_rank)
+            metadata.setdefault("retrieval_offset", offset)
+            metadata.setdefault("retrieval_score", None)
+            metadata.setdefault("retrieval_source", "qdrant")
+            doc.metadata = metadata
+        return docs
 
     def random_sample(self, k: int) -> list[Document]:
         out = []
@@ -125,6 +133,11 @@ class QdrantBackend(VectorBackend):
                 metadata = payload.get("metadata") or {}
                 page_content = payload.get("page_content") or payload.get("text") or ""
                 if "document_id" in metadata:
+                    metadata = dict(metadata)
+                    metadata.setdefault("retrieval_rank", len(out))
+                    metadata.setdefault("retrieval_offset", None)
+                    metadata.setdefault("retrieval_score", None)
+                    metadata.setdefault("retrieval_source", "random")
                     out.append(Document(page_content=page_content, metadata=metadata))
                 if len(out) >= k:
                     break
@@ -321,6 +334,7 @@ class LanceDBBackend(VectorBackend):
         limit = max(k + offset, k)
 
         # Prefer hybrid query: dense + BM25 FTS.
+        retrieval_source = "hybrid"
         try:
             hits = (
                 self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
@@ -329,6 +343,7 @@ class LanceDBBackend(VectorBackend):
                 .to_list()
             )
         except Exception:
+            retrieval_source = "vector"
             hits = (
                 self._tune_query(self.table.search(vector))
                 .select(self.VECTOR_SELECT_COLUMNS)
@@ -337,9 +352,20 @@ class LanceDBBackend(VectorBackend):
             )
 
         docs = []
-        for hit in hits[offset:offset + k]:
+        for local_rank, hit in enumerate(hits[offset:offset + k]):
             doc_id = str(hit.get("document_id", ""))
-            docs.append(Document(page_content=hit.get("text", ""), metadata={"document_id": doc_id}))
+            docs.append(
+                Document(
+                    page_content=hit.get("text", ""),
+                    metadata={
+                        "document_id": doc_id,
+                        "retrieval_rank": offset + local_rank,
+                        "retrieval_offset": offset,
+                        "retrieval_score": hit.get("_score", hit.get("_distance")),
+                        "retrieval_source": retrieval_source,
+                    },
+                )
+            )
 
         return docs[:k]
 
@@ -357,6 +383,7 @@ class LanceDBBackend(VectorBackend):
         limit = max(offsets) + k
 
         # Prefer hybrid query: dense + BM25 FTS.
+        retrieval_source = "hybrid"
         try:
             hits = (
                 self._tune_query(self.table.search(query_type="hybrid").vector(vector).text(query_text))
@@ -365,6 +392,7 @@ class LanceDBBackend(VectorBackend):
                 .to_list()
             )
         except Exception:
+            retrieval_source = "vector"
             hits = (
                 self._tune_query(self.table.search(vector))
                 .select(self.VECTOR_SELECT_COLUMNS)
@@ -375,9 +403,20 @@ class LanceDBBackend(VectorBackend):
         out: dict[int, list[Document]] = {}
         for offset in offsets:
             docs = []
-            for hit in hits[offset:offset + k]:
+            for local_rank, hit in enumerate(hits[offset:offset + k]):
                 doc_id = str(hit.get("document_id", ""))
-                docs.append(Document(page_content=hit.get("text", ""), metadata={"document_id": doc_id}))
+                docs.append(
+                    Document(
+                        page_content=hit.get("text", ""),
+                        metadata={
+                            "document_id": doc_id,
+                            "retrieval_rank": offset + local_rank,
+                            "retrieval_offset": offset,
+                            "retrieval_score": hit.get("_score", hit.get("_distance")),
+                            "retrieval_source": retrieval_source,
+                        },
+                    )
+                )
             out[offset] = docs[:k]
         return out
 
@@ -390,7 +429,19 @@ class LanceDBBackend(VectorBackend):
         else:
             sample = random.sample(rows, k)
 
-        return [Document(page_content=row.get("text", ""), metadata={"document_id": str(row.get("document_id", ""))}) for row in sample]
+        return [
+            Document(
+                page_content=row.get("text", ""),
+                metadata={
+                    "document_id": str(row.get("document_id", "")),
+                    "retrieval_rank": rank,
+                    "retrieval_offset": None,
+                    "retrieval_score": None,
+                    "retrieval_source": "random",
+                },
+            )
+            for rank, row in enumerate(sample)
+        ]
 
     def _embed_query_cached(self, query_text: str):
         if self.query_vector_cache_size <= 0:

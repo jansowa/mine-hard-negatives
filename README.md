@@ -66,6 +66,51 @@ This starts the `executable` container and optional `vdb` service based on Qdran
    python app_code/create_flag_embedding_jsonl.py
    ```
 
+## Optional two-stage negative reranking
+
+For cheaper mining, you can split negative scoring into a small-reranker candidate pass and a final large-reranker pass. The intermediate candidate artifact is intentionally light: it stores IDs, retrieval metadata, and candidate scores, but not duplicated query/document texts. A complete example configuration is available in `.env.example.sdadas.two-stage`; with that file copied to `.env`, the commands below do not need path/model flags.
+
+### 1) Workstation: score candidates with a small reranker
+
+First score positives with the same small reranker so the candidate percentile thresholds use the matching score distribution:
+
+```bash
+python app_code/add_positives_ranks.py
+```
+
+Then mine candidate negatives and save the small-reranker scores as `candidate_ranking`:
+
+```bash
+python app_code/find_negatives.py
+```
+
+Upload or otherwise move these files together:
+
+- `data/queries.parquet`
+- `data/corpus.parquet`
+- `data/negative_candidates.parquet`
+- the relevant file needed by your next stage, for example `data/relevant_with_candidate_score.parquet`
+
+### 2) Larger machine: final-rerank selected candidates
+
+The final pass reads `candidate_selected == true` by default, adds `final_ranking`, and also writes `ranking = final_ranking` for compatibility with the existing JSONL builder:
+
+```bash
+python app_code/rerank_negative_candidates.py
+```
+
+If you also want positive scores from the final reranker for training/export thresholds, score positives again with the final model:
+
+```bash
+python app_code/add_positives_ranks.py --final-step
+```
+
+Finally build JSONL using the final negative score column:
+
+```bash
+python app_code/create_flag_embedding_jsonl.py
+```
+
 ## Backend notes
 
 - `VECTOR_DB_BACKEND=lancedb` uses dense retrieval + LanceDB BM25/hybrid.

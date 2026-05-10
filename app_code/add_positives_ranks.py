@@ -5,12 +5,87 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from models import get_reranker_model, rerank
-from decouple import config
+from decouple import UndefinedValueError, config
 import uuid
 import glob
 import shutil
 from typing import Iterable, Optional
 import re
+
+
+_MISSING = object()
+
+
+def _config_first(names: tuple[str, ...], *, cast=None, default=_MISSING):
+    for name in names:
+        try:
+            if cast is None:
+                return config(name)
+            return config(name, cast=cast)
+        except UndefinedValueError:
+            continue
+    if default is _MISSING:
+        raise UndefinedValueError(
+            f"{', '.join(names)} not found. Declare one of these env vars or pass the CLI flag."
+        )
+    return default
+
+
+def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
+    if final_step:
+        return {
+            "output_path": _config_first(
+                ("FINAL_POSITIVE_RANKS_OUTPUT_PATH", "RELEVANT_WITH_SCORE_PATH")
+            ),
+            "reranker_model_name": _config_first(
+                ("FINAL_POSITIVE_RANKS_RERANKER_NAME", "FINAL_RERANKER_NAME", "RERANKER_NAME")
+            ),
+            "reranker_batch_size": _config_first(
+                ("FINAL_POSITIVE_RANKS_RERANKER_BATCH_SIZE", "FINAL_RERANKER_BATCH_SIZE", "RERANKER_BATCH_SIZE"),
+                cast=int,
+            ),
+            "score_column": _config_first(
+                ("FINAL_POSITIVE_RANKS_SCORE_COLUMN", "FINAL_POSITIVE_SCORE_COLUMN"),
+                default="positive_ranking",
+            ),
+        }
+
+    return {
+        "output_path": _config_first(
+            (
+                "CANDIDATE_POSITIVE_RANKS_OUTPUT_PATH",
+                "RELEVANT_WITH_CANDIDATE_SCORE_PATH",
+                "POSITIVE_RANKS_OUTPUT_PATH",
+                "RELEVANT_WITH_SCORE_PATH",
+            ),
+        ),
+        "reranker_model_name": _config_first(
+            (
+                "CANDIDATE_POSITIVE_RANKS_RERANKER_NAME",
+                "CANDIDATE_RERANKER_NAME",
+                "POSITIVE_RANKS_RERANKER_NAME",
+                "RERANKER_NAME",
+            ),
+        ),
+        "reranker_batch_size": _config_first(
+            (
+                "CANDIDATE_POSITIVE_RANKS_RERANKER_BATCH_SIZE",
+                "CANDIDATE_RERANKER_BATCH_SIZE",
+                "POSITIVE_RANKS_RERANKER_BATCH_SIZE",
+                "RERANKER_BATCH_SIZE",
+            ),
+            cast=int,
+        ),
+        "score_column": _config_first(
+            (
+                "CANDIDATE_POSITIVE_RANKS_SCORE_COLUMN",
+                "CANDIDATE_POSITIVE_SCORE_COLUMN",
+                "POSITIVE_RANKS_SCORE_COLUMN",
+            ),
+            default="positive_candidate_ranking",
+        ),
+    }
+
 
 def _get_next_part_idx(parts_dir: str) -> int:
     parts = _list_parts(parts_dir)
@@ -193,7 +268,11 @@ def process_relevant(
     reranker_model_name: str,
     skip: int = 0,
     offset: Optional[int] = None,
+    score_column: str = "positive_ranking",
 ) -> None:
+    if not score_column:
+        raise ValueError("score_column must not be empty")
+
     output_dir: str = os.path.dirname(output_path) if output_path else "."
     parts_dir: str = f"{output_path}.parts"
     tmp_dir: str = os.path.join(output_dir or ".", ".tmp")
@@ -239,7 +318,7 @@ def process_relevant(
         relevant_extended_schema: pa.Schema = pa.schema([
             ('query_id', pa.string()),
             ('document_id', pa.string()),
-            ('positive_ranking', pa.float32())
+            (score_column, pa.float32())
         ])
         print("Schema for output parts defined.")
 
@@ -282,7 +361,7 @@ def process_relevant(
                 result_chunk_df: pd.DataFrame = pd.DataFrame({
                     'query_id': merged_chunk_df['query_id'].astype('string', copy=False),
                     'document_id': merged_chunk_df['document_id'].astype('string', copy=False),
-                    'positive_ranking': pd.Series(scores_chunk, dtype='float32')
+                    score_column: pd.Series(scores_chunk, dtype='float32')
                 })
 
                 result_table_chunk: pa.Table = pa.Table.from_pandas(
@@ -336,22 +415,52 @@ if __name__ == "__main__":
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"), help="Path to parquet file with queries")
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"), help="Path to parquet file with corpus")
     parser.add_argument("--relevant_path", type=str, default=config("RELEVANT_PATH"), help="Path to parquet file with relevant connections")
-    parser.add_argument("--output_path", type=str, default=config("RELEVANT_WITH_SCORE_PATH"), help="Base path for output (final file will be at output_path)")
+    parser.add_argument(
+        "--final-step",
+        "--second-step",
+        dest="final_step",
+        action="store_true",
+        help="Use final positive-reranking settings from FINAL_POSITIVE_RANKS_* / FINAL_* env vars.",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=None,
+        help="Base path for output (final file will be at output_path)",
+    )
     parser.add_argument("--chunk_size", type=int, default=config("PROCESSING_CHUNK_SIZE", cast=int), help="Chunk size for processing")
-    parser.add_argument("--reranker_batch_size", type=int, default=config("RERANKER_BATCH_SIZE", cast=int), help="Batch size for reranker")
-    parser.add_argument("--reranker_model_name", type=str, default=config("RERANKER_NAME"), help="Name of the reranker model")
+    parser.add_argument(
+        "--reranker_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for reranker",
+    )
+    parser.add_argument(
+        "--reranker_model_name",
+        type=str,
+        default=None,
+        help="Name of the reranker model",
+    )
+    parser.add_argument(
+        "--score_column",
+        type=str,
+        default=None,
+        help="Name of the output score column, e.g. positive_candidate_ranking.",
+    )
     parser.add_argument("--skip", type=int, default=0, help="How many initial items to skip in relevant_path (by position in the file).")
     parser.add_argument("--offset", type=int, default=None, help="How many items in total to process from relevant_path window (after skip). If omitted, process to the end.")
     args = parser.parse_args()
+    stage_defaults = get_positive_ranks_stage_defaults(args.final_step)
 
     process_relevant(
         queries_path=args.queries_path,
         corpus_path=args.corpus_path,
         relevant_path=args.relevant_path,
-        output_path=args.output_path,
+        output_path=args.output_path or stage_defaults["output_path"],
         chunk_size=args.chunk_size,
-        reranker_batch_size=args.reranker_batch_size,
-        reranker_model_name=args.reranker_model_name,
+        reranker_batch_size=args.reranker_batch_size or stage_defaults["reranker_batch_size"],
+        reranker_model_name=args.reranker_model_name or stage_defaults["reranker_model_name"],
+        score_column=args.score_column or stage_defaults["score_column"],
         skip=args.skip,
         offset=args.offset,
     )

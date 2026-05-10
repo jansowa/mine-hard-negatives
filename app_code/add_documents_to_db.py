@@ -403,16 +403,16 @@ if __name__ == "__main__":
         default=None,
         help="Embedding microbatch size. If omitted for LanceDB, a short benchmark selects it automatically.",
     )
-    parser.add_argument("--auto_batch_size_candidates", type=str, default=None)
-    parser.add_argument("--auto_batch_size_min", type=int, default=8)
-    parser.add_argument("--auto_batch_size_max", type=int, default=256)
-    parser.add_argument("--auto_batch_size_sample_size", type=int, default=512)
+    parser.add_argument("--auto_batch_size_candidates", type=str, default=config("ADD_DOCUMENTS_AUTO_BATCH_SIZE_CANDIDATES", default=None))
+    parser.add_argument("--auto_batch_size_min", type=int, default=config("ADD_DOCUMENTS_AUTO_BATCH_SIZE_MIN", cast=int, default=8))
+    parser.add_argument("--auto_batch_size_max", type=int, default=config("ADD_DOCUMENTS_AUTO_BATCH_SIZE_MAX", cast=int, default=256))
+    parser.add_argument("--auto_batch_size_sample_size", type=int, default=config("ADD_DOCUMENTS_AUTO_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=512))
     parser.add_argument(
         "--db_write_batch_size",
         type=int,
         default=config("LANCEDB_DB_WRITE_BATCH_SIZE", cast=int, default=4096),
     )
-    parser.add_argument("--database_collection_name", type=str, default="all_documents")
+    parser.add_argument("--database_collection_name", type=str, default=config("DATABASE_COLLECTION_NAME", default="all_documents"))
     parser.add_argument("--skip", type=int, default=0)
     parser.add_argument("--offset", type=int, default=None)
     parser.add_argument("--resume", dest="resume", action="store_true")

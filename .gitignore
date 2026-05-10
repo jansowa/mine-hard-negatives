@@ -5,3 +5,16 @@ qdrant_storage
 app_code/data
 app_code/logs
 __pycache__
+.smoke
+.codex
+app_code/data*
+trt_models/
+*.plan
+*.engine
+.venv
+*/*.sqlite
+*/*.parquet
+.smoke-nq
+logs
+merge_data
+runs
