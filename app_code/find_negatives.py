@@ -451,7 +451,7 @@ def find_negatives_multigpu(
     relevant_path: str,
     output_path: str,
     top_k: int,
-    force_resume: bool = None,
+    force_resume: bool | None = None,
     query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
     profile_timing: bool = config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False),
     auto_embedding_batch_size_candidates: str | None = config(

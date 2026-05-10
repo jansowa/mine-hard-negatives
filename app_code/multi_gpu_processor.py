@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from queue import Empty, Queue
 
 import numpy as np
@@ -19,7 +19,9 @@ class TimingStats:
     def __init__(self, enabled: bool = False) -> None:
         self.enabled = enabled
         self._lock = threading.Lock()
-        self._stats = defaultdict(lambda: {"seconds": 0.0, "calls": 0, "items": 0})
+        self._stats: defaultdict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"seconds": 0.0, "calls": 0, "items": 0}
+        )
 
     def record(self, name: str, seconds: float, items: int = 0) -> None:
         if not self.enabled:
@@ -342,7 +344,7 @@ class MultiGPUNegativeFinder:
     def __init__(
         self,
         model_sets: list[GPUModelSet],
-        output_path: str = None,
+        output_path: str | None = None,
         progress_bar=None,
         logger=None,
         resume: bool = False,
@@ -352,7 +354,7 @@ class MultiGPUNegativeFinder:
         if not ranking_column:
             raise ValueError("ranking_column must not be empty")
         self.model_sets = model_sets
-        self.query_queue = Queue()
+        self.query_queue: Queue[tuple[int, list[dict]]] = Queue()
         self.completed_batches = 0  # Now tracks completed queries
         self.total_batches = 0  # Now tracks total queries
         self.total_queries = 0
@@ -362,7 +364,7 @@ class MultiGPUNegativeFinder:
         self.progress_bar = progress_bar
         self.logger = logger or logging.getLogger(__name__)
         self.resume = resume
-        self.start_time = None  # Track overall processing start time
+        self.start_time: float | None = None  # Track overall processing start time
         self.timing_stats = TimingStats(enabled=profile_timing)
         self.parquet_row_group_size = max(1, config("NEGATIVES_PARQUET_ROW_GROUP_SIZE", cast=int, default=100_000))
         self.ranking_column = ranking_column
@@ -410,6 +412,8 @@ class MultiGPUNegativeFinder:
     def _normalise_result(self, result: dict | tuple) -> dict:
         if isinstance(result, dict):
             score = result.get(self.ranking_column, result.get("ranking"))
+            if score is None:
+                raise ValueError(f"Result is missing ranking column {self.ranking_column!r}")
             row = {
                 "query_id": str(result["query_id"]),
                 "document_id": str(result["document_id"]),
@@ -435,7 +439,7 @@ class MultiGPUNegativeFinder:
             self.ranking_column: float(ranking),
         }
 
-    def write_results_to_jsonl(self, handle, results: list[dict | tuple]) -> None:
+    def write_results_to_jsonl(self, handle, results: Sequence[dict | tuple]) -> None:
         """Write a batch of results to an already-open JSONL handle."""
         if not results:
             return
@@ -611,6 +615,9 @@ class MultiGPUNegativeFinder:
 
     def consolidate_worker_files(self) -> None:
         """Consolidate all worker JSONL files into final parquet file"""
+
+        if self.output_path is None:
+            raise ValueError("output_path must be set before consolidating worker files")
 
         self.logger.info("[MAIN] Consolidating worker files into final parquet...")
 

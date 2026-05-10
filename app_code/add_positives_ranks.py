@@ -148,8 +148,8 @@ def _pack_pair(query_id: str, document_id: str) -> str:
     return f"{str(query_id)}\t{str(document_id)}"
 
 
-def _load_scored_pairs_from_files(paths: Iterable[str]) -> set[int]:
-    scored: set[int] = set()
+def _load_scored_pairs_from_files(paths: Iterable[str]) -> set[str]:
+    scored: set[str] = set()
     for p in paths:
         try:
             pf = pq.ParquetFile(p)
@@ -164,7 +164,7 @@ def _load_scored_pairs_from_files(paths: Iterable[str]) -> set[int]:
     return scored
 
 
-def _load_scored_pairs(output_path: str) -> set[int]:
+def _load_scored_pairs(output_path: str) -> set[str]:
     parts_dir = f"{output_path}.parts"
     paths: list[str] = []
     if os.path.isdir(parts_dir):
@@ -179,7 +179,7 @@ def _load_scored_pairs(output_path: str) -> set[int]:
 
 def _filter_relevant_to_missing(
     relevant_path: str,
-    already_scored_pairs: set[int],
+    already_scored_pairs: set[str],
     skip: int,
     offset: int | None,
     tmp_dir: str,
@@ -300,7 +300,7 @@ def process_relevant(
         print("Files queries.parquet and corpus.parquet loaded and prepared.")
         print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
 
-        already_scored_pairs: set[int] = _load_scored_pairs(output_path)
+        already_scored_pairs: set[str] = _load_scored_pairs(output_path)
         already_scored_count = len(already_scored_pairs)
         if already_scored_count:
             print(f"Found {already_scored_count:,} previously scored unique pairs.")

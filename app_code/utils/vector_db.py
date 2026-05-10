@@ -106,7 +106,7 @@ class QdrantBackend(VectorBackend):
         return docs
 
     def random_sample(self, k: int) -> list[Document]:
-        out = []
+        out: list[Document] = []
         next_page = None
 
         for _ in range(10):
@@ -192,7 +192,7 @@ class LanceDBBackend(VectorBackend):
         else:
             raw_table_names = self.db.table_names()
 
-        table_names = set()
+        table_names: set[str] = set()
         if hasattr(raw_table_names, "tables"):
             table_names.update(str(name) for name in raw_table_names.tables)
 

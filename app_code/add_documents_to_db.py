@@ -360,6 +360,9 @@ def process_file(
             set_dense_embedding_batch_size(dense_embeddings, effective_batch_size)
         backend.set_dense_embeddings(dense_embeddings)
 
+    if effective_batch_size is None:
+        raise ValueError("Embedding batch size could not be determined")
+
     print(f"Embedding batch size: {effective_batch_size}")
     print(f"DB write batch size: {effective_db_write_batch_size}")
     if backend_type == "lancedb":

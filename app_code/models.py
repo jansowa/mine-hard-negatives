@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -16,20 +17,38 @@ except ImportError:
         return False
 
 
+# langchain-qdrant is optional in some environments. Keep the imported classes
+# and local fallback classes under separate names so mypy does not see a redefinition.
+SparseEmbeddingsBase: type[Any]
+SparseVectorFactory: type[Any]
+
+
+class SparseVectorLike(Protocol):
+    indices: list[int]
+    values: list[float]
+
+
 try:
-    from langchain_qdrant.sparse_embeddings import SparseEmbeddings, SparseVector
+    from langchain_qdrant.sparse_embeddings import SparseEmbeddings as ImportedSparseEmbeddings
+    from langchain_qdrant.sparse_embeddings import SparseVector as ImportedSparseVector
 except ImportError:
 
-    class SparseEmbeddings:
+    class FallbackSparseEmbeddings:
         pass
 
     @dataclass
-    class SparseVector:
+    class FallbackSparseVector:
         indices: list[int]
         values: list[float]
 
+    SparseEmbeddingsBase = FallbackSparseEmbeddings
+    SparseVectorFactory = FallbackSparseVector
+else:
+    SparseEmbeddingsBase = ImportedSparseEmbeddings
+    SparseVectorFactory = ImportedSparseVector
 
-class SpladeEmbedding(SparseEmbeddings):
+
+class SpladeEmbedding(SparseEmbeddingsBase):
     def __init__(
         self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0
     ):
@@ -41,7 +60,7 @@ class SpladeEmbedding(SparseEmbeddings):
         self.device = torch.device(f"cuda:{gpu_id}")
         self.batch_size = batch_size
 
-    def _encode_splade_batch(self, texts: list[str]) -> list[SparseVector]:
+    def _encode_splade_batch(self, texts: list[str]) -> list[SparseVectorLike]:
         inputs = self.tokenizer(
             texts,
             padding="longest",
@@ -60,15 +79,15 @@ class SpladeEmbedding(SparseEmbeddings):
         for vector in vectors:
             idx = torch.nonzero(vector).squeeze().cpu().numpy().tolist()
             values = vector[idx].cpu().numpy().tolist()
-            results.append(SparseVector(indices=idx, values=values))
+            results.append(SparseVectorFactory(indices=idx, values=values))
 
         torch.cuda.empty_cache()
         return results
 
-    def embed_query(self, query: str) -> SparseVector:
+    def embed_query(self, query: str) -> SparseVectorLike:
         return self._encode_splade_batch([query])[0]
 
-    def embed_documents(self, texts: list[str]) -> list[SparseVector]:
+    def embed_documents(self, texts: list[str]) -> list[SparseVectorLike]:
         results = []
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i : i + self.batch_size]
@@ -155,9 +174,9 @@ def rerank(
     if hasattr(model, "score_pairs"):
         return model.score_pairs([(q, a) for q, a in texts], batch_size=batch_size)
 
-    results = []
     if is_flag_embedding_reranker(model_name):
-        additional_params = dict()
+        results = []
+        additional_params: dict[str, Any] = {}
         if is_llm_lightweight_reranker(model_name):
             additional_params["cutoff_layers"] = [28]
             additional_params["compress_ratio"] = 2
@@ -167,6 +186,7 @@ def rerank(
             results += model.compute_score(batch_texts, **additional_params)
         return results
 
+    result_batches: list[np.ndarray] = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i : i + batch_size]
         tokens = tokenizer(
@@ -179,8 +199,8 @@ def rerank(
         with torch.inference_mode():
             output = model(**tokens)
         batch_results = output.logits.detach().cpu().float().numpy()
-        results.append(batch_results)
+        result_batches.append(batch_results)
 
-    results = np.concatenate(results, axis=0)
-    results = np.squeeze(results)
-    return [float(result) for result in results.tolist()]
+    result_array = np.concatenate(result_batches, axis=0)
+    result_array = np.squeeze(result_array)
+    return [float(result) for result in result_array.tolist()]

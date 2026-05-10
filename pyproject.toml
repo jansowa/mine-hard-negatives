@@ -36,11 +36,3 @@ follow_imports = "silent"
 show_error_codes = true
 warn_unused_configs = true
 check_untyped_defs = false
-disable_error_code = [
-  "arg-type",
-  "assignment",
-  "attr-defined",
-  "no-redef",
-  "union-attr",
-  "var-annotated",
-]
