@@ -29,6 +29,16 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
      uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements.txt
      ```
 
+If installation fails while building old `ir-datasets` dependencies such as `cbor`,
+make sure the system has a C build toolchain, then clear the failed build cache:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential python3.12-dev
+uv cache clean cbor warc3-wet-clueweb09 flagembedding setuptools
+uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+```
+
 ### 2) Docker Compose (optional local convenience setup)
 
 ```bash
