@@ -6,12 +6,14 @@ FlagEmbedding
 langchain-core
 langchain-huggingface
 lancedb
+mypy
 numpy
 pandas
 polars
 pytest
 python-decouple
 rapidfuzz
+ruff
 simhash
 torch
 transformers==4.51

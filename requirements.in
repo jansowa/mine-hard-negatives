@@ -10,9 +10,11 @@ pandas
 transformers==4.51
 langchain-huggingface
 numpy
+mypy
 torch
 accelerate
 FlagEmbedding
 rapidfuzz
 simhash
 pytest
+ruff

@@ -18,6 +18,8 @@ annotated-types==0.7.0
     # via pydantic
 anyio==4.9.0
     # via httpx
+ast-serialize==0.3.0
+    # via mypy
 attrs==25.3.0
     # via aiohttp
 beautifulsoup4==4.13.4
@@ -128,6 +130,8 @@ langchain-qdrant==0.2.0
     # via -r requirements.in
 langsmith==0.3.42
     # via langchain-core
+librt==0.10.0
+    # via mypy
 lxml==5.4.0
     # via
     #   inscriptis
@@ -144,6 +148,10 @@ multidict==6.4.4
     #   yarl
 multiprocess==0.70.16
     # via datasets
+mypy==2.0.0
+    # via -r requirements.in
+mypy-extensions==1.1.0
+    # via mypy
 networkx==3.4.2
     # via torch
 numpy==2.2.6
@@ -218,6 +226,8 @@ pandas==2.2.3
     # via
     #   -r requirements.in
     #   datasets
+pathspec==1.1.1
+    # via mypy
 peft==0.15.2
     # via flagembedding
 pillow==11.2.1
@@ -293,6 +303,8 @@ requests==2.32.3
     #   transformers
 requests-toolbelt==1.0.0
     # via langsmith
+ruff==0.15.12
+    # via -r requirements.in
 safetensors==0.5.3
     # via
     #   accelerate
@@ -364,6 +376,7 @@ typing-extensions==4.13.2
     #   huggingface-hub
     #   lance-namespace-urllib3-client
     #   langchain-core
+    #   mypy
     #   pydantic
     #   pydantic-core
     #   sentence-transformers

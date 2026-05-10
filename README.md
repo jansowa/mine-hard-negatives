@@ -67,6 +67,32 @@ uv pip compile requirements.in -o requirements.txt \
   --emit-find-links
 ```
 
+## Code quality
+
+Run Ruff checks:
+
+```bash
+ruff check app_code tests
+```
+
+Run mypy type checks:
+
+```bash
+mypy
+```
+
+Apply safe automatic fixes:
+
+```bash
+ruff check app_code tests --fix
+```
+
+Format Python files:
+
+```bash
+ruff format app_code tests
+```
+
 ## Pipeline
 
 1. Prepare data (`corpus.parquet`, `queries.parquet`, `relevant.parquet`):

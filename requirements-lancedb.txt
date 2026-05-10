@@ -18,6 +18,8 @@ annotated-types==0.7.0
     # via pydantic
 anyio==4.13.0
     # via httpx
+ast-serialize==0.3.0
+    # via mypy
 attrs==26.1.0
     # via aiohttp
 beautifulsoup4==4.14.3
@@ -119,6 +121,8 @@ langchain-huggingface==1.2.1
     # via -r requirements-lancedb.in
 langsmith==0.7.29
     # via langchain-core
+librt==0.10.0
+    # via mypy
 lxml==6.0.3
     # via
     #   inscriptis
@@ -135,6 +139,10 @@ multidict==6.7.1
     #   yarl
 multiprocess==0.70.19
     # via datasets
+mypy==2.0.0
+    # via -r requirements-lancedb.in
+mypy-extensions==1.1.0
+    # via mypy
 networkx==3.6.1
     # via torch
 numpy==2.4.4
@@ -209,6 +217,8 @@ pandas==3.0.2
     # via
     #   -r requirements-lancedb.in
     #   datasets
+pathspec==1.1.1
+    # via mypy
 peft==0.18.1
     # via flagembedding
 pluggy==1.6.0
@@ -274,6 +284,8 @@ requests==2.33.1
     #   transformers
 requests-toolbelt==1.0.0
     # via langsmith
+ruff==0.15.12
+    # via -r requirements-lancedb.in
 safetensors==0.7.0
     # via
     #   accelerate
@@ -341,6 +353,7 @@ typing-extensions==4.15.0
     #   huggingface-hub
     #   lance-namespace-urllib3-client
     #   langchain-core
+    #   mypy
     #   pydantic
     #   pydantic-core
     #   sentence-transformers
