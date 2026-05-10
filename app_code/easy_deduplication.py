@@ -165,7 +165,7 @@ def _verify_bucket_worker(
     dropped_rows: List[Tuple[str, str, str, float]] = []
     cluster_rows: List[Tuple[str, str]] = []
 
-    for lb, rid, rtext, _ in all_docs:
+    for _, rid, rtext, _ in all_docs:
         best_id, best_score = None, -1.0
         for cid, ctext in canons:
             # szybki strażnik długości (ogranicza porównania)

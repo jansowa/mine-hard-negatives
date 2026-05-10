@@ -43,7 +43,7 @@ def main(queries_path: str, corpus_path: str, relevant_path: str) -> None:
         kept_answers = 0
         skipped_questions = 0
 
-        for idx, item in enumerate(ds):
+        for item in ds:
             q_text = (item.get("name") or "").strip()
             answers = item.get("answers") or []
 

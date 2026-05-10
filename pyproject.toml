@@ -15,8 +15,11 @@ select = [
   "E9", # pycodestyle syntax/runtime errors
   "F",  # Pyflakes: undefined names, unused imports, and similar correctness issues
   "I",  # isort: import ordering
+  "B",  # flake8-bugbear: likely bugs and risky patterns
 ]
-ignore = []
+ignore = [
+  "B905", # Require explicit strict= for zip(); useful later, noisy for the current codebase
+]
 
 [tool.mypy]
 python_version = "3.12"
