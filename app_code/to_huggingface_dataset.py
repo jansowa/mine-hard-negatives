@@ -18,7 +18,7 @@ def main(input_file_path: str, queries_path: str, corpus_path: str, relevant_pat
     corpus_writer = None
     relevant_writer = None
 
-    with open(input_file_path, "r", encoding="utf-8") as infile:
+    with open(input_file_path, encoding="utf-8") as infile:
         for line in infile:
             data: dict = json.loads(line)
             messages: list = data.get("messages", [])

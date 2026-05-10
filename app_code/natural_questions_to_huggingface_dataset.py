@@ -4,8 +4,8 @@ import json
 import os
 import random
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -37,7 +37,7 @@ def write_batch(writer: pq.ParquetWriter, batch: list[dict], schema: pa.Schema) 
     batch.clear()
 
 
-def extract_trailing_query_id(raw_id: object) -> Optional[str]:
+def extract_trailing_query_id(raw_id: object) -> str | None:
     match = QUERY_ID_RE.search(str(raw_id or ""))
     if not match:
         return None
@@ -81,7 +81,7 @@ def reservoir_sample_msmarco_docs(
     return reservoir, eligible_seen, skipped_used
 
 
-def download_msmarco_pl_corpus(hf_token: Optional[str]) -> str:
+def download_msmarco_pl_corpus(hf_token: str | None) -> str:
     try:
         return hf_hub_download(
             repo_id="clarin-knext/msmarco-pl",
@@ -187,7 +187,7 @@ def write_natural_questions_parquets(
     return stats
 
 
-def load_used_corpus_ids(dataset_name: str, hf_token: Optional[str]) -> set[str]:
+def load_used_corpus_ids(dataset_name: str, hf_token: str | None) -> set[str]:
     try:
         ds = load_dataset(dataset_name, data_dir="corpus", split="train", token=hf_token)
     except Exception as exc:
@@ -207,7 +207,7 @@ def load_used_corpus_ids(dataset_name: str, hf_token: Optional[str]) -> set[str]
 def load_natural_questions_dataset(
     dataset_name: str,
     split: str,
-    hf_token: Optional[str],
+    hf_token: str | None,
 ) -> Iterable[dict]:
     try:
         return load_dataset(dataset_name, split=split, token=hf_token)
@@ -229,7 +229,7 @@ def main(
     seed: int,
     skip_used_corpus_filter: bool,
     used_corpus_dataset: str,
-    hf_token: Optional[str],
+    hf_token: str | None,
     batch_size: int,
 ) -> None:
     for path in (queries_path, corpus_path, relevant_path):

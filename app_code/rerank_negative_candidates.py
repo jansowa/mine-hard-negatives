@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Iterable
+from collections.abc import Iterable
 
 import pandas as pd
 import pyarrow as pa
@@ -55,7 +55,7 @@ def _load_scored_pairs_from_jsonl(path: str) -> set[str]:
         return set()
 
     scored: set[str] = set()
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
@@ -127,7 +127,7 @@ def consolidate_worker_jsonl(worker_file: str, output_path: str, schema: pa.Sche
 
     try:
         buffer: list[dict] = []
-        with open(worker_file, "r", encoding="utf-8") as handle:
+        with open(worker_file, encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue

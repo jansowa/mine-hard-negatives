@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -143,7 +142,7 @@ def get_reranker_model(
 def rerank(
     tokenizer,
     model,
-    query: Tuple[str, list[str]],
+    query: tuple[str, list[str]],
     answers: list[str],
     batch_size=16,
     model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2"),

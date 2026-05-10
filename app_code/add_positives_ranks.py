@@ -4,7 +4,7 @@ import os
 import re
 import shutil
 import uuid
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 import pandas as pd
 import pyarrow as pa
@@ -181,7 +181,7 @@ def _filter_relevant_to_missing(
     relevant_path: str,
     already_scored_pairs: set[int],
     skip: int,
-    offset: Optional[int],
+    offset: int | None,
     tmp_dir: str,
     chunk_size: int = 200_000,
 ) -> tuple[str, int]:
@@ -275,7 +275,7 @@ def process_relevant(
     reranker_batch_size: int,
     reranker_model_name: str,
     skip: int = 0,
-    offset: Optional[int] = None,
+    offset: int | None = None,
     score_column: str = "positive_ranking",
 ) -> None:
     if not score_column:

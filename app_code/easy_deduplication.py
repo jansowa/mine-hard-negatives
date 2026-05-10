@@ -10,7 +10,6 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -79,7 +78,7 @@ class HPDB:
         self.conn.commit()
 
     # exact
-    def exact_get(self, sha1: str) -> Optional[str]:
+    def exact_get(self, sha1: str) -> str | None:
         row = self.conn.execute("SELECT kept_id FROM exact WHERE sha1=?", (sha1,)).fetchone()
         return row[0] if row else None
 
@@ -87,17 +86,17 @@ class HPDB:
         self.conn.execute("INSERT OR IGNORE INTO exact(sha1, kept_id) VALUES(?,?)", (sha1, kept_id))
 
     # blocks
-    def blocks_add_many(self, rows: List[Tuple[int, int, str, str]]):
+    def blocks_add_many(self, rows: list[tuple[int, int, str, str]]):
         self.conn.executemany("INSERT OR IGNORE INTO blocks(bucket,lenbin,id,text) VALUES(?,?,?,?)", rows)
 
-    def blocks_distinct_buckets(self) -> List[int]:
+    def blocks_distinct_buckets(self) -> list[int]:
         cur = self.conn.execute("SELECT DISTINCT bucket FROM blocks ORDER BY bucket")
         return [r[0] for r in cur.fetchall()]
 
-    def kept_add_many(self, ids: List[str]):
+    def kept_add_many(self, ids: list[str]):
         self.conn.executemany("INSERT OR IGNORE INTO kept(id) VALUES(?)", ((i,) for i in ids))
 
-    def kept_membership(self, ids: List[str]) -> List[bool]:
+    def kept_membership(self, ids: list[str]) -> list[bool]:
         if not ids:
             return []
         q = ",".join("?" for _ in ids)
@@ -119,8 +118,8 @@ class HPDB:
 # Równoległe worker'y (TOP-LEVEL!)
 # -----------------------------
 def _prep_for_blocking(
-    item: Tuple[str, str], bucket_bits: int, len_bin: int, ngram: int
-) -> Tuple[str, str, str, int, int]:
+    item: tuple[str, str], bucket_bits: int, len_bin: int, ngram: int
+) -> tuple[str, str, str, int, int]:
     """
     Zwraca: (doc_id, norm, sha1, bucket, lenbin)
     """
@@ -137,7 +136,7 @@ def _prep_for_blocking(
 
 def _verify_bucket_worker(
     db_path: str, bucket: int, verify_threshold: int
-) -> Tuple[List[str], List[Tuple[str, str, str, float]], List[Tuple[str, str]]]:
+) -> tuple[list[str], list[tuple[str, str, str, float]], list[tuple[str, str]]]:
     """
     Czyta jeden koszyk z SQLite (read-only), robi konserwatywną deduplikację w obrębie koszyka.
     Zwraca: (kept_ids_local, dropped_rows, cluster_rows)
@@ -149,7 +148,7 @@ def _verify_bucket_worker(
         return [], [], []
 
     # grupuj po lenbin
-    by_bin: Dict[int, List[Tuple[str, str]]] = {}
+    by_bin: dict[int, list[tuple[str, str]]] = {}
     for lbin, rid, rtext in rows:
         by_bin.setdefault(lbin, []).append((rid, rtext))
 
@@ -160,10 +159,10 @@ def _verify_bucket_worker(
             all_docs.append((lb, rid, rtext, len(rtext)))
     all_docs.sort(key=lambda x: (-x[3], x[1]))
 
-    canons: List[Tuple[str, str]] = []  # (id, text)
-    kept_ids_local: List[str] = []
-    dropped_rows: List[Tuple[str, str, str, float]] = []
-    cluster_rows: List[Tuple[str, str]] = []
+    canons: list[tuple[str, str]] = []  # (id, text)
+    kept_ids_local: list[str] = []
+    dropped_rows: list[tuple[str, str, str, float]] = []
+    cluster_rows: list[tuple[str, str]] = []
 
     for _, rid, rtext, _ in all_docs:
         best_id, best_score = None, -1.0
@@ -214,8 +213,8 @@ class HighPrecisionDeduper:
         len_bin: int = 40,
         progress: bool = True,
         parquet_compression: str = "zstd",
-        n_jobs_ingest: Optional[int] = None,  # None -> cpu_count()-1
-        n_jobs_verify: Optional[int] = None,  # None -> cpu_count()-1
+        n_jobs_ingest: int | None = None,  # None -> cpu_count()-1
+        n_jobs_verify: int | None = None,  # None -> cpu_count()-1
         ingest_parallel: bool = True,
         block_ngram: int = 3,  # n-gramy do SimHash
     ):
@@ -234,10 +233,10 @@ class HighPrecisionDeduper:
         self,
         parquet_path: str,
         *,
-        id_column: Optional[str] = None,
+        id_column: str | None = None,
         text_column: str = "text",
         batch_size: int = 20_000,
-        output_prefix: Optional[str] = None,
+        output_prefix: str | None = None,
     ) -> HPResult:
         base = output_prefix or os.path.splitext(os.path.basename(parquet_path))[0]
         db_path = f"{base}_hp.sqlite"
@@ -251,7 +250,7 @@ class HighPrecisionDeduper:
         dropped_writer = None
         clusters_writer = None
 
-        def write_dropped(rows: List[Tuple[str, str, str, float]]):
+        def write_dropped(rows: list[tuple[str, str, str, float]]):
             nonlocal dropped_writer
             if not rows:
                 return
@@ -269,7 +268,7 @@ class HighPrecisionDeduper:
                 )
             dropped_writer.write_table(tbl)
 
-        def write_clusters(rows: List[Tuple[str, str]]):
+        def write_clusters(rows: list[tuple[str, str]]):
             nonlocal clusters_writer
             if not rows:
                 return
@@ -420,7 +419,7 @@ class HighPrecisionDeduper:
 # -----------------------------
 # CLI
 # -----------------------------
-def parse_args(argv: List[str]) -> argparse.Namespace:
+def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="High-precision dedup + filtrowanie powiązanych plików Parquet.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -466,7 +465,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: List[str]) -> int:
+def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
     # 1) Dedup korpusu

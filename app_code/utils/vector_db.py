@@ -7,9 +7,9 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from collections.abc import Iterable
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable
 
 from decouple import config
 from langchain_core.documents import Document

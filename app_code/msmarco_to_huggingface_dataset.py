@@ -1,7 +1,6 @@
 import argparse
 import os
 import random
-from typing import Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,7 +21,7 @@ def main(
     queries_path: str,
     corpus_path: str,
     relevant_path: str,
-    corpus_max_docs: Optional[int],
+    corpus_max_docs: int | None,
     seed: int,
 ) -> None:
     random.seed(seed)

@@ -6,7 +6,6 @@ import argparse
 import json
 import sqlite3
 from collections import Counter
-from typing import Dict, List, Tuple
 
 import numpy as np
 import polars as pl
@@ -62,8 +61,8 @@ def bulk_upsert_corpus(conn: sqlite3.Connection, rows, batch_size: int = 50_000)
     conn.commit()
 
 
-def fetch_texts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 2000) -> Dict[str, str]:
-    res: Dict[str, str] = {}
+def fetch_texts_batch(conn: sqlite3.Connection, ids: list[str], batch: int = 2000) -> dict[str, str]:
+    res: dict[str, str] = {}
     if not ids:
         return res
     cur = conn.cursor()
@@ -77,8 +76,8 @@ def fetch_texts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 200
     return res
 
 
-def fetch_counts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 5000) -> Dict[str, int]:
-    res: Dict[str, int] = {}
+def fetch_counts_batch(conn: sqlite3.Connection, ids: list[str], batch: int = 5000) -> dict[str, int]:
+    res: dict[str, int] = {}
     if not ids:
         return res
     cur = conn.cursor()
@@ -92,7 +91,7 @@ def fetch_counts_batch(conn: sqlite3.Connection, ids: List[str], batch: int = 50
     return res
 
 
-def inc_counts_batch(conn: sqlite3.Connection, ids: List[str]):
+def inc_counts_batch(conn: sqlite3.Connection, ids: list[str]):
     if not ids:
         return
     cnt = Counter(ids)
@@ -106,7 +105,7 @@ def inc_counts_batch(conn: sqlite3.Connection, ids: List[str]):
 # --------------------------- ECDF helpers ---------------------------
 
 
-def build_ecdf(sorted_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def build_ecdf(sorted_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     n = len(sorted_values)
     if n == 0:
         raise ValueError("Empty array for ECDF.")
@@ -262,7 +261,7 @@ def process_negatives_streaming(
         }
     )
 
-    pos_map: Dict[str, Tuple[List[str], List[float]]] = {
+    pos_map: dict[str, tuple[list[str], list[float]]] = {
         qid: (row["pos_ids"], row["pos_scores"]) for qid, row in zip(thr_df["query_id"], thr_df.iter_rows(named=True))
     }
 
@@ -314,15 +313,15 @@ def process_negatives_streaming(
         texts_map = fetch_texts_batch(corpus_conn, need_ids)
         corpus_conn.close()
 
-        bumped_all: List[str] = []
+        bumped_all: list[str] = []
 
         for qid, pairs in zip(candidates["query_id"].to_list(), candidates["pairs"].to_list()):
             doc_ids_all = [p["document_id"] for p in pairs]
             ranks_all = [p["ranking"] for p in pairs]
 
-            chosen_ids: List[str] = []
-            chosen_scores: List[float] = []
-            bumped_local: List[str] = []
+            chosen_ids: list[str] = []
+            chosen_scores: list[float] = []
+            bumped_local: list[str] = []
 
             for did, rnk in zip(doc_ids_all, ranks_all):
                 if counts_map.get(did, 0) >= max_neg_reuse:

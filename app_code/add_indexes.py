@@ -1,10 +1,9 @@
 import argparse
 import json
 import os
-from typing import Optional
 
 
-def add_indexes(input_file: str, output_file: Optional[str] = None) -> None:
+def add_indexes(input_file: str, output_file: str | None = None) -> None:
     base_name = os.path.splitext(os.path.basename(input_file))[0]
 
     ext = os.path.splitext(input_file)[1]
@@ -16,7 +15,7 @@ def add_indexes(input_file: str, output_file: Optional[str] = None) -> None:
     assistant_counter = 1
     error_lines = []
 
-    with open(input_file, "r", encoding="utf-8") as fin, open(output_file, "w", encoding="utf-8") as fout:
+    with open(input_file, encoding="utf-8") as fin, open(output_file, "w", encoding="utf-8") as fout:
         for line_number, line in enumerate(fin, start=1):
             line = line.strip()
             if not line:

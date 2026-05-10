@@ -4,8 +4,8 @@ import os
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from queue import Empty, Queue
-from typing import Callable, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -158,7 +158,7 @@ class GPUModelSet:
     def _search_with_offset(self, backend, query_text: str, limit: int, offset: int):
         return backend.search(query_text=query_text, k=limit, offset=offset)
 
-    def _search_many_offsets(self, backend, query_text: str, limit: int, offsets: List[int]):
+    def _search_many_offsets(self, backend, query_text: str, limit: int, offsets: list[int]):
         if hasattr(backend, "search_many_offsets"):
             return backend.search_many_offsets(query_text=query_text, k=limit, offsets=offsets)
         return {offset: self._search_with_offset(backend, query_text, limit, offset) for offset in offsets}
@@ -166,7 +166,7 @@ class GPUModelSet:
     def _random_sample(self, backend, limit: int):
         return backend.random_sample(k=limit)
 
-    def _positive_score(self, query_data: Dict) -> float:
+    def _positive_score(self, query_data: dict) -> float:
         if "positive_score" in query_data:
             return float(query_data["positive_score"])
         positive_score_column = getattr(self, "positive_score_column", "positive_ranking")
@@ -174,7 +174,7 @@ class GPUModelSet:
             return float(query_data[positive_score_column])
         return float(query_data["positive_ranking"])
 
-    def _build_result(self, state: Dict, document, score: float, percentile: float, selected: bool) -> dict:
+    def _build_result(self, state: dict, document, score: float, percentile: float, selected: bool) -> dict:
         metadata = getattr(document, "metadata", {}) or {}
         return {
             "query_id": state["qid"],
@@ -190,12 +190,12 @@ class GPUModelSet:
 
     def process_query_batch(
         self,
-        query_batch: List[Dict],
+        query_batch: list[dict],
         backend,
         rerank_function: Callable,
         reranker_batch_size: int,
         timing_stats: TimingStats | None = None,
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """
         Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
         until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
@@ -328,7 +328,7 @@ class GPUModelSet:
                 selected = self._is_negative_percentile(state["u_pos"], float(u_d))
                 state["collected_docs"].append(self._build_result(state, d, float(s), float(u_d), selected))
 
-        results: List[Dict] = []
+        results: list[dict] = []
         for state in states:
             results.extend(state["collected_docs"])
 
@@ -341,7 +341,7 @@ class MultiGPUNegativeFinder:
 
     def __init__(
         self,
-        model_sets: List[GPUModelSet],
+        model_sets: list[GPUModelSet],
         output_path: str = None,
         progress_bar=None,
         logger=None,
@@ -389,7 +389,7 @@ class MultiGPUNegativeFinder:
         for worker_file in self.worker_files:
             if os.path.exists(worker_file):
                 try:
-                    with open(worker_file, "r") as f:
+                    with open(worker_file) as f:
                         for line in f:
                             if line.strip():
                                 result = json.loads(line.strip())
@@ -435,7 +435,7 @@ class MultiGPUNegativeFinder:
             self.ranking_column: float(ranking),
         }
 
-    def write_results_to_jsonl(self, handle, results: List[dict | tuple]) -> None:
+    def write_results_to_jsonl(self, handle, results: list[dict | tuple]) -> None:
         """Write a batch of results to an already-open JSONL handle."""
         if not results:
             return
@@ -452,7 +452,7 @@ class MultiGPUNegativeFinder:
             self.logger.error(f"Error saving results to JSONL: {e}")
             raise
 
-    def create_batches(self, queries: List[Dict], query_batch_size: int = 1) -> None:
+    def create_batches(self, queries: list[dict], query_batch_size: int = 1) -> None:
         """Add individual queries to queue for processing, filtering out already processed ones if resuming"""
         # Filter out already processed queries if resuming
         if self.resume:
@@ -559,7 +559,7 @@ class MultiGPUNegativeFinder:
 
     def process_all(
         self,
-        queries: List[Dict],
+        queries: list[dict],
         vector_store,
         rerank_function: Callable,
         top_k: int,
@@ -702,7 +702,7 @@ class MultiGPUNegativeFinder:
                     worker_results = 0
                     buffer = []
                     try:
-                        with open(worker_file, "r") as f:
+                        with open(worker_file) as f:
                             for line in f:
                                 if line.strip():
                                     result = json.loads(line.strip())
@@ -757,7 +757,7 @@ class MultiGPUNegativeFinder:
         self.timing_stats.log(self.logger)
 
 
-def should_resume_processing(output_path: str, model_sets: List[GPUModelSet]) -> bool:
+def should_resume_processing(output_path: str, model_sets: list[GPUModelSet]) -> bool:
     """Check if there are existing worker files that suggest we should resume processing"""
 
     if not output_path:
@@ -780,7 +780,7 @@ def setup_multi_gpu_models(
     models_per_gpu: int = 1,
     logger=None,
     positive_score_column: str = "positive_ranking",
-) -> List[GPUModelSet]:
+) -> list[GPUModelSet]:
     """Setup model sets across all available GPUs, with multiple model instances per GPU if desired"""
     from models import get_reranker_model
 
