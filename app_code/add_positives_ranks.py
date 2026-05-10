@@ -38,10 +38,10 @@ def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
                 ("FINAL_POSITIVE_RANKS_OUTPUT_PATH", "RELEVANT_WITH_SCORE_PATH")
             ),
             "reranker_model_name": _config_first(
-                ("FINAL_POSITIVE_RANKS_RERANKER_NAME", "FINAL_RERANKER_NAME", "RERANKER_NAME")
+                ("FINAL_RERANKER_NAME", "FINAL_POSITIVE_RANKS_RERANKER_NAME", "RERANKER_NAME")
             ),
             "reranker_batch_size": _config_first(
-                ("FINAL_POSITIVE_RANKS_RERANKER_BATCH_SIZE", "FINAL_RERANKER_BATCH_SIZE", "RERANKER_BATCH_SIZE"),
+                ("FINAL_RERANKER_BATCH_SIZE", "FINAL_POSITIVE_RANKS_RERANKER_BATCH_SIZE", "RERANKER_BATCH_SIZE"),
                 cast=int,
             ),
             "score_column": _config_first(
@@ -61,16 +61,16 @@ def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
         ),
         "reranker_model_name": _config_first(
             (
-                "CANDIDATE_POSITIVE_RANKS_RERANKER_NAME",
                 "CANDIDATE_RERANKER_NAME",
+                "CANDIDATE_POSITIVE_RANKS_RERANKER_NAME",
                 "POSITIVE_RANKS_RERANKER_NAME",
                 "RERANKER_NAME",
             ),
         ),
         "reranker_batch_size": _config_first(
             (
-                "CANDIDATE_POSITIVE_RANKS_RERANKER_BATCH_SIZE",
                 "CANDIDATE_RERANKER_BATCH_SIZE",
+                "CANDIDATE_POSITIVE_RANKS_RERANKER_BATCH_SIZE",
                 "POSITIVE_RANKS_RERANKER_BATCH_SIZE",
                 "RERANKER_BATCH_SIZE",
             ),
@@ -420,7 +420,7 @@ if __name__ == "__main__":
         "--second-step",
         dest="final_step",
         action="store_true",
-        help="Use final positive-reranking settings from FINAL_POSITIVE_RANKS_* / FINAL_* env vars.",
+        help="Use final positive-reranking settings from FINAL_RERANKER_* and FINAL_POSITIVE_RANKS_* env vars.",
     )
     parser.add_argument(
         "--output_path",
