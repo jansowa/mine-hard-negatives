@@ -10,7 +10,7 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
    ```bash
    uv venv --python 3.12.3 .venv
    source .venv/bin/activate
-   uv pip install -r requirements-lancedb.txt
+   uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
    ```
 2. Prepare `.env` (based on `.env.example.base` or `.env.example.large`).
 3. Set vector DB backend:
@@ -148,7 +148,7 @@ If you want to quickly verify that the full pipeline wiring works, you can run i
 # 0) Environment
 uv venv --python 3.12.3 .venv
 source .venv/bin/activate
-uv pip install -r requirements-lancedb.txt
+uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
 
 # 1) Use LanceDB (no Docker required)
 export VECTOR_DB_BACKEND=lancedb
