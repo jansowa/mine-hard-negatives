@@ -1,9 +1,8 @@
+import json
 import sys
 from pathlib import Path
-import json
 
 import pandas as pd
-
 from langchain_core.documents import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))

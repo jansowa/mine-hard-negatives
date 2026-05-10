@@ -1,15 +1,20 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
-import os, re, sqlite3, hashlib, multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
-import argparse
-import sys
 
-import pyarrow.parquet as pq
-import pyarrow as pa
+import argparse
+import hashlib
+import multiprocessing as mp
+import os
+import re
+import sqlite3
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 try:
     from tqdm import tqdm

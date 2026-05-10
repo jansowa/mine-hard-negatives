@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 from typing import Tuple
 
+import numpy as np
+import torch
 from decouple import config
 from langchain_huggingface import HuggingFaceEmbeddings
 from transformers import AutoModelForMaskedLM, AutoModelForSequenceClassification, AutoTokenizer
-import numpy as np
-import torch
 
 try:
     from tensorrt import TensorRTDenseEmbeddings, TensorRTReranker, is_tensorrt_model_path

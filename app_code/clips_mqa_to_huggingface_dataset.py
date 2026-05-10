@@ -1,5 +1,6 @@
-import os
 import argparse
+import os
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset

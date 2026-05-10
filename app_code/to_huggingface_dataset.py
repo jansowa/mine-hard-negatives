@@ -1,8 +1,10 @@
+import argparse
 import json
+
 import pyarrow as pa
 import pyarrow.parquet as pq
-import argparse
 from decouple import config
+
 
 def main(
     input_file_path: str,

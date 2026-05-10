@@ -1,17 +1,17 @@
 import os
+
 os.environ.setdefault("POLARS_MAX_THREADS", "12")
 
+import argparse
 import json
 import sqlite3
-import argparse
 from collections import Counter
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import polars as pl
-from tqdm.auto import tqdm
 from decouple import config
-
+from tqdm.auto import tqdm
 
 # --------------------------- SQLite utils ---------------------------
 

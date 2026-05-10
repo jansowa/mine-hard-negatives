@@ -12,10 +12,9 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-  "E9",
-  "F63",
-  "F7",
-  "F82",
+  "E9", # pycodestyle syntax/runtime errors
+  "F",  # Pyflakes: undefined names, unused imports, and similar correctness issues
+  "I",  # isort: import ordering
 ]
 ignore = []
 

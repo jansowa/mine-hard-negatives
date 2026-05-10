@@ -1,14 +1,15 @@
+import json
+import logging
+import os
 import threading
-from queue import Queue, Empty
 import time
 from collections import defaultdict
-from typing import List, Callable, Dict
-import logging
-import torch
-import json
-import os
-import pandas as pd
+from queue import Empty, Queue
+from typing import Callable, Dict, List
+
 import numpy as np
+import pandas as pd
+import torch
 from decouple import config
 
 
@@ -521,7 +522,7 @@ class MultiGPUNegativeFinder:
                 except Empty:
                     self.logger.info(f"[GPU {model_set.gpu_id}] Worker found no more queries to process... quitting")
                     break
-                except Exception as e:
+                except Exception:
                     self.logger.error(f"[GPU {model_set.gpu_id}] Worker error:", exc_info=True)
                     break
         

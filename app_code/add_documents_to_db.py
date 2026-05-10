@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from config import get_vector_db_backend
 from models import get_dense_model, get_sparse_model
-from utils.vector_db import create_vector_backend, VectorBackend
+from utils.vector_db import VectorBackend, create_vector_backend
 
 
 def filter_dataset_by_missing_ids_ds(

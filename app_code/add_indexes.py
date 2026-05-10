@@ -1,6 +1,6 @@
+import argparse
 import json
 import os
-import argparse
 from typing import Optional
 
 

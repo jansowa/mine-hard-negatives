@@ -1,17 +1,18 @@
-import os
 import argparse
+import glob
+import os
+import re
+import shutil
+import uuid
+from typing import Iterable, Optional
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm import tqdm
-from models import get_reranker_model, rerank
 from decouple import UndefinedValueError, config
-import uuid
-import glob
-import shutil
-from typing import Iterable, Optional
-import re
+from tqdm import tqdm
 
+from models import get_reranker_model, rerank
 
 _MISSING = object()
 
