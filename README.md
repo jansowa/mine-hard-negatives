@@ -10,7 +10,7 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
    ```bash
    uv venv --python 3.12.3 .venv
    source .venv/bin/activate
-   uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+   uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements-lancedb.txt
    ```
 2. Prepare `.env` (based on `.env.example.base` or `.env.example.large`).
 3. Set vector DB backend:
@@ -26,7 +26,7 @@ This project builds a training dataset `(query, positive, hard negatives)` for e
      ```
      Install dependencies with:
      ```bash
-     uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements.txt
+     uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements.txt
      ```
 
 If installation fails while building old `ir-datasets` dependencies such as `cbor`,
@@ -36,7 +36,7 @@ make sure the system has a C build toolchain, then clear the failed build cache:
 sudo apt-get update
 sudo apt-get install -y build-essential python3.12-dev
 uv cache clean cbor warc3-wet-clueweb09 flagembedding setuptools
-uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements-lancedb.txt
 ```
 
 ### 2) Docker Compose (optional local convenience setup)
@@ -54,14 +54,14 @@ The `.in` files are the source of truth. Compile pinned requirements with `uv`:
 ```bash
 uv pip compile requirements-lancedb.in -o requirements-lancedb.txt \
   --python-version 3.12.3 \
-  --torch-backend cu124 \
+  --torch-backend cu128 \
   --build-constraint build-constraints.txt \
   --emit-index-url \
   --emit-find-links
 
 uv pip compile requirements.in -o requirements.txt \
   --python-version 3.12.3 \
-  --torch-backend cu124 \
+  --torch-backend cu128 \
   --build-constraint build-constraints.txt \
   --emit-index-url \
   --emit-find-links
@@ -178,7 +178,7 @@ If you want to quickly verify that the full pipeline wiring works, you can run i
 # 0) Environment
 uv venv --python 3.12.3 .venv
 source .venv/bin/activate
-uv pip install --torch-backend cu124 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements-lancedb.txt
 
 # 1) Use LanceDB (no Docker required)
 export VECTOR_DB_BACKEND=lancedb
