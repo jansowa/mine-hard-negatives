@@ -134,7 +134,10 @@ First score positives with the same small reranker so the candidate percentile t
 python app_code/add_positives_ranks.py
 ```
 
-Then mine candidate negatives and save the small-reranker scores as `candidate_ranking`:
+Then mine candidate negatives and save the small-reranker scores as `candidate_ranking`.
+The candidate-stage thresholds come from `CANDIDATE_BETA` and `CANDIDATE_U_FLOOR`, falling back to `BETA`
+and `U_FLOOR`. The old `TOP_K` option is kept for command compatibility, but iterative mining is now controlled
+by `CANDIDATE_TARGET`, `CANDIDATE_SEARCH_CHUNK`, `CANDIDATE_MAX_OFFSET_ITERS`, and `CANDIDATE_RANDOM_FALLBACK`.
 
 ```bash
 python app_code/find_negatives.py
@@ -147,18 +150,24 @@ Upload or otherwise move these files together:
 - `data/negative_candidates.parquet`
 - the relevant file needed by your next stage, for example `data/relevant_with_candidate_score.parquet`
 
-### 2) Larger machine: final-rerank selected candidates
+### 2) Larger machine: score positives with the final reranker
 
-The final pass reads `candidate_selected == true` by default, adds `final_ranking`, and also writes `ranking = final_ranking` for compatibility with the existing JSONL builder:
-
-```bash
-python app_code/rerank_negative_candidates.py
-```
-
-If you also want positive scores from the final reranker for training/export thresholds, score positives again with the final model:
+Adaptive final reranking uses the final reranker's positive-score distribution for thresholds, so score positives
+with the final model before reranking negative candidates:
 
 ```bash
 python app_code/add_positives_ranks.py --final-step
+```
+
+### 3) Larger machine: adaptive final reranking
+
+The final pass uses `FINAL_RERANK_MODE=adaptive` by default. It starts with the best small-reranker candidates,
+scores only the initial budget with the large reranker, and expands the per-query budget only when the final
+threshold still yields fewer than `NUM_NEGATIVES` strict negatives. It writes `final_ranking`, a compatibility
+`ranking` alias, final-selection metadata, and a JSON report.
+
+```bash
+python app_code/rerank_negative_candidates.py
 ```
 
 Finally build JSONL using the final negative score column:
@@ -166,6 +175,10 @@ Finally build JSONL using the final negative score column:
 ```bash
 python app_code/create_flag_embedding_jsonl.py
 ```
+
+The JSONL builder first chooses strict final negatives. With `BACKFILL_POLICY=relaxed`, it fills any missing
+slots from the safest final-scored relaxed candidates instead of silently producing very short negative lists.
+It also writes an export report with the final negatives-per-query histogram.
 
 ## Backend notes
 
@@ -247,7 +260,7 @@ python app_code/find_negatives.py \
   --queries_path ./.smoke/queries.parquet \
   --relevant_path ./.smoke/relevant_with_score.parquet \
   --output_path ./.smoke/negatives.parquet \
-  --top_k 20
+  --candidate_target 20
 
 # 6) Build FlagEmbedding JSONL
 python app_code/create_flag_embedding_jsonl.py \

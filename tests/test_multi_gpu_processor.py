@@ -50,6 +50,10 @@ def _build_model_set_for_test():
     model_set.total_queries = 0
     model_set.beta = 0.4
     model_set.u_floor = 0.1
+    model_set.candidate_target = 20
+    model_set.candidate_search_chunk = 128
+    model_set.candidate_max_offset_iters = 10
+    model_set.candidate_random_fallback = 128
     model_set._ecdf_x = [0.0, 0.5, 1.0]
     model_set._ecdf_y = [0.0, 0.5, 1.0]
     return model_set
@@ -113,6 +117,15 @@ def test_process_query_batch_marks_candidates_without_dropping_unselected():
     assert selected_by_doc == {"d1": True, "d2": False}
     assert all("candidate_percentile" in row for row in results)
     assert all(row["retrieval_source"] == "test" for row in results)
+
+
+def test_negative_percentile_rule_matches_export_threshold_formula():
+    model_set = _build_model_set_for_test()
+    model_set.beta = 0.5
+    model_set.u_floor = 0.1
+
+    assert model_set._is_negative_percentile(u_pos=0.8, u_doc=0.35)
+    assert not model_set._is_negative_percentile(u_pos=0.8, u_doc=0.45)
 
 
 def test_consolidate_worker_files_streams_to_parquet(tmp_path):

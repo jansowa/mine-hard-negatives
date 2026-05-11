@@ -32,6 +32,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_negative_mining_stage_defaults() -> dict:
+    return {
+        "candidate_beta": config("CANDIDATE_BETA", cast=float, default=config("BETA", cast=float, default=0.01)),
+        "candidate_u_floor": config(
+            "CANDIDATE_U_FLOOR",
+            cast=float,
+            default=config("U_FLOOR", cast=float, default=0.005),
+        ),
+        "candidate_target": config("CANDIDATE_TARGET", cast=int, default=40),
+        "candidate_search_chunk": config("CANDIDATE_SEARCH_CHUNK", cast=int, default=128),
+        "candidate_max_offset_iters": config("CANDIDATE_MAX_OFFSET_ITERS", cast=int, default=10),
+        "candidate_random_fallback": config("CANDIDATE_RANDOM_FALLBACK", cast=int, default=128),
+    }
+
+
 def parse_batch_size_candidates(raw_candidates: str | None, minimum: int, maximum: int) -> list[int]:
     if raw_candidates:
         candidates = [int(item.strip()) for item in raw_candidates.split(",") if item.strip()]
@@ -450,7 +465,7 @@ def find_negatives_multigpu(
     queries_path: str,
     relevant_path: str,
     output_path: str,
-    top_k: int,
+    top_k: int | None,
     force_resume: bool | None = None,
     query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
     profile_timing: bool = config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False),
@@ -482,6 +497,16 @@ def find_negatives_multigpu(
     ),
     ranking_column: str = config("NEGATIVE_RANKING_COLUMN", default="ranking"),
     positive_score_column: str = config("NEGATIVE_POSITIVE_SCORE_COLUMN", default="positive_ranking"),
+    candidate_beta: float = config("CANDIDATE_BETA", cast=float, default=config("BETA", cast=float, default=0.01)),
+    candidate_u_floor: float = config(
+        "CANDIDATE_U_FLOOR",
+        cast=float,
+        default=config("U_FLOOR", cast=float, default=0.005),
+    ),
+    candidate_target: int = config("CANDIDATE_TARGET", cast=int, default=40),
+    candidate_search_chunk: int = config("CANDIDATE_SEARCH_CHUNK", cast=int, default=128),
+    candidate_max_offset_iters: int = config("CANDIDATE_MAX_OFFSET_ITERS", cast=int, default=10),
+    candidate_random_fallback: int = config("CANDIDATE_RANDOM_FALLBACK", cast=int, default=128),
 ):
     validate_batch_size_options(
         embedding_batch_size,
@@ -509,6 +534,8 @@ def find_negatives_multigpu(
         raise ValueError("--positive_score_column must not be empty")
 
     logger.info(f"{num_gpus} GPUs available for processing")
+    if top_k is not None:
+        logger.warning("--top_k/TOP_K is deprecated and ignored by iterative negative mining")
     logger.info("Loading queries and relevance data")
     queries_df = pd.read_parquet(queries_path)
     relevant_df = pd.read_parquet(relevant_path)
@@ -572,6 +599,12 @@ def find_negatives_multigpu(
         models_per_gpu=1,
         logger=logger,
         positive_score_column=positive_score_column,
+        beta=candidate_beta,
+        u_floor=candidate_u_floor,
+        candidate_target=candidate_target,
+        candidate_search_chunk=candidate_search_chunk,
+        candidate_max_offset_iters=candidate_max_offset_iters,
+        candidate_random_fallback=candidate_random_fallback,
     )
 
     rerank_function = partial(rerank, model_name=reranker_model_name)
@@ -644,7 +677,6 @@ def find_negatives_multigpu(
             queries_list,
             vector_backend,
             safe_rerank_function,
-            top_k,
             reranker_batch_size,
             query_batch_size,
         )
@@ -660,6 +692,7 @@ def find_negatives_multigpu(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find negative samples using multi-GPU processing")
+    stage_defaults = get_negative_mining_stage_defaults()
     parser.add_argument("--dense_model_name", type=str, default=config("DENSE_EMBEDDER_NAME"))
     parser.add_argument("--sparse_model_name", type=str, default=config("SPLADE_MODEL_NAME"))
     parser.add_argument(
@@ -739,7 +772,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_path", type=str, default=config("NEGATIVE_CANDIDATES_PATH", default=config("NEGATIVES_PATH"))
     )
-    parser.add_argument("--top_k", type=int, default=config("TOP_K", cast=int))
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=config("TOP_K", cast=int, default=None),
+        help="Deprecated compatibility option; iterative mining ignores this value.",
+    )
     parser.add_argument(
         "--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4)
     )
@@ -755,6 +793,12 @@ if __name__ == "__main__":
         default=config("NEGATIVE_POSITIVE_SCORE_COLUMN", default="positive_ranking"),
         help="Positive score column used to build the percentile threshold distribution.",
     )
+    parser.add_argument("--candidate_beta", type=float, default=stage_defaults["candidate_beta"])
+    parser.add_argument("--candidate_u_floor", type=float, default=stage_defaults["candidate_u_floor"])
+    parser.add_argument("--candidate_target", type=int, default=stage_defaults["candidate_target"])
+    parser.add_argument("--candidate_search_chunk", type=int, default=stage_defaults["candidate_search_chunk"])
+    parser.add_argument("--candidate_max_offset_iters", type=int, default=stage_defaults["candidate_max_offset_iters"])
+    parser.add_argument("--candidate_random_fallback", type=int, default=stage_defaults["candidate_random_fallback"])
     parser.add_argument("--profile-timing", dest="profile_timing", action="store_true", default=None)
     parser.add_argument("--no-profile-timing", dest="profile_timing", action="store_false", default=None)
     parser.add_argument("--resume", action="store_true", default=None)
@@ -790,4 +834,10 @@ if __name__ == "__main__":
         args.auto_reranker_batch_size_memory_utilization,
         ranking_column=args.ranking_column,
         positive_score_column=args.positive_score_column,
+        candidate_beta=args.candidate_beta,
+        candidate_u_floor=args.candidate_u_floor,
+        candidate_target=args.candidate_target,
+        candidate_search_chunk=args.candidate_search_chunk,
+        candidate_max_offset_iters=args.candidate_max_offset_iters,
+        candidate_random_fallback=args.candidate_random_fallback,
     )

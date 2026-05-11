@@ -1,8 +1,11 @@
 import argparse
 import json
 import os
+from collections import Counter, defaultdict
 from collections.abc import Iterable
+from typing import Any, TypedDict
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -10,6 +13,23 @@ from decouple import config
 from tqdm import tqdm
 
 from models import get_reranker_model, rerank
+
+ADAPTIVE_RERANK_FIELDS = (
+    ("final_percentile", pa.float32()),
+    ("final_threshold_rank", pa.float32()),
+    ("final_selected", pa.bool_()),
+    ("final_selection_tier", pa.string()),
+    ("final_rerank_budget", pa.int32()),
+)
+
+
+class AdaptiveQueryReportRow(TypedDict):
+    query_id: str
+    strict_final_negatives: int
+    target_negatives: int
+    candidate_rows: int
+    scored_rows: int
+    budget_limit: int
 
 
 def _pack_pair(query_id: str, document_id: str) -> str:
@@ -74,10 +94,113 @@ def _load_scored_pairs(paths: Iterable[str]) -> set[str]:
     return scored
 
 
-def _output_schema(candidates_path: str, ranking_column: str) -> pa.Schema:
+def _stage_float_config(name: str, fallback_name: str, default: float) -> float:
+    return config(name, cast=float, default=config(fallback_name, cast=float, default=default))
+
+
+def _positive_int(value: int, name: str) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
+def _build_ecdf(sorted_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if len(sorted_values) == 0:
+        raise ValueError("Cannot build ECDF from an empty score array")
+    ecdf_y = np.linspace(0.0, 1.0, len(sorted_values)) if len(sorted_values) > 1 else np.array([1.0])
+    return sorted_values, ecdf_y
+
+
+def _percentile_from_ecdf(values: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: np.ndarray):
+    return np.interp(values, ecdf_x, ecdf_y, left=0.0, right=1.0)
+
+
+def _inv_percentile_from_ecdf(percentiles: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: np.ndarray):
+    percentiles = np.clip(percentiles, 0.0, 1.0)
+    idx = np.searchsorted(ecdf_y, percentiles, side="right") - 1
+    idx = np.clip(idx, 0, len(ecdf_x) - 1)
+    return ecdf_x[idx]
+
+
+def _load_final_thresholds(
+    relevant_path: str,
+    positive_score_column: str,
+    beta: float,
+    u_floor: float,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    relevant_df = pd.read_parquet(relevant_path, columns=["query_id", "document_id", positive_score_column])
+    relevant_df["query_id"] = relevant_df["query_id"].astype("string")
+    relevant_df[positive_score_column] = pd.to_numeric(relevant_df[positive_score_column], errors="coerce")
+
+    positive_scores = np.sort(relevant_df[positive_score_column].dropna().to_numpy(copy=True))
+    ecdf_x, ecdf_y = _build_ecdf(positive_scores)
+
+    min_scores = relevant_df.groupby("query_id", dropna=False)[positive_score_column].min().dropna()
+    u_pos = _percentile_from_ecdf(min_scores.to_numpy(copy=True), ecdf_x, ecdf_y)
+    threshold_ranks = np.maximum(
+        _inv_percentile_from_ecdf(beta * u_pos, ecdf_x, ecdf_y),
+        _inv_percentile_from_ecdf(u_floor, ecdf_x, ecdf_y),
+    )
+    thresholds = {str(query_id): float(threshold) for query_id, threshold in zip(min_scores.index, threshold_ranks)}
+    return thresholds, ecdf_x, ecdf_y
+
+
+def _load_scored_rows_from_jsonl(path: str, ranking_column: str) -> dict[str, dict]:
+    if not os.path.isfile(path):
+        return {}
+
+    rows: dict[str, dict] = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if ranking_column not in row and "ranking" not in row:
+                continue
+            rows[_pack_pair(row["query_id"], row["document_id"])] = row
+    return rows
+
+
+def _load_scored_rows_from_parquet(path: str, ranking_column: str) -> dict[str, dict]:
+    if not os.path.isfile(path):
+        return {}
+
+    try:
+        pf = pq.ParquetFile(path)
+    except Exception:
+        return {}
+
+    rows: dict[str, dict] = {}
+    columns = None
+    schema_names = set(pf.schema_arrow.names)
+    if "query_id" in schema_names and "document_id" in schema_names:
+        columns = list(schema_names)
+    for batch in pf.iter_batches(columns=columns, batch_size=200_000):
+        table = pa.Table.from_batches([batch])
+        for row in table.to_pylist():
+            if ranking_column not in row and "ranking" not in row:
+                continue
+            rows[_pack_pair(row["query_id"], row["document_id"])] = row
+    return rows
+
+
+def _load_scored_rows(paths: Iterable[str], ranking_column: str) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    for path in paths:
+        if path.endswith(".jsonl"):
+            rows.update(_load_scored_rows_from_jsonl(path, ranking_column))
+        else:
+            rows.update(_load_scored_rows_from_parquet(path, ranking_column))
+    return rows
+
+
+def _output_schema(candidates_path: str, ranking_column: str, include_adaptive_fields: bool = False) -> pa.Schema:
     candidate_schema = pq.ParquetFile(candidates_path).schema_arrow
     fields = []
     final_columns = {ranking_column, "ranking"}
+    if include_adaptive_fields:
+        final_columns.update(name for name, _ in ADAPTIVE_RERANK_FIELDS)
     for field in candidate_schema:
         if field.name not in final_columns:
             fields.append(field)
@@ -85,14 +208,29 @@ def _output_schema(candidates_path: str, ranking_column: str) -> pa.Schema:
     if ranking_column != "ranking":
         fields.append(pa.field(ranking_column, pa.float32()))
     fields.append(pa.field("ranking", pa.float32()))
+    if include_adaptive_fields:
+        existing_names = {field.name for field in fields}
+        fields.extend(
+            pa.field(name, field_type) for name, field_type in ADAPTIVE_RERANK_FIELDS if name not in existing_names
+        )
     return pa.schema(fields)
 
 
-def _row_for_output(candidate_row: dict, score: float, ranking_column: str, schema: pa.Schema) -> dict:
+def _row_for_output(
+    candidate_row: dict,
+    score: float,
+    ranking_column: str,
+    schema: pa.Schema,
+    extra_values: dict | None = None,
+) -> dict:
     out = {name: _json_safe(candidate_row.get(name)) for name in schema.names}
     if ranking_column != "ranking":
         out[ranking_column] = float(score)
     out["ranking"] = float(score)
+    if extra_values:
+        for key, value in extra_values.items():
+            if key in out:
+                out[key] = _json_safe(value)
     return out
 
 
@@ -154,6 +292,247 @@ def consolidate_worker_jsonl(worker_file: str, output_path: str, schema: pa.Sche
         raise
 
 
+def _strict_final_count(rows: Iterable[dict], ranking_column: str, threshold: float) -> int:
+    doc_ids = set()
+    for row in rows:
+        score = row.get(ranking_column, row.get("ranking"))
+        if score is None:
+            continue
+        if float(score) <= threshold:
+            doc_ids.add(str(row["document_id"]))
+    return len(doc_ids)
+
+
+def _candidate_score_column(candidates_df: pd.DataFrame, preferred_column: str | None) -> str:
+    candidates = [preferred_column, "candidate_ranking", "ranking", "retrieval_score"]
+    for column in candidates:
+        if column and column in candidates_df.columns:
+            return column
+    raise ValueError("Could not find a candidate score column in candidates_path")
+
+
+def _prepare_candidates(candidates_df: pd.DataFrame, candidate_score_column: str, candidate_selected_column: str):
+    candidates_df["query_id"] = candidates_df["query_id"].astype("string")
+    candidates_df["document_id"] = candidates_df["document_id"].astype("string")
+    candidates_df["_candidate_score"] = pd.to_numeric(candidates_df[candidate_score_column], errors="coerce")
+    if candidate_selected_column in candidates_df.columns:
+        candidates_df["_candidate_selected"] = candidates_df[candidate_selected_column].fillna(False).astype(bool)
+    else:
+        candidates_df["_candidate_selected"] = True
+    selected = candidates_df[candidates_df["_candidate_selected"]].sort_values(
+        ["query_id", "_candidate_score"], ascending=[True, False], na_position="last"
+    )
+    unselected = candidates_df[~candidates_df["_candidate_selected"]].sort_values(
+        ["query_id", "_candidate_score"], ascending=[True, True], na_position="last"
+    )
+    candidates_df = pd.concat([selected, unselected], ignore_index=True)
+    return candidates_df.drop_duplicates(subset=["query_id", "document_id"], keep="first")
+
+
+def _write_report(report_path: str | None, report: dict) -> None:
+    if not report_path:
+        return
+    os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def rerank_candidates_adaptive(
+    candidates_path: str,
+    queries_path: str,
+    corpus_path: str,
+    relevant_path: str,
+    output_path: str,
+    reranker_model_name: str,
+    reranker_batch_size: int,
+    ranking_column: str,
+    candidate_selected_column: str,
+    candidate_score_column: str | None,
+    positive_score_column: str,
+    num_negatives: int,
+    beta: float,
+    u_floor: float,
+    initial_budget: int,
+    budget_step: int,
+    max_budget: int,
+    resume: bool,
+    row_group_size: int,
+    report_path: str | None,
+) -> None:
+    num_negatives = _positive_int(num_negatives, "num_negatives")
+    initial_budget = _positive_int(initial_budget, "initial_budget")
+    budget_step = _positive_int(budget_step, "budget_step")
+    max_budget = _positive_int(max_budget, "max_budget")
+    if initial_budget > max_budget:
+        raise ValueError("initial_budget must be less than or equal to max_budget")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    worker_file = _worker_file(output_path)
+    if not resume and os.path.exists(worker_file):
+        os.remove(worker_file)
+
+    print(f"Loading final thresholds from {relevant_path}")
+    thresholds, ecdf_x, ecdf_y = _load_final_thresholds(
+        relevant_path=relevant_path,
+        positive_score_column=positive_score_column,
+        beta=beta,
+        u_floor=u_floor,
+    )
+
+    print(f"Loading queries from {queries_path}")
+    queries_df = pd.read_parquet(queries_path, columns=["id", "text"])
+    queries_df["id"] = queries_df["id"].astype("string")
+    queries = dict(zip(queries_df["id"].astype(str), queries_df["text"].astype(str)))
+
+    print(f"Loading corpus from {corpus_path}")
+    corpus_df = pd.read_parquet(corpus_path, columns=["id", "text"])
+    corpus_df["id"] = corpus_df["id"].astype("string")
+    corpus = dict(zip(corpus_df["id"].astype(str), corpus_df["text"].astype(str)))
+
+    print(f"Loading candidate metadata from {candidates_path}")
+    candidates_df = pd.read_parquet(candidates_path)
+    score_column = _candidate_score_column(candidates_df, candidate_score_column)
+    candidates_df = _prepare_candidates(candidates_df, score_column, candidate_selected_column)
+    candidates_df = candidates_df[candidates_df["query_id"].astype(str).isin(thresholds)]
+
+    already_scored_rows = _load_scored_rows([worker_file, output_path], ranking_column) if resume else {}
+    if already_scored_rows:
+        print(f"Resume enabled: found {len(already_scored_rows):,} already reranked pairs")
+
+    scored_by_query: dict[str, list[dict]] = defaultdict(list)
+    for row in already_scored_rows.values():
+        scored_by_query[str(row["query_id"])].append(row)
+
+    tokenizer, reranker_model = get_reranker_model(reranker_model_name)
+    print("Final reranker loaded.")
+
+    output_schema = _output_schema(candidates_path, ranking_column, include_adaptive_fields=True)
+    newly_scored = 0
+    skipped_missing_text = 0
+    query_report: list[AdaptiveQueryReportRow] = []
+    strict_histogram: Counter[int] = Counter()
+
+    grouped = candidates_df.groupby("query_id", sort=False)
+    with open(worker_file, "a", encoding="utf-8") as output_handle:
+        with tqdm(total=len(grouped), unit="query", desc="Adaptive final reranking") as pbar:
+            for query_id, group in grouped:
+                qid = str(query_id)
+                threshold = thresholds.get(qid)
+                if threshold is None:
+                    pbar.update(1)
+                    continue
+
+                existing_rows = scored_by_query.get(qid, [])
+                existing_doc_ids = {str(row["document_id"]) for row in existing_rows}
+                strict_count = _strict_final_count(existing_rows, ranking_column, threshold)
+                budget_limit = max(initial_budget, min(max_budget, len(existing_doc_ids)))
+                candidate_rows = group.to_dict("records")
+
+                while strict_count < num_negatives and budget_limit <= max_budget:
+                    window = candidate_rows[: min(budget_limit, len(candidate_rows))]
+                    rows_to_score = [row for row in window if str(row["document_id"]) not in existing_doc_ids]
+                    if not rows_to_score:
+                        if budget_limit >= max_budget or len(window) >= len(candidate_rows):
+                            break
+                        budget_limit = min(max_budget, budget_limit + budget_step)
+                        continue
+
+                    query_text = queries.get(qid)
+                    rerank_queries: list[str] = []
+                    rerank_docs: list[str] = []
+                    valid_rows: list[dict[str, Any]] = []
+                    for candidate_row in rows_to_score:
+                        document_id = str(candidate_row["document_id"])
+                        document_text = corpus.get(document_id)
+                        if query_text is None or document_text is None:
+                            skipped_missing_text += 1
+                            existing_doc_ids.add(document_id)
+                            continue
+                        rerank_queries.append(query_text)
+                        rerank_docs.append(document_text)
+                        valid_rows.append(candidate_row)
+
+                    if not valid_rows:
+                        if budget_limit >= max_budget or len(window) >= len(candidate_rows):
+                            break
+                        budget_limit = min(max_budget, budget_limit + budget_step)
+                        continue
+
+                    scores = rerank(
+                        tokenizer,
+                        reranker_model,
+                        rerank_queries,
+                        rerank_docs,
+                        batch_size=reranker_batch_size,
+                        model_name=reranker_model_name,
+                    )
+                    percentiles = _percentile_from_ecdf(np.array(scores, dtype=float), ecdf_x, ecdf_y)
+
+                    rows = []
+                    for candidate_row, score, percentile in zip(valid_rows, scores, percentiles):
+                        final_selected = float(score) <= threshold
+                        extra_values = {
+                            "final_percentile": float(percentile),
+                            "final_threshold_rank": float(threshold),
+                            "final_selected": bool(final_selected),
+                            "final_selection_tier": "strict" if final_selected else "candidate",
+                            "final_rerank_budget": int(budget_limit),
+                        }
+                        row = _row_for_output(candidate_row, score, ranking_column, output_schema, extra_values)
+                        rows.append(row)
+                        existing_doc_ids.add(str(row["document_id"]))
+                        scored_by_query[qid].append(row)
+                        if final_selected:
+                            strict_count += 1
+
+                    _write_jsonl(output_handle, rows)
+                    newly_scored += len(rows)
+
+                    if strict_count < num_negatives:
+                        if budget_limit >= max_budget or budget_limit >= len(candidate_rows):
+                            break
+                        budget_limit = min(max_budget, budget_limit + budget_step)
+
+                strict_histogram[min(strict_count, num_negatives)] += 1
+                query_report.append(
+                    {
+                        "query_id": qid,
+                        "strict_final_negatives": int(strict_count),
+                        "target_negatives": int(num_negatives),
+                        "candidate_rows": int(len(candidate_rows)),
+                        "scored_rows": int(len(existing_doc_ids)),
+                        "budget_limit": int(min(budget_limit, max_budget)),
+                    }
+                )
+                pbar.update(1)
+
+    print(f"Newly reranked pairs: {newly_scored:,}")
+    consolidate_worker_jsonl(worker_file, output_path, output_schema, row_group_size=row_group_size)
+
+    complete_queries = sum(1 for row in query_report if row["strict_final_negatives"] >= num_negatives)
+    report = {
+        "mode": "adaptive",
+        "target_negatives": num_negatives,
+        "beta": beta,
+        "u_floor": u_floor,
+        "initial_budget": initial_budget,
+        "budget_step": budget_step,
+        "max_budget": max_budget,
+        "queries_with_candidates": len(query_report),
+        "complete_queries": complete_queries,
+        "partial_queries": len(query_report) - complete_queries,
+        "newly_scored_pairs": newly_scored,
+        "skipped_missing_text": skipped_missing_text,
+        "strict_final_negatives_histogram": {str(key): value for key, value in sorted(strict_histogram.items())},
+        "worst_partial_queries": sorted(
+            (row for row in query_report if row["strict_final_negatives"] < num_negatives),
+            key=lambda row: (row["strict_final_negatives"], -row["candidate_rows"]),
+        )[:50],
+    }
+    _write_report(report_path, report)
+
+
 def rerank_candidates(
     candidates_path: str,
     queries_path: str,
@@ -167,6 +546,17 @@ def rerank_candidates(
     chunk_size: int = 100_000,
     resume: bool = True,
     row_group_size: int = 100_000,
+    rerank_mode: str = "selected",
+    relevant_path: str | None = None,
+    candidate_score_column: str | None = None,
+    positive_score_column: str = "positive_ranking",
+    num_negatives: int = 10,
+    beta: float = 0.01,
+    u_floor: float = 0.005,
+    initial_budget: int = 20,
+    budget_step: int = 10,
+    max_budget: int = 80,
+    report_path: str | None = None,
 ) -> None:
     if not ranking_column:
         raise ValueError("ranking_column must not be empty")
@@ -176,6 +566,38 @@ def rerank_candidates(
         raise ValueError("chunk_size must be greater than 0")
     if row_group_size <= 0:
         raise ValueError("row_group_size must be greater than 0")
+
+    if rerank_mode not in {"selected", "all", "adaptive"}:
+        raise ValueError("rerank_mode must be one of: selected, all, adaptive")
+    if rerank_mode == "adaptive":
+        if relevant_path is None:
+            raise ValueError("relevant_path is required when rerank_mode='adaptive'")
+        rerank_candidates_adaptive(
+            candidates_path=candidates_path,
+            queries_path=queries_path,
+            corpus_path=corpus_path,
+            relevant_path=relevant_path,
+            output_path=output_path,
+            reranker_model_name=reranker_model_name,
+            reranker_batch_size=reranker_batch_size,
+            ranking_column=ranking_column,
+            candidate_selected_column=candidate_selected_column,
+            candidate_score_column=candidate_score_column,
+            positive_score_column=positive_score_column,
+            num_negatives=num_negatives,
+            beta=beta,
+            u_floor=u_floor,
+            initial_budget=initial_budget,
+            budget_step=budget_step,
+            max_budget=max_budget,
+            resume=resume,
+            row_group_size=row_group_size,
+            report_path=report_path,
+        )
+        return
+
+    if rerank_mode == "all":
+        selected_only = False
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     worker_file = _worker_file(output_path)
@@ -271,6 +693,7 @@ def rerank_candidates(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Final-rerank lightweight negative candidates.")
+    num_negatives_default = config("NUM_NEGATIVES", cast=int, default=10)
     parser.add_argument(
         "--candidates_path",
         type=str,
@@ -298,6 +721,51 @@ def main() -> None:
         type=str,
         default=config("CANDIDATE_SELECTED_COLUMN", default="candidate_selected"),
     )
+    parser.add_argument(
+        "--candidate_score_column",
+        type=str,
+        default=config("NEGATIVE_RANKING_COLUMN", default="candidate_ranking"),
+        help="Small-reranker score column used to prioritize adaptive final reranking.",
+    )
+    parser.add_argument(
+        "--rerank_mode",
+        choices=["adaptive", "selected", "all"],
+        default=config("FINAL_RERANK_MODE", default="adaptive"),
+        help="adaptive reranks more candidates only for queries that still need final negatives.",
+    )
+    parser.add_argument(
+        "--relevant_path",
+        type=str,
+        default=config("FINAL_POSITIVE_RANKS_OUTPUT_PATH", default=config("RELEVANT_WITH_SCORE_PATH")),
+        help="Relevant-with-final-positive-scores file used by adaptive mode.",
+    )
+    parser.add_argument(
+        "--positive_score_column",
+        type=str,
+        default=config(
+            "FINAL_POSITIVE_SCORE_COLUMN", default=config("POSITIVE_SCORE_COLUMN", default="positive_ranking")
+        ),
+        help="Final positive score column used by adaptive mode.",
+    )
+    parser.add_argument("--num_negatives", type=int, default=num_negatives_default)
+    parser.add_argument("--beta", type=float, default=_stage_float_config("FINAL_BETA", "BETA", 0.01))
+    parser.add_argument("--u_floor", type=float, default=_stage_float_config("FINAL_U_FLOOR", "U_FLOOR", 0.005))
+    parser.add_argument(
+        "--initial_budget",
+        type=int,
+        default=config("FINAL_RERANK_INITIAL_BUDGET", cast=int, default=max(1, num_negatives_default * 2)),
+    )
+    parser.add_argument(
+        "--budget_step",
+        type=int,
+        default=config("FINAL_RERANK_BUDGET_STEP", cast=int, default=max(1, num_negatives_default)),
+    )
+    parser.add_argument(
+        "--max_budget",
+        type=int,
+        default=config("FINAL_RERANK_MAX_BUDGET", cast=int, default=max(1, num_negatives_default * 8)),
+    )
+    parser.add_argument("--report_path", type=str, default=config("FINAL_RERANK_REPORT_PATH", default=None))
     parser.add_argument("--selected-only", dest="selected_only", action="store_true")
     parser.add_argument("--all-candidates", dest="selected_only", action="store_false")
     parser.set_defaults(selected_only=config("FINAL_RERANK_SELECTED_ONLY", cast=bool, default=True))
@@ -311,6 +779,9 @@ def main() -> None:
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.set_defaults(resume=config("FINAL_RERANK_RESUME", cast=bool, default=True))
     args = parser.parse_args()
+    report_path = args.report_path
+    if args.rerank_mode == "adaptive" and report_path is None:
+        report_path = f"{args.output_path}.report.json"
 
     rerank_candidates(
         candidates_path=args.candidates_path,
@@ -325,6 +796,17 @@ def main() -> None:
         chunk_size=args.chunk_size,
         resume=args.resume,
         row_group_size=args.row_group_size,
+        rerank_mode=args.rerank_mode,
+        relevant_path=args.relevant_path,
+        candidate_score_column=args.candidate_score_column,
+        positive_score_column=args.positive_score_column,
+        num_negatives=args.num_negatives,
+        beta=args.beta,
+        u_floor=args.u_floor,
+        initial_budget=args.initial_budget,
+        budget_step=args.budget_step,
+        max_budget=args.max_budget,
+        report_path=report_path,
     )
 
 

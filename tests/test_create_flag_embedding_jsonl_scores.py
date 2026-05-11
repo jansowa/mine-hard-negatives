@@ -60,3 +60,57 @@ def test_process_negatives_streaming_reads_custom_negative_score_column(tmp_path
     assert len(rows) == 1
     assert rows[0]["neg_id"] == ["n1"]
     assert rows[0]["neg_scores"] == [0.5]
+
+
+def test_process_negatives_streaming_backfills_relaxed_candidates(tmp_path):
+    corpus_path = tmp_path / "corpus.parquet"
+    queries_path = tmp_path / "queries.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    negatives_path = tmp_path / "negatives.parquet"
+    output_path = tmp_path / "train.jsonl"
+
+    pd.DataFrame(
+        {
+            "id": ["p1", "n1", "n2"],
+            "text": ["positive text", "strict negative", "relaxed negative"],
+        }
+    ).to_parquet(corpus_path, index=False)
+    pd.DataFrame({"id": ["q1"], "text": ["question"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1"],
+            "document_id": ["p1"],
+            "positive_ranking": [1.0],
+        }
+    ).to_parquet(relevant_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q1", "q1"],
+            "document_id": ["n1", "n2", "p1"],
+            "final_ranking": [0.5, 2.0, 0.1],
+        }
+    ).to_parquet(negatives_path, index=False)
+
+    process_negatives_streaming(
+        corpus_path=str(corpus_path),
+        queries_path=str(queries_path),
+        relevant_path=str(relevant_path),
+        negatives_path=str(negatives_path),
+        output_path=str(output_path),
+        num_negatives=2,
+        positive_score_column="positive_ranking",
+        negative_score_column="final_ranking",
+        beta=0.5,
+        u_floor=0.0,
+        max_neg_reuse=10,
+        corpus_sqlite_path=str(tmp_path / "corpus.sqlite"),
+        negcount_sqlite_path=str(tmp_path / "negcount.sqlite"),
+        query_chunk_size=1,
+        oversample_factor=1,
+        backfill_policy="relaxed",
+        report_path=str(tmp_path / "report.json"),
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["neg_id"] == ["n1", "n2"]
+    assert rows[0]["neg_selection_tier"] == ["strict", "relaxed_backfill"]

@@ -102,6 +102,17 @@ def inc_counts_batch(conn: sqlite3.Connection, ids: list[str]):
     )
 
 
+def write_report(report_path: str | None, report: dict) -> None:
+    if not report_path:
+        return
+    d = os.path.dirname(report_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 # --------------------------- ECDF helpers ---------------------------
 
 
@@ -175,11 +186,15 @@ def process_negatives_streaming(
     oversample_factor: int,
     positive_score_column: str = "positive_ranking",
     negative_score_column: str = "ranking",
+    backfill_policy: str = "relaxed",
+    report_path: str | None = None,
 ):
     if not positive_score_column:
         raise ValueError("positive_score_column must not be empty")
     if not negative_score_column:
         raise ValueError("negative_score_column must not be empty")
+    if backfill_policy not in {"none", "relaxed"}:
+        raise ValueError("backfill_policy must be one of: none, relaxed")
 
     try:
         pl.enable_string_cache()
@@ -278,6 +293,8 @@ def process_negatives_streaming(
 
     out_f = open(output_path, "w", encoding="utf-8")
     corpus_db_path = os.path.abspath(corpus_sqlite_path)
+    stats: Counter[str] = Counter()
+    neg_count_histogram: Counter[int] = Counter()
 
     for start in tqdm(range(0, total_q, query_chunk_size), desc="Negatives streaming", unit="q_chunk"):
         end = min(start + query_chunk_size, total_q)
@@ -285,17 +302,18 @@ def process_negatives_streaming(
 
         thr_chunk = thr_df.slice(start, end - start).select(["query_id", "threshold_rank"])
 
-        K = num_negatives * oversample_factor
         candidates = (
             neg_scan.join(thr_chunk.lazy(), on="query_id", how="inner")
-            .filter(pl.col("ranking") <= pl.col("threshold_rank"))
+            .with_columns((pl.col("ranking") <= pl.col("threshold_rank")).alias("strict_negative"))
             .group_by("query_id")
-            .agg(pl.struct(["document_id", "ranking"]).sort_by("ranking", descending=True).head(K).alias("pairs"))
+            .agg(pl.struct(["document_id", "ranking", "strict_negative"]).alias("pairs"))
             .collect()
         )
 
         if candidates.height == 0:
+            stats["queries_without_candidates"] += len(qids_chunk)
             continue
+        stats["queries_without_candidates"] += len(set(qids_chunk) - set(candidates["query_id"].to_list()))
 
         need_ids_set = set()
         for pairs in candidates["pairs"].to_list():
@@ -316,27 +334,59 @@ def process_negatives_streaming(
         bumped_all: list[str] = []
 
         for qid, pairs in zip(candidates["query_id"].to_list(), candidates["pairs"].to_list()):
-            doc_ids_all = [p["document_id"] for p in pairs]
-            ranks_all = [p["ranking"] for p in pairs]
-
             chosen_ids: list[str] = []
             chosen_scores: list[float] = []
+            chosen_tiers: list[str] = []
             bumped_local: list[str] = []
+            seen_local: set[str] = set()
+            pos_ids, pos_scores = pos_map[qid]
+            pos_ids_set = set(pos_ids)
 
-            for did, rnk in zip(doc_ids_all, ranks_all):
+            strict_pairs = sorted(
+                (p for p in pairs if p["strict_negative"]),
+                key=lambda p: p["ranking"],
+                reverse=True,
+            )
+            fallback_pairs = sorted(
+                (p for p in pairs if not p["strict_negative"]),
+                key=lambda p: p["ranking"],
+            )
+            ordered_pairs = [(p, "strict") for p in strict_pairs]
+            if backfill_policy == "relaxed":
+                ordered_pairs.extend((p, "relaxed_backfill") for p in fallback_pairs)
+
+            strict_chosen = 0
+            backfill_chosen = 0
+            for pair, tier in ordered_pairs:
+                did = pair["document_id"]
+                rnk = pair["ranking"]
+                if did in seen_local:
+                    stats["duplicate_candidate_filtered"] += 1
+                    continue
+                seen_local.add(did)
+                if did in pos_ids_set:
+                    stats["positive_doc_filtered"] += 1
+                    continue
                 if counts_map.get(did, 0) >= max_neg_reuse:
+                    stats["reuse_filtered"] += 1
                     continue
                 chosen_ids.append(did)
                 chosen_scores.append(rnk)
+                chosen_tiers.append(tier)
                 counts_map[did] = counts_map.get(did, 0) + 1
                 bumped_local.append(did)
+                if tier == "strict":
+                    strict_chosen += 1
+                else:
+                    backfill_chosen += 1
                 if len(chosen_ids) >= num_negatives:
                     break
 
             if not chosen_ids:
+                stats["queries_with_zero_negatives"] += 1
+                neg_count_histogram[0] += 1
                 continue
 
-            pos_ids, pos_scores = pos_map[qid]
             query_text = queries_dict.get(qid, "")
 
             pos_texts = [texts_map.get(pid, "") for pid in pos_ids]
@@ -350,15 +400,38 @@ def process_negatives_streaming(
                 "neg_scores": chosen_scores,
                 "pos_id": pos_ids,
                 "neg_id": chosen_ids,
+                "neg_selection_tier": chosen_tiers,
             }
             out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
             bumped_all.extend(bumped_local)
+            stats["queries_written"] += 1
+            stats["strict_negatives_written"] += strict_chosen
+            stats["backfill_negatives_written"] += backfill_chosen
+            if backfill_chosen:
+                stats["queries_with_backfill"] += 1
+            if len(chosen_ids) < num_negatives:
+                stats["queries_with_partial_negatives"] += 1
+            else:
+                stats["queries_with_full_negatives"] += 1
+            neg_count_histogram[len(chosen_ids)] += 1
 
         inc_counts_batch(neg_conn, bumped_all)
         neg_conn.commit()
 
     out_f.close()
     neg_conn.close()
+    report = {
+        "target_negatives": num_negatives,
+        "beta": beta,
+        "u_floor": u_floor,
+        "positive_score_column": positive_score_column,
+        "negative_score_column": negative_score_column,
+        "backfill_policy": backfill_policy,
+        "total_queries": total_q,
+        **dict(stats),
+        "negatives_per_query_histogram": {str(key): value for key, value in sorted(neg_count_histogram.items())},
+    }
+    write_report(report_path, report)
 
 
 # --------------------------- CLI ---------------------------
@@ -390,13 +463,13 @@ def main():
     parser.add_argument(
         "--beta",
         type=float,
-        default=config("BETA", cast=float, default=0.5),
+        default=config("FINAL_BETA", cast=float, default=config("BETA", cast=float, default=0.01)),
         help="Warunek: u_doc <= max(beta * u_pos, u_floor) (liczone przez ECDF).",
     )
     parser.add_argument(
         "--u_floor",
         type=float,
-        default=config("U_FLOOR", cast=float, default=0.05),
+        default=config("FINAL_U_FLOOR", cast=float, default=config("U_FLOOR", cast=float, default=0.005)),
         help="Minimalny percentyl dla negatywu.",
     )
 
@@ -422,10 +495,18 @@ def main():
         "--oversample_factor",
         type=int,
         default=config("OVERSAMPLE_FACTOR", cast=int, default=5),
-        help="Ile nadpróbkować top-negatywów per query przed limitem reuse.",
+        help="Legacy compatibility knob; relaxed backfill considers all final-scored candidates in a query chunk.",
     )
+    parser.add_argument(
+        "--backfill_policy",
+        choices=["none", "relaxed"],
+        default=config("BACKFILL_POLICY", default="relaxed"),
+        help="Whether to fill missing strict negatives with the safest final-scored relaxed candidates.",
+    )
+    parser.add_argument("--report_path", type=str, default=config("EXPORT_REPORT_PATH", default=None))
 
     args = parser.parse_args()
+    report_path = args.report_path or f"{args.output_path}.report.json"
 
     if "POLARS_MAX_THREADS" not in os.environ:
         pass
@@ -439,6 +520,8 @@ def main():
         num_negatives=args.num_negatives,
         positive_score_column=args.positive_score_column,
         negative_score_column=args.negative_score_column,
+        backfill_policy=args.backfill_policy,
+        report_path=report_path,
         beta=args.beta,
         u_floor=args.u_floor,
         max_neg_reuse=args.max_neg_reuse,

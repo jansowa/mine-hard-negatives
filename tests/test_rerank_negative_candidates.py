@@ -112,3 +112,85 @@ def test_rerank_candidates_resume_skips_already_scored_pairs(monkeypatch, tmp_pa
 
     df = pd.read_parquet(output_path)
     assert df["document_id"].tolist() == ["d1", "d3"]
+
+
+def test_rerank_candidates_adaptive_expands_only_until_target(monkeypatch, tmp_path):
+    queries_path = tmp_path / "queries.parquet"
+    corpus_path = tmp_path / "corpus.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    candidates_path = tmp_path / "negative_candidates.parquet"
+    output_path = tmp_path / "negatives.parquet"
+    report_path = tmp_path / "report.json"
+
+    pd.DataFrame(
+        {
+            "id": ["q1", "q2"],
+            "text": ["query one", "query two"],
+        }
+    ).to_parquet(queries_path, index=False)
+    pd.DataFrame(
+        {
+            "id": ["d1", "d2", "d3", "d4", "d5", "d6", "p1", "p2"],
+            "text": ["d1", "d2", "d3", "d4", "d5", "d6", "p1", "p2"],
+        }
+    ).to_parquet(corpus_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q2"],
+            "document_id": ["p1", "p2"],
+            "positive_ranking": [1.0, 1.0],
+        }
+    ).to_parquet(relevant_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q1", "q1", "q2", "q2", "q2"],
+            "document_id": ["d1", "d2", "d3", "d4", "d5", "d6"],
+            "candidate_ranking": [0.9, 0.8, 0.7, 0.9, 0.8, 0.7],
+            "candidate_percentile": [0.1, 0.2, 0.3, 0.1, 0.2, 0.3],
+            "candidate_selected": [True, True, False, True, False, False],
+            "retrieval_rank": [0, 1, 2, 0, 1, 2],
+            "retrieval_offset": [0, 0, 0, 0, 0, 0],
+            "retrieval_score": [0.9, 0.8, 0.7, 0.9, 0.8, 0.7],
+            "retrieval_source": ["hybrid"] * 6,
+        }
+    ).to_parquet(candidates_path, index=False)
+
+    monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+
+    final_scores = {"d1": 0.5, "d2": 0.5, "d3": 0.5, "d4": 2.0, "d5": 0.5, "d6": 0.5}
+    calls = []
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        calls.append(list(docs))
+        return [final_scores[doc] for doc in docs]
+
+    monkeypatch.setattr(rnc, "rerank", fake_rerank)
+
+    rnc.rerank_candidates(
+        candidates_path=str(candidates_path),
+        queries_path=str(queries_path),
+        corpus_path=str(corpus_path),
+        relevant_path=str(relevant_path),
+        output_path=str(output_path),
+        reranker_model_name="final-model",
+        reranker_batch_size=2,
+        ranking_column="final_ranking",
+        rerank_mode="adaptive",
+        positive_score_column="positive_ranking",
+        num_negatives=2,
+        beta=1.0,
+        u_floor=0.0,
+        initial_budget=1,
+        budget_step=1,
+        max_budget=3,
+        resume=False,
+        report_path=str(report_path),
+    )
+
+    df = pd.read_parquet(output_path)
+    by_query = {query_id: set(group["document_id"]) for query_id, group in df.groupby("query_id")}
+    assert by_query == {"q1": {"d1", "d2"}, "q2": {"d4", "d5", "d6"}}
+    scored_docs = [doc for call in calls for doc in call]
+    assert all("d3" not in call for call in calls)
+    assert scored_docs.index("d6") < scored_docs.index("d5")
+    assert set(df.columns) >= {"final_selected", "final_threshold_rank", "final_rerank_budget"}

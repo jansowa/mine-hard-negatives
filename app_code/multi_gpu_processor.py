@@ -104,6 +104,17 @@ def _result_value(row: dict, key: str, default=None):
     return value
 
 
+def _stage_float_config(name: str, fallback_name: str, default: float) -> float:
+    return config(name, cast=float, default=config(fallback_name, cast=float, default=default))
+
+
+def _positive_int(value: int, name: str) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
 class GPUModelSet:
     """Represents a set of models (dense, sparse, reranker) running on a specific GPU"""
 
@@ -115,9 +126,13 @@ class GPUModelSet:
         relevant_path: str,
         logger=None,
         skip_if_not_in_top_k: int = config("SKIP_IF_NOT_IN_TOP_K", cast=int, default=100),
-        beta: float = 0.4,
-        u_floor: float = 0.1,
+        beta: float | None = None,
+        u_floor: float | None = None,
         positive_score_column: str = "positive_ranking",
+        candidate_target: int = config("CANDIDATE_TARGET", cast=int, default=40),
+        candidate_search_chunk: int = config("CANDIDATE_SEARCH_CHUNK", cast=int, default=128),
+        candidate_max_offset_iters: int = config("CANDIDATE_MAX_OFFSET_ITERS", cast=int, default=10),
+        candidate_random_fallback: int = config("CANDIDATE_RANDOM_FALLBACK", cast=int, default=128),
     ):
 
         self.gpu_id = gpu_id
@@ -128,6 +143,12 @@ class GPUModelSet:
         self.logger = logger or logging.getLogger(__name__)
         self.skip_if_not_in_top_k = skip_if_not_in_top_k
         self.positive_score_column = positive_score_column
+        self.beta = beta if beta is not None else _stage_float_config("CANDIDATE_BETA", "BETA", 0.01)
+        self.u_floor = u_floor if u_floor is not None else _stage_float_config("CANDIDATE_U_FLOOR", "U_FLOOR", 0.005)
+        self.candidate_target = _positive_int(candidate_target, "candidate_target")
+        self.candidate_search_chunk = _positive_int(candidate_search_chunk, "candidate_search_chunk")
+        self.candidate_max_offset_iters = _positive_int(candidate_max_offset_iters, "candidate_max_offset_iters")
+        self.candidate_random_fallback = max(0, int(candidate_random_fallback))
 
         relevant_df = pd.read_parquet(relevant_path)
 
@@ -148,14 +169,11 @@ class GPUModelSet:
             for _, row in relevant_df.iterrows()
         }
 
-        self.beta = beta
-        self.u_floor = u_floor
-
     def _percentile(self, s: np.ndarray) -> np.ndarray:
         return np.interp(s, self._ecdf_x, self._ecdf_y, left=0.0, right=1.0)
 
     def _is_negative_percentile(self, u_pos: float, u_doc: float) -> bool:
-        return (u_doc - u_pos) <= -self.beta or (u_doc <= self.u_floor)
+        return u_doc <= max(self.beta * u_pos, self.u_floor)
 
     def _search_with_offset(self, backend, query_text: str, limit: int, offset: int):
         return backend.search(query_text=query_text, k=limit, offset=offset)
@@ -199,14 +217,13 @@ class GPUModelSet:
         timing_stats: TimingStats | None = None,
     ) -> list[dict]:
         """
-        Iteratively fetches documents in batches of 128, with an offset of 2^(n+7), n = 0..9,
-        until it collects ≥20 negatives according to the percentile rule (beta = 0.4, u_floor = 0.1),
-        or completes 10 iterations; then it fetches an additional random 128 and stops.
+        Iteratively fetches documents in offset batches until it collects the configured candidate target,
+        or exhausts the configured offset probes; then it can fetch an additional random fallback sample.
         Returns every scored candidate collected during the process for each query.
         """
-        NEG_TARGET = 20
-        CHUNK = 128
-        MAX_ITERS = 10
+        NEG_TARGET = self.candidate_target
+        CHUNK = self.candidate_search_chunk
+        MAX_ITERS = self.candidate_max_offset_iters
         OFFSET_GROUP_SIZE = config("SEARCH_MANY_OFFSETS_GROUP_SIZE", cast=int, default=2)
 
         offsets = [0 if n == 0 else 2 ** (n + 7) for n in range(MAX_ITERS)]
@@ -303,8 +320,10 @@ class GPUModelSet:
         for state in states:
             if state["neg_count"] >= NEG_TARGET:
                 continue
+            if self.candidate_random_fallback <= 0:
+                continue
             started_at = _now_if_enabled(timing_stats)
-            rand_docs = self._random_sample(backend, CHUNK)
+            rand_docs = self._random_sample(backend, self.candidate_random_fallback)
             _record_elapsed(timing_stats, "random_sample", started_at, items=len(rand_docs))
             for d in rand_docs:
                 did = str(d.metadata.get("document_id", ""))
@@ -483,7 +502,6 @@ class MultiGPUNegativeFinder:
         model_set: GPUModelSet,
         vector_store,
         rerank_function: Callable,
-        top_k: int,
         reranker_batch_size: int,
     ) -> None:
         """Worker function for each GPU model set"""
@@ -566,7 +584,6 @@ class MultiGPUNegativeFinder:
         queries: list[dict],
         vector_store,
         rerank_function: Callable,
-        top_k: int,
         reranker_batch_size: int,
         query_batch_size: int = 1,
     ) -> int:
@@ -579,7 +596,7 @@ class MultiGPUNegativeFinder:
         threads = []
         for i, model_set in enumerate(self.model_sets):
             thread = threading.Thread(
-                target=self.worker, args=(i, model_set, vector_store, rerank_function, top_k, reranker_batch_size)
+                target=self.worker, args=(i, model_set, vector_store, rerank_function, reranker_batch_size)
             )
             thread.daemon = True
             thread.start()
@@ -787,6 +804,12 @@ def setup_multi_gpu_models(
     models_per_gpu: int = 1,
     logger=None,
     positive_score_column: str = "positive_ranking",
+    beta: float | None = None,
+    u_floor: float | None = None,
+    candidate_target: int = config("CANDIDATE_TARGET", cast=int, default=40),
+    candidate_search_chunk: int = config("CANDIDATE_SEARCH_CHUNK", cast=int, default=128),
+    candidate_max_offset_iters: int = config("CANDIDATE_MAX_OFFSET_ITERS", cast=int, default=10),
+    candidate_random_fallback: int = config("CANDIDATE_RANDOM_FALLBACK", cast=int, default=128),
 ) -> list[GPUModelSet]:
     """Setup model sets across all available GPUs, with multiple model instances per GPU if desired"""
     from models import get_reranker_model
@@ -811,7 +834,13 @@ def setup_multi_gpu_models(
                 reranker_model,
                 relevant_path,
                 logger,
+                beta=beta,
+                u_floor=u_floor,
                 positive_score_column=positive_score_column,
+                candidate_target=candidate_target,
+                candidate_search_chunk=candidate_search_chunk,
+                candidate_max_offset_iters=candidate_max_offset_iters,
+                candidate_random_fallback=candidate_random_fallback,
             )
             model_sets.append(model_set)
             logger.info(f"[GPU {gpu_id}] Successfully loaded models (instance {instance + 1}/{models_per_gpu})")

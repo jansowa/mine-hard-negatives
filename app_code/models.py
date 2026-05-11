@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -161,7 +162,7 @@ def get_reranker_model(
 def rerank(
     tokenizer,
     model,
-    query: tuple[str, list[str]],
+    query: str | Sequence[str],
     answers: list[str],
     batch_size=16,
     model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2"),
