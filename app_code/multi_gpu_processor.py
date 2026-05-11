@@ -191,6 +191,11 @@ class GPUModelSet:
     def _random_sample(self, backend, limit: int):
         return backend.random_sample(k=limit)
 
+    def _prepare_query_vectors(self, backend, query_texts: list[str]) -> None:
+        prepare_query_vectors = getattr(backend, "prepare_query_vectors", None)
+        if callable(prepare_query_vectors):
+            prepare_query_vectors(query_texts)
+
     def _positive_score(self, query_data: dict) -> float:
         if "positive_score" in query_data:
             return float(query_data["positive_score"])
@@ -257,6 +262,10 @@ class GPUModelSet:
                     "docs_by_offset": {},
                 }
             )
+
+        started_at = _now_if_enabled(timing_stats)
+        self._prepare_query_vectors(backend, [state["qtext"] for state in states])
+        _record_elapsed(timing_stats, "prepare_query_vectors", started_at, items=len(states))
 
         for offset_group in offset_groups:
             for state in states:

@@ -1,4 +1,6 @@
 import sys
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from datasets import Dataset
@@ -50,6 +52,29 @@ class FakeDenseEmbeddings:
         self._client = FakeSentenceTransformerClient()
 
 
+class FakeQueryEmbeddings:
+    def __init__(self):
+        self.encode_kwargs = {"prompt": "doc: "}
+        self.query_encode_kwargs = {"prompt": "query: "}
+        self.calls = []
+
+    def _embed(self, texts, encode_kwargs):
+        self.calls.append((list(texts), dict(encode_kwargs)))
+        return [[float(index), float(index + 1)] for index, _ in enumerate(texts)]
+
+    def embed_query(self, _text):
+        raise AssertionError("cached query vector should be reused")
+
+
+def _build_lancedb_backend_for_query_cache(dense_embeddings):
+    backend = LanceDBBackend.__new__(LanceDBBackend)
+    backend.dense_embeddings = dense_embeddings
+    backend.query_vector_cache_size = 10
+    backend._query_vector_cache = OrderedDict()
+    backend._query_vector_cache_lock = threading.Lock()
+    return backend
+
+
 def test_filter_dataset_by_missing_ids_ds_removes_existing_ids():
     ds = Dataset.from_dict({"id": ["1", "2", "3"], "text": ["a", "b", "c"]})
     filtered = filter_dataset_by_missing_ids_ds(ds, {"2"}, num_proc=1, batch_size=2)
@@ -92,6 +117,18 @@ def test_lancedb_fast_path_keeps_write_batches_larger_than_gpu_microbatches():
 
     assert [len(call[0]) for call in backend.calls] == [3, 2]
     assert embeddings._client.batch_sizes == [2, 2]
+
+
+def test_lancedb_prepare_query_vectors_batches_missing_queries_into_cache():
+    embeddings = FakeQueryEmbeddings()
+    backend = _build_lancedb_backend_for_query_cache(embeddings)
+
+    backend.prepare_query_vectors(["q1", "q2", "q1"])
+
+    assert embeddings.calls == [(["q1", "q2"], {"prompt": "query: "})]
+    assert list(backend._query_vector_cache) == ["q1", "q2"]
+    assert backend._embed_query_cached("q1") == [0.0, 1.0]
+    assert backend._embed_query_cached("q2") == [1.0, 2.0]
 
 
 def test_normalise_vectors_does_not_count_rows_per_document():

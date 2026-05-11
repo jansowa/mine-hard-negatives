@@ -33,6 +33,9 @@ class VectorBackend(ABC):
     def search_many_offsets(self, query_text: str, k: int, offsets: list[int]) -> dict[int, list[Document]]:
         return {offset: self.search(query_text=query_text, k=k, offset=offset) for offset in offsets}
 
+    def prepare_query_vectors(self, query_texts: Iterable[str]) -> None:
+        return None
+
     @abstractmethod
     def random_sample(self, k: int) -> list[Document]: ...
 
@@ -441,6 +444,64 @@ class LanceDBBackend(VectorBackend):
             while len(self._query_vector_cache) > self.query_vector_cache_size:
                 self._query_vector_cache.popitem(last=False)
 
+        return vector
+
+    def prepare_query_vectors(self, query_texts: Iterable[str]) -> None:
+        if self.dense_embeddings is None:
+            raise ValueError("Dense embeddings must be configured before LanceDB search")
+        if self.query_vector_cache_size <= 0:
+            return
+
+        ordered_missing: list[str] = []
+        seen_missing: set[str] = set()
+        with self._query_vector_cache_lock:
+            for query_text in query_texts:
+                query_text = str(query_text)
+                if query_text in self._query_vector_cache:
+                    self._query_vector_cache.move_to_end(query_text)
+                    continue
+                if query_text in seen_missing:
+                    continue
+                seen_missing.add(query_text)
+                ordered_missing.append(query_text)
+
+        if not ordered_missing:
+            return
+
+        vectors = self._embed_queries_batch(ordered_missing)
+        if len(vectors) != len(ordered_missing):
+            raise ValueError(f"Query embedding count mismatch: {len(ordered_missing)} != {len(vectors)}")
+
+        with self._query_vector_cache_lock:
+            for query_text, vector in zip(ordered_missing, vectors):
+                self._query_vector_cache[query_text] = self._normalise_query_vector(vector)
+                self._query_vector_cache.move_to_end(query_text)
+            while len(self._query_vector_cache) > self.query_vector_cache_size:
+                self._query_vector_cache.popitem(last=False)
+
+    def _embed_queries_batch(self, query_texts: list[str]):
+        query_encode_kwargs = getattr(self.dense_embeddings, "query_encode_kwargs", None)
+        encode_kwargs = query_encode_kwargs if isinstance(query_encode_kwargs, dict) and query_encode_kwargs else None
+        if encode_kwargs is None:
+            maybe_encode_kwargs = getattr(self.dense_embeddings, "encode_kwargs", None)
+            if isinstance(maybe_encode_kwargs, dict):
+                encode_kwargs = maybe_encode_kwargs
+
+        embed = getattr(self.dense_embeddings, "_embed", None)
+        if callable(embed) and encode_kwargs is not None:
+            return embed(query_texts, encode_kwargs)
+
+        if not query_encode_kwargs:
+            embed_documents = getattr(self.dense_embeddings, "embed_documents", None)
+            if callable(embed_documents):
+                return embed_documents(query_texts)
+
+        return [self.dense_embeddings.embed_query(query_text) for query_text in query_texts]
+
+    @staticmethod
+    def _normalise_query_vector(vector):
+        if hasattr(vector, "tolist"):
+            return vector.tolist()
         return vector
 
     def _random_sample_rows(self):
