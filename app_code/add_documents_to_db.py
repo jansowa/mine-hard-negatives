@@ -1,5 +1,4 @@
 import argparse
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from datasets import Dataset
@@ -7,6 +6,14 @@ from decouple import config
 from langchain_core.documents import Document
 from tqdm import tqdm
 
+from batch_tuning import (
+    benchmark_embedding_batch_size as benchmark_dense_batch_size,
+)
+from batch_tuning import (
+    embed_dense_documents,
+    parse_batch_size_candidates,
+    set_dense_embedding_batch_size,
+)
 from config import get_vector_db_backend
 from models import get_dense_model, get_sparse_model
 from utils.vector_db import VectorBackend, create_vector_backend
@@ -58,44 +65,6 @@ def add_documents_from_dataset(
                 pbar.update(len(documents))
 
 
-def set_dense_embedding_batch_size(dense_embeddings, batch_size: int) -> None:
-    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
-    if isinstance(encode_kwargs, dict):
-        encode_kwargs["batch_size"] = batch_size
-
-
-def embed_dense_documents(dense_embeddings, texts: list[str]):
-    client = getattr(dense_embeddings, "_client", None)
-    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
-    if client is not None and isinstance(encode_kwargs, dict) and hasattr(client, "encode"):
-        texts = [text.replace("\n", " ") for text in texts]
-        return client.encode(
-            texts,
-            show_progress_bar=getattr(dense_embeddings, "show_progress", False),
-            **encode_kwargs,
-        )
-
-    return dense_embeddings.embed_documents(texts)
-
-
-def parse_batch_size_candidates(raw_candidates: str | None, minimum: int, maximum: int) -> list[int]:
-    if raw_candidates:
-        candidates = [int(item.strip()) for item in raw_candidates.split(",") if item.strip()]
-    else:
-        candidates = []
-        value = minimum
-        while value <= maximum:
-            candidates.append(value)
-            value *= 2
-        if maximum not in candidates:
-            candidates.append(maximum)
-
-    candidates = sorted({candidate for candidate in candidates if candidate > 0})
-    if not candidates:
-        raise ValueError("Auto batch-size candidates must contain at least one positive integer")
-    return candidates
-
-
 def collect_text_sample(ds: Dataset, sample_size: int) -> list[str]:
     if sample_size <= 0:
         return []
@@ -109,85 +78,6 @@ def collect_text_sample(ds: Dataset, sample_size: int) -> list[str]:
                 if len(sample) >= sample_size:
                     return sample
     return sample
-
-
-def is_cuda_oom(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return "out of memory" in text or exc.__class__.__name__ == "OutOfMemoryError"
-
-
-def clear_cuda_cache() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    except Exception:
-        return
-
-
-def synchronize_cuda() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-    except Exception:
-        return
-
-
-def benchmark_dense_batch_size(
-    dense_embeddings,
-    sample_texts: list[str],
-    candidates: list[int],
-) -> int:
-    if not sample_texts:
-        return candidates[0]
-
-    print(f"Auto-tuning embedding batch size on {len(sample_texts)} sample documents...")
-    results: list[tuple[float, int]] = []
-
-    warmup_size = min(len(sample_texts), candidates[0])
-    if warmup_size:
-        try:
-            set_dense_embedding_batch_size(dense_embeddings, candidates[0])
-            embed_dense_documents(dense_embeddings, sample_texts[:warmup_size])
-            synchronize_cuda()
-        except Exception as exc:
-            if is_cuda_oom(exc):
-                clear_cuda_cache()
-            else:
-                print(f"WARNING: batch-size warmup failed ({type(exc).__name__}: {exc})")
-
-    for candidate in candidates:
-        set_dense_embedding_batch_size(dense_embeddings, candidate)
-        clear_cuda_cache()
-        started_at = time.perf_counter()
-        try:
-            embed_dense_documents(dense_embeddings, sample_texts)
-            synchronize_cuda()
-        except Exception as exc:
-            clear_cuda_cache()
-            if is_cuda_oom(exc):
-                print(f"  batch_size={candidate}: OOM, stopping candidate search")
-                break
-            print(f"  batch_size={candidate}: failed ({type(exc).__name__}: {exc})")
-            continue
-
-        elapsed = max(time.perf_counter() - started_at, 1e-9)
-        docs_per_second = len(sample_texts) / elapsed
-        print(f"  batch_size={candidate}: {docs_per_second:.1f} docs/s ({elapsed:.2f}s)")
-        results.append((docs_per_second, candidate))
-
-    if not results:
-        raise RuntimeError("Could not find a working embedding batch size")
-
-    best_speed = max(speed for speed, _ in results)
-    selected = min(candidate for speed, candidate in results if speed >= best_speed * 0.98)
-    set_dense_embedding_batch_size(dense_embeddings, selected)
-    print(f"Selected embedding batch size: {selected}")
-    return selected
 
 
 def write_lancedb_embedding_batch(

@@ -78,6 +78,42 @@ def test_rerank_candidates_scores_selected_and_writes_ranking_alias(monkeypatch,
     assert calls[0][3] == "final-model"
 
 
+def test_rerank_candidates_auto_tunes_reranker_batch_size(monkeypatch, tmp_path):
+    queries_path, corpus_path, candidates_path = _write_inputs(tmp_path)
+    output_path = tmp_path / "negatives.parquet"
+    benchmark_calls = []
+    rerank_calls = []
+
+    monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+
+    def fake_benchmark(_tokenizer, _model, sample_queries, sample_docs, candidates, _rerank_function, **_kwargs):
+        benchmark_calls.append((sample_queries, sample_docs, candidates))
+        return 4
+
+    monkeypatch.setattr(rnc, "benchmark_reranker_batch_size", fake_benchmark)
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        rerank_calls.append((docs, batch_size, model_name))
+        return [1.0] * len(docs)
+
+    monkeypatch.setattr(rnc, "rerank", fake_rerank)
+
+    rnc.rerank_candidates(
+        candidates_path=str(candidates_path),
+        queries_path=str(queries_path),
+        corpus_path=str(corpus_path),
+        output_path=str(output_path),
+        reranker_model_name="final-model",
+        reranker_batch_size=None,
+        chunk_size=3,
+        auto_reranker_batch_size_candidates="2,4",
+        auto_reranker_batch_size_sample_size=2,
+    )
+
+    assert benchmark_calls == [(["query one", "query two"], ["doc one", "doc three"], [2, 4])]
+    assert rerank_calls == [(["doc one", "doc three"], 4, "final-model")]
+
+
 def test_rerank_candidates_resume_skips_already_scored_pairs(monkeypatch, tmp_path):
     queries_path, corpus_path, candidates_path = _write_inputs(tmp_path)
     output_path = tmp_path / "negatives.parquet"

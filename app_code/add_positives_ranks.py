@@ -5,6 +5,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Iterable
+from functools import partial
 
 import pandas as pd
 import pyarrow as pa
@@ -12,6 +13,12 @@ import pyarrow.parquet as pq
 from decouple import UndefinedValueError, config
 from tqdm import tqdm
 
+from batch_tuning import (
+    OOMRetryReranker,
+    benchmark_reranker_batch_size,
+    parse_batch_size_candidates,
+    validate_batch_size_options,
+)
 from models import get_reranker_model, rerank
 
 _MISSING = object()
@@ -30,6 +37,17 @@ def _config_first(names: tuple[str, ...], *, cast=None, default=_MISSING):
     return default
 
 
+def _config_first_optional(names: tuple[str, ...], *, cast=None, default=None):
+    for name in names:
+        try:
+            if cast is None:
+                return config(name)
+            return config(name, cast=cast)
+        except UndefinedValueError:
+            continue
+    return default
+
+
 def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
     if final_step:
         return {
@@ -37,8 +55,8 @@ def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
             "reranker_model_name": _config_first(
                 ("FINAL_RERANKER_NAME", "FINAL_POSITIVE_RANKS_RERANKER_NAME", "RERANKER_NAME")
             ),
-            "reranker_batch_size": _config_first(
-                ("FINAL_RERANKER_BATCH_SIZE", "FINAL_POSITIVE_RANKS_RERANKER_BATCH_SIZE", "RERANKER_BATCH_SIZE"),
+            "reranker_batch_size": _config_first_optional(
+                ("FINAL_RERANKER_BATCH_SIZE", "FINAL_POSITIVE_RANKS_RERANKER_BATCH_SIZE"),
                 cast=int,
             ),
             "score_column": _config_first(
@@ -64,12 +82,11 @@ def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
                 "RERANKER_NAME",
             ),
         ),
-        "reranker_batch_size": _config_first(
+        "reranker_batch_size": _config_first_optional(
             (
                 "CANDIDATE_RERANKER_BATCH_SIZE",
                 "CANDIDATE_POSITIVE_RANKS_RERANKER_BATCH_SIZE",
                 "POSITIVE_RANKS_RERANKER_BATCH_SIZE",
-                "RERANKER_BATCH_SIZE",
             ),
             cast=int,
         ),
@@ -80,6 +97,101 @@ def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
                 "POSITIVE_RANKS_SCORE_COLUMN",
             ),
             default="positive_candidate_ranking",
+        ),
+    }
+
+
+def get_positive_ranks_auto_batch_defaults(final_step: bool) -> dict:
+    if final_step:
+        return {
+            "candidates": _config_first_optional(
+                (
+                    "FINAL_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+                    "FINAL_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+                    "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+                )
+            ),
+            "min": _config_first_optional(
+                (
+                    "FINAL_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MIN",
+                    "FINAL_AUTO_RERANKER_BATCH_SIZE_MIN",
+                    "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MIN",
+                ),
+                cast=int,
+                default=1,
+            ),
+            "max": _config_first_optional(
+                (
+                    "FINAL_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MAX",
+                    "FINAL_AUTO_RERANKER_BATCH_SIZE_MAX",
+                    "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MAX",
+                ),
+                cast=int,
+                default=64,
+            ),
+            "sample_size": _config_first_optional(
+                (
+                    "FINAL_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+                    "FINAL_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+                    "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+                ),
+                cast=int,
+                default=128,
+            ),
+            "memory_utilization": _config_first_optional(
+                (
+                    "FINAL_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+                    "FINAL_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+                    "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+                ),
+                cast=float,
+                default=0.70,
+            ),
+        }
+
+    return {
+        "candidates": _config_first_optional(
+            (
+                "CANDIDATE_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+                "CANDIDATE_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+                "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_CANDIDATES",
+            )
+        ),
+        "min": _config_first_optional(
+            (
+                "CANDIDATE_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MIN",
+                "CANDIDATE_AUTO_RERANKER_BATCH_SIZE_MIN",
+                "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MIN",
+            ),
+            cast=int,
+            default=1,
+        ),
+        "max": _config_first_optional(
+            (
+                "CANDIDATE_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MAX",
+                "CANDIDATE_AUTO_RERANKER_BATCH_SIZE_MAX",
+                "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MAX",
+            ),
+            cast=int,
+            default=64,
+        ),
+        "sample_size": _config_first_optional(
+            (
+                "CANDIDATE_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+                "CANDIDATE_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+                "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE",
+            ),
+            cast=int,
+            default=128,
+        ),
+        "memory_utilization": _config_first_optional(
+            (
+                "CANDIDATE_POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+                "CANDIDATE_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+                "POSITIVE_RANKS_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION",
+            ),
+            cast=float,
+            default=0.70,
         ),
     }
 
@@ -266,20 +378,71 @@ def _filter_relevant_to_missing(
     return filtered_path, kept
 
 
+def _collect_reranker_sample_pairs(
+    filtered_relevant_path: str,
+    queries_df: pd.DataFrame,
+    corpus_df: pd.DataFrame,
+    sample_size: int,
+    chunk_size: int,
+) -> tuple[list[str], list[str]]:
+    if sample_size <= 0:
+        return [], []
+
+    sample_queries: list[str] = []
+    sample_docs: list[str] = []
+    batch_size = max(1, min(chunk_size, max(sample_size * 2, 1)))
+    pf_filtered = pq.ParquetFile(filtered_relevant_path)
+
+    for batch in pf_filtered.iter_batches(batch_size=batch_size, columns=["query_id", "document_id"]):
+        relevant_chunk_df: pd.DataFrame = batch.to_pandas()
+        if relevant_chunk_df.empty:
+            continue
+
+        merged_chunk_df: pd.DataFrame = pd.merge(
+            relevant_chunk_df, queries_df, left_on="query_id", right_index=True, how="inner"
+        )
+        merged_chunk_df = pd.merge(merged_chunk_df, corpus_df, left_on="document_id", right_index=True, how="inner")
+        if merged_chunk_df.empty:
+            continue
+
+        for query_text, document_text in zip(
+            merged_chunk_df["query_text"].values, merged_chunk_df["document_text"].values
+        ):
+            sample_queries.append(str(query_text))
+            sample_docs.append(str(document_text))
+            if len(sample_docs) >= sample_size:
+                return sample_queries, sample_docs
+
+    return sample_queries, sample_docs
+
+
 def process_relevant(
     queries_path: str,
     corpus_path: str,
     relevant_path: str,
     output_path: str,
     chunk_size: int,
-    reranker_batch_size: int,
+    reranker_batch_size: int | None,
     reranker_model_name: str,
     skip: int = 0,
     offset: int | None = None,
     score_column: str = "positive_ranking",
+    auto_reranker_batch_size_candidates: str | None = None,
+    auto_reranker_batch_size_min: int = 1,
+    auto_reranker_batch_size_max: int = 64,
+    auto_reranker_batch_size_sample_size: int = 128,
+    auto_reranker_batch_size_memory_utilization: float = 0.70,
 ) -> None:
     if not score_column:
         raise ValueError("score_column must not be empty")
+    validate_batch_size_options(
+        reranker_batch_size,
+        auto_reranker_batch_size_min,
+        auto_reranker_batch_size_max,
+        auto_reranker_batch_size_sample_size,
+        auto_reranker_batch_size_memory_utilization,
+        "reranker",
+    )
 
     output_dir: str = os.path.dirname(output_path) if output_path else "."
     parts_dir: str = f"{output_path}.parts"
@@ -322,6 +485,35 @@ def process_relevant(
 
         tokenizer, reranker = get_reranker_model(reranker_model_name)
         print("Reranker loaded.")
+        rerank_function = partial(rerank, model_name=reranker_model_name)
+
+        if reranker_batch_size is None:
+            candidates = parse_batch_size_candidates(
+                auto_reranker_batch_size_candidates,
+                minimum=auto_reranker_batch_size_min,
+                maximum=auto_reranker_batch_size_max,
+            )
+            sample_queries, sample_docs = _collect_reranker_sample_pairs(
+                filtered_relevant_path,
+                queries_df,
+                corpus_df,
+                auto_reranker_batch_size_sample_size,
+                chunk_size,
+            )
+            reranker_batch_size = benchmark_reranker_batch_size(
+                tokenizer,
+                reranker,
+                sample_queries,
+                sample_docs,
+                candidates,
+                rerank_function,
+                memory_utilization=auto_reranker_batch_size_memory_utilization,
+            )
+        else:
+            print(f"Using explicit reranker batch size: {reranker_batch_size}")
+        assert reranker_batch_size is not None
+        safe_rerank = OOMRetryReranker(rerank_function, reranker_batch_size)
+        print(f"Effective reranker batch size: {reranker_batch_size}")
 
         relevant_extended_schema: pa.Schema = pa.schema(
             [("query_id", pa.string()), ("document_id", pa.string()), (score_column, pa.float32())]
@@ -355,7 +547,7 @@ def process_relevant(
                     pbar.update(len(relevant_chunk_df))
                     continue
 
-                scores_chunk = rerank(
+                scores_chunk = safe_rerank(
                     tokenizer,
                     reranker,
                     merged_chunk_df["query_text"].values.tolist(),
@@ -449,7 +641,23 @@ if __name__ == "__main__":
         "--reranker_batch_size",
         type=int,
         default=None,
-        help="Batch size for reranker",
+        help="Explicit reranker batch size. If omitted, a short startup benchmark selects it automatically.",
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_candidates",
+        type=str,
+        default=None,
+        help="Comma-separated reranker batch sizes to benchmark. Defaults to powers of two between min and max.",
+    )
+    parser.add_argument("--auto_reranker_batch_size_min", type=int, default=None)
+    parser.add_argument("--auto_reranker_batch_size_max", type=int, default=None)
+    parser.add_argument("--auto_reranker_batch_size_sample_size", type=int, default=None)
+    parser.add_argument("--auto_reranker_batch_size_memory_utilization", type=float, default=None)
+    parser.add_argument(
+        "--legacy-env-reranker-batch-size",
+        dest="use_legacy_env_reranker_batch_size",
+        action="store_true",
+        help="Use RERANKER_BATCH_SIZE from .env when stage-specific batch size is not set.",
     )
     parser.add_argument(
         "--reranker_model_name",
@@ -474,6 +682,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     stage_defaults = get_positive_ranks_stage_defaults(args.final_step)
+    auto_defaults = get_positive_ranks_auto_batch_defaults(args.final_step)
+
+    reranker_batch_size = args.reranker_batch_size
+    if reranker_batch_size is None:
+        reranker_batch_size = stage_defaults["reranker_batch_size"]
+    if reranker_batch_size is None and args.use_legacy_env_reranker_batch_size:
+        reranker_batch_size = _config_first_optional(("RERANKER_BATCH_SIZE",), cast=int)
 
     process_relevant(
         queries_path=args.queries_path,
@@ -481,9 +696,30 @@ if __name__ == "__main__":
         relevant_path=args.relevant_path,
         output_path=args.output_path or stage_defaults["output_path"],
         chunk_size=args.chunk_size,
-        reranker_batch_size=args.reranker_batch_size or stage_defaults["reranker_batch_size"],
+        reranker_batch_size=reranker_batch_size,
         reranker_model_name=args.reranker_model_name or stage_defaults["reranker_model_name"],
         score_column=args.score_column or stage_defaults["score_column"],
         skip=args.skip,
         offset=args.offset,
+        auto_reranker_batch_size_candidates=(
+            args.auto_reranker_batch_size_candidates
+            if args.auto_reranker_batch_size_candidates is not None
+            else auto_defaults["candidates"]
+        ),
+        auto_reranker_batch_size_min=(
+            args.auto_reranker_batch_size_min if args.auto_reranker_batch_size_min is not None else auto_defaults["min"]
+        ),
+        auto_reranker_batch_size_max=(
+            args.auto_reranker_batch_size_max if args.auto_reranker_batch_size_max is not None else auto_defaults["max"]
+        ),
+        auto_reranker_batch_size_sample_size=(
+            args.auto_reranker_batch_size_sample_size
+            if args.auto_reranker_batch_size_sample_size is not None
+            else auto_defaults["sample_size"]
+        ),
+        auto_reranker_batch_size_memory_utilization=(
+            args.auto_reranker_batch_size_memory_utilization
+            if args.auto_reranker_batch_size_memory_utilization is not None
+            else auto_defaults["memory_utilization"]
+        ),
     )

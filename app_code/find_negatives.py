@@ -1,8 +1,6 @@
 import argparse
 import logging
 import os
-import threading
-import time
 from datetime import datetime
 from functools import partial
 
@@ -10,6 +8,16 @@ import pandas as pd
 from decouple import config
 from tqdm import tqdm
 
+from batch_tuning import (
+    OOMRetryReranker,
+    benchmark_embedding_batch_size,
+    parse_batch_size_candidates,
+    set_dense_embedding_batch_size,
+    validate_batch_size_options,
+)
+from batch_tuning import (
+    benchmark_reranker_batch_size as benchmark_single_reranker_batch_size,
+)
 from config import get_vector_db_backend
 from models import get_dense_model, get_sparse_model, rerank
 from multi_gpu_processor import (
@@ -37,13 +45,6 @@ def _import_torch():
     return torch
 
 
-def _import_torch_or_none():
-    try:
-        return _import_torch()
-    except ImportError:
-        return None
-
-
 def get_negative_mining_stage_defaults() -> dict:
     return {
         "candidate_beta": config("CANDIDATE_BETA", cast=float, default=config("BETA", cast=float, default=0.01)),
@@ -59,84 +60,6 @@ def get_negative_mining_stage_defaults() -> dict:
     }
 
 
-def parse_batch_size_candidates(raw_candidates: str | None, minimum: int, maximum: int) -> list[int]:
-    if raw_candidates:
-        candidates = [int(item.strip()) for item in raw_candidates.split(",") if item.strip()]
-    else:
-        candidates = []
-        value = minimum
-        while value <= maximum:
-            candidates.append(value)
-            value *= 2
-        if maximum not in candidates:
-            candidates.append(maximum)
-
-    candidates = sorted({candidate for candidate in candidates if candidate > 0})
-    if not candidates:
-        raise ValueError("Auto batch-size candidates must contain at least one positive integer")
-    return candidates
-
-
-def is_cuda_oom(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return "out of memory" in text or exc.__class__.__name__ == "OutOfMemoryError"
-
-
-def clear_cuda_cache(device_id: int | None = None) -> None:
-    try:
-        torch = _import_torch_or_none()
-        if torch is None:
-            return
-        if torch.cuda.is_available():
-            if device_id is None:
-                for gpu_id in range(torch.cuda.device_count()):
-                    with torch.cuda.device(gpu_id):
-                        torch.cuda.empty_cache()
-            else:
-                with torch.cuda.device(device_id):
-                    torch.cuda.empty_cache()
-            synchronize_cuda(device_id)
-    except Exception:
-        return
-
-
-def synchronize_cuda(device_id: int | None = None) -> None:
-    try:
-        torch = _import_torch_or_none()
-        if torch is None:
-            return
-        if torch.cuda.is_available():
-            if device_id is None:
-                for gpu_id in range(torch.cuda.device_count()):
-                    torch.cuda.synchronize(gpu_id)
-            else:
-                torch.cuda.synchronize(device_id)
-    except Exception:
-        return
-
-
-def set_dense_embedding_batch_size(dense_embeddings, batch_size: int) -> None:
-    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
-    if isinstance(encode_kwargs, dict):
-        encode_kwargs["batch_size"] = batch_size
-    if hasattr(dense_embeddings, "batch_size"):
-        dense_embeddings.batch_size = batch_size
-
-
-def embed_dense_documents(dense_embeddings, texts: list[str]):
-    client = getattr(dense_embeddings, "_client", None)
-    encode_kwargs = getattr(dense_embeddings, "encode_kwargs", None)
-    if client is not None and isinstance(encode_kwargs, dict) and hasattr(client, "encode"):
-        texts = [text.replace("\n", " ") for text in texts]
-        return client.encode(
-            texts,
-            show_progress_bar=getattr(dense_embeddings, "show_progress", False),
-            **encode_kwargs,
-        )
-
-    return dense_embeddings.embed_documents(texts)
-
-
 def collect_query_text_sample(queries: list[dict], sample_size: int) -> list[str]:
     if sample_size <= 0:
         return []
@@ -149,186 +72,6 @@ def collect_query_text_sample(queries: list[dict], sample_size: int) -> list[str
             if len(sample) >= sample_size:
                 break
     return sample
-
-
-def _cuda_memory_allocated(device_id: int | None) -> int | None:
-    torch = _import_torch_or_none()
-    if torch is None:
-        return None
-    if device_id is None or not torch.cuda.is_available():
-        return None
-    try:
-        return torch.cuda.memory_allocated(device_id)
-    except Exception:
-        return None
-
-
-def _cuda_peak_memory_allocated(device_id: int | None) -> int | None:
-    torch = _import_torch_or_none()
-    if torch is None:
-        return None
-    if device_id is None or not torch.cuda.is_available():
-        return None
-    try:
-        return torch.cuda.max_memory_allocated(device_id)
-    except Exception:
-        return None
-
-
-def _reset_cuda_peak_memory(device_id: int | None) -> None:
-    torch = _import_torch_or_none()
-    if torch is None:
-        return
-    if device_id is None or not torch.cuda.is_available():
-        return
-    try:
-        torch.cuda.reset_peak_memory_stats(device_id)
-    except Exception:
-        return
-
-
-def _cuda_free_memory(device_id: int | None) -> int | None:
-    torch = _import_torch_or_none()
-    if torch is None:
-        return None
-    if device_id is None or not torch.cuda.is_available():
-        return None
-    try:
-        free, _ = torch.cuda.mem_get_info(device_id)
-        return free
-    except Exception:
-        return None
-
-
-def _format_bytes(value: int | None) -> str:
-    if value is None:
-        return "unknown"
-
-    out = float(value)
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if out < 1024 or unit == "GiB":
-            return f"{out:.1f} {unit}"
-        out /= 1024
-    return f"{out:.1f} GiB"
-
-
-def _should_skip_candidate_for_memory(
-    candidate: int,
-    previous_candidate: int | None,
-    previous_peak_extra: int | None,
-    device_id: int | None,
-    memory_utilization: float,
-) -> bool:
-    if previous_candidate is None or previous_peak_extra is None or previous_peak_extra <= 0:
-        return False
-
-    free_memory = _cuda_free_memory(device_id)
-    if free_memory is None:
-        return False
-
-    estimated_extra = int(previous_peak_extra * (candidate / previous_candidate))
-    allowed_extra = int(free_memory * memory_utilization)
-    return estimated_extra > allowed_extra
-
-
-def benchmark_batch_size(
-    label: str,
-    item_label: str,
-    sample_count: int,
-    candidates: list[int],
-    run_once,
-    device_id: int | None,
-    memory_utilization: float,
-) -> int:
-    if sample_count <= 0:
-        selected = candidates[0]
-        logger.warning("No samples available for %s auto-tuning; using batch_size=%s", label, selected)
-        return selected
-
-    logger.info("Auto-tuning %s batch size on %s sample %s", label, sample_count, item_label)
-    results: list[tuple[float, int]] = []
-    previous_candidate = None
-    previous_peak_extra = None
-
-    for candidate in candidates:
-        clear_cuda_cache(device_id)
-        if _should_skip_candidate_for_memory(
-            candidate,
-            previous_candidate,
-            previous_peak_extra,
-            device_id,
-            memory_utilization,
-        ):
-            logger.info(
-                "  batch_size=%s: skipped to keep CUDA memory headroom after batch_size=%s",
-                candidate,
-                previous_candidate,
-            )
-            break
-
-        baseline_allocated = _cuda_memory_allocated(device_id)
-        _reset_cuda_peak_memory(device_id)
-        started_at = time.perf_counter()
-        try:
-            run_once(candidate)
-            synchronize_cuda(device_id)
-        except Exception as exc:
-            clear_cuda_cache(device_id)
-            if is_cuda_oom(exc):
-                logger.info("  batch_size=%s: CUDA OOM, stopping candidate search", candidate)
-                break
-            logger.warning("  batch_size=%s: failed (%s: %s)", candidate, type(exc).__name__, exc)
-            continue
-
-        elapsed = max(time.perf_counter() - started_at, 1e-9)
-        items_per_second = sample_count / elapsed
-        peak_allocated = _cuda_peak_memory_allocated(device_id)
-        peak_extra = None
-        if baseline_allocated is not None and peak_allocated is not None:
-            peak_extra = max(0, peak_allocated - baseline_allocated)
-
-        logger.info(
-            "  batch_size=%s: %.1f %s/s (%.2fs, peak extra %s)",
-            candidate,
-            items_per_second,
-            item_label,
-            elapsed,
-            _format_bytes(peak_extra),
-        )
-        results.append((items_per_second, candidate))
-        previous_candidate = candidate
-        previous_peak_extra = peak_extra
-
-    if not results:
-        raise RuntimeError(f"Could not find a working {label} batch size")
-
-    best_speed = max(speed for speed, _ in results)
-    selected = min(candidate for speed, candidate in results if speed >= best_speed * 0.98)
-    logger.info("Selected %s batch size: %s", label, selected)
-    return selected
-
-
-def benchmark_embedding_batch_size(
-    dense_embeddings,
-    sample_texts: list[str],
-    candidates: list[int],
-    memory_utilization: float,
-) -> int:
-    def run_once(candidate: int) -> None:
-        set_dense_embedding_batch_size(dense_embeddings, candidate)
-        embed_dense_documents(dense_embeddings, sample_texts)
-
-    selected = benchmark_batch_size(
-        label="embedding",
-        item_label="texts",
-        sample_count=len(sample_texts),
-        candidates=candidates,
-        run_once=run_once,
-        device_id=0,
-        memory_utilization=memory_utilization,
-    )
-    set_dense_embedding_batch_size(dense_embeddings, selected)
-    return selected
 
 
 def collect_reranker_sample_pairs(
@@ -378,7 +121,7 @@ def collect_reranker_sample_pairs(
     return sample_queries, sample_docs
 
 
-def benchmark_reranker_batch_size(
+def benchmark_model_sets_reranker_batch_size(
     model_sets,
     rerank_function,
     sample_queries: list[str],
@@ -395,23 +138,17 @@ def benchmark_reranker_batch_size(
             continue
         seen_gpu_ids.add(gpu_id)
 
-        def run_once(candidate: int, current_model_set=model_set) -> None:
-            rerank_function(
-                current_model_set.reranker_tokenizer,
-                current_model_set.reranker_model,
-                sample_queries,
-                sample_docs,
-                batch_size=candidate,
-            )
-
-        selected = benchmark_batch_size(
-            label=f"reranker GPU {gpu_id}",
-            item_label="pairs",
-            sample_count=len(sample_docs),
-            candidates=candidates,
-            run_once=run_once,
-            device_id=gpu_id,
+        selected = benchmark_single_reranker_batch_size(
+            model_set.reranker_tokenizer,
+            model_set.reranker_model,
+            sample_queries,
+            sample_docs,
+            candidates,
+            rerank_function,
             memory_utilization=memory_utilization,
+            device_id=gpu_id,
+            label=f"reranker GPU {gpu_id}",
+            logger=logger,
         )
         selected_by_gpu.append((gpu_id, selected))
 
@@ -423,66 +160,6 @@ def benchmark_reranker_batch_size(
         details = ", ".join(f"gpu{gpu_id}={batch_size}" for gpu_id, batch_size in selected_by_gpu)
         logger.info("Selected global reranker batch size: %s (%s)", selected, details)
     return selected
-
-
-class OOMRetryReranker:
-    def __init__(self, rerank_function, initial_batch_size: int):
-        self.rerank_function = rerank_function
-        self.current_batch_size = max(1, initial_batch_size)
-        self.lock = threading.Lock()
-
-    def __call__(self, tokenizer, model, query, answers: list[str], batch_size: int = 16) -> list[float]:
-        requested_batch_size = max(1, int(batch_size or self.current_batch_size))
-        with self.lock:
-            effective_batch_size = min(requested_batch_size, self.current_batch_size)
-
-        while True:
-            try:
-                return self.rerank_function(
-                    tokenizer,
-                    model,
-                    query,
-                    answers,
-                    batch_size=effective_batch_size,
-                )
-            except Exception as exc:
-                if not is_cuda_oom(exc) or effective_batch_size <= 1:
-                    raise
-
-                next_batch_size = max(1, effective_batch_size // 2)
-                with self.lock:
-                    self.current_batch_size = min(self.current_batch_size, next_batch_size)
-                clear_cuda_cache()
-                logger.warning(
-                    "Reranker CUDA OOM at batch_size=%s; retrying with batch_size=%s",
-                    effective_batch_size,
-                    next_batch_size,
-                )
-                effective_batch_size = next_batch_size
-
-
-def validate_batch_size_options(
-    explicit_batch_size: int | None,
-    minimum: int,
-    maximum: int,
-    sample_size: int,
-    memory_utilization: float,
-    option_name: str,
-) -> None:
-    if explicit_batch_size is not None and explicit_batch_size <= 0:
-        raise ValueError(f"--{option_name}_batch_size must be greater than 0")
-    if minimum <= 0 or maximum <= 0:
-        raise ValueError(
-            f"--auto_{option_name}_batch_size_min and --auto_{option_name}_batch_size_max must be greater than 0"
-        )
-    if minimum > maximum:
-        raise ValueError(
-            f"--auto_{option_name}_batch_size_min cannot be greater than --auto_{option_name}_batch_size_max"
-        )
-    if sample_size < 0:
-        raise ValueError(f"--auto_{option_name}_batch_size_sample_size must be greater than or equal to 0")
-    if not 0 < memory_utilization <= 1:
-        raise ValueError(f"--auto_{option_name}_batch_size_memory_utilization must be in the (0, 1] range")
 
 
 def find_negatives_multigpu(
@@ -612,6 +289,7 @@ def find_negatives_multigpu(
             embedding_sample,
             embedding_candidates,
             auto_embedding_batch_size_memory_utilization,
+            logger=logger,
         )
     else:
         set_dense_embedding_batch_size(dense_model_vs, effective_embedding_batch_size)
@@ -667,7 +345,7 @@ def find_negatives_multigpu(
             vector_backend,
             auto_reranker_batch_size_sample_size,
         )
-        reranker_batch_size = benchmark_reranker_batch_size(
+        reranker_batch_size = benchmark_model_sets_reranker_batch_size(
             model_sets,
             rerank_function,
             sample_queries,
@@ -678,7 +356,8 @@ def find_negatives_multigpu(
     else:
         logger.info("Using explicit reranker batch size: %s", reranker_batch_size)
 
-    safe_rerank_function = OOMRetryReranker(rerank_function, reranker_batch_size)
+    assert reranker_batch_size is not None
+    safe_rerank_function = OOMRetryReranker(rerank_function, reranker_batch_size, logger=logger)
     logger.info("Effective embedding batch size: %s", effective_embedding_batch_size)
     logger.info("Effective reranker batch size: %s", reranker_batch_size)
 

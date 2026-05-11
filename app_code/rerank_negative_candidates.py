@@ -3,15 +3,22 @@ import json
 import os
 from collections import Counter, defaultdict
 from collections.abc import Iterable
+from functools import partial
 from typing import Any, TypedDict
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from decouple import config
+from decouple import UndefinedValueError, config
 from tqdm import tqdm
 
+from batch_tuning import (
+    OOMRetryReranker,
+    benchmark_reranker_batch_size,
+    parse_batch_size_candidates,
+    validate_batch_size_options,
+)
 from models import get_reranker_model, rerank
 
 ADAPTIVE_RERANK_FIELDS = (
@@ -30,6 +37,15 @@ class AdaptiveQueryReportRow(TypedDict):
     candidate_rows: int
     scored_rows: int
     budget_limit: int
+
+
+def _config_optional(name: str, *, cast=None, default=None):
+    try:
+        if cast is None:
+            return config(name)
+        return config(name, cast=cast)
+    except UndefinedValueError:
+        return default
 
 
 def _pack_pair(query_id: str, document_id: str) -> str:
@@ -329,6 +345,88 @@ def _prepare_candidates(candidates_df: pd.DataFrame, candidate_score_column: str
     return candidates_df.drop_duplicates(subset=["query_id", "document_id"], keep="first")
 
 
+def _collect_reranker_sample_from_candidate_rows(
+    candidates_df: pd.DataFrame,
+    queries: dict[str, str],
+    corpus: dict[str, str],
+    sample_size: int,
+    already_scored: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    if sample_size <= 0:
+        return [], []
+
+    already_scored = already_scored or set()
+    sample_queries: list[str] = []
+    sample_docs: list[str] = []
+    for row in candidates_df[["query_id", "document_id"]].itertuples(index=False):
+        query_id = str(row.query_id)
+        document_id = str(row.document_id)
+        if _pack_pair(query_id, document_id) in already_scored:
+            continue
+        query_text = queries.get(query_id)
+        document_text = corpus.get(document_id)
+        if query_text is None or document_text is None:
+            continue
+        sample_queries.append(query_text)
+        sample_docs.append(document_text)
+        if len(sample_docs) >= sample_size:
+            break
+    return sample_queries, sample_docs
+
+
+def _collect_reranker_sample_from_candidate_file(
+    candidates_path: str,
+    queries_df: pd.DataFrame,
+    corpus_df: pd.DataFrame,
+    selected_only: bool,
+    candidate_selected_column: str,
+    already_scored: set[str],
+    sample_size: int,
+    chunk_size: int,
+) -> tuple[list[str], list[str]]:
+    if sample_size <= 0:
+        return [], []
+
+    sample_queries: list[str] = []
+    sample_docs: list[str] = []
+    batch_size = max(1, min(chunk_size, max(sample_size * 4, 1)))
+    pf = pq.ParquetFile(candidates_path)
+    for batch in pf.iter_batches(batch_size=batch_size):
+        candidates_df = batch.to_pandas()
+        if candidates_df.empty:
+            continue
+
+        candidates_df["query_id"] = candidates_df["query_id"].astype("string")
+        candidates_df["document_id"] = candidates_df["document_id"].astype("string")
+
+        if selected_only and candidate_selected_column in candidates_df.columns:
+            candidates_df = candidates_df[candidates_df[candidate_selected_column].fillna(False)]
+        if candidates_df.empty:
+            continue
+
+        if already_scored:
+            packed = (
+                _pack_pair(query_id, document_id)
+                for query_id, document_id in zip(candidates_df["query_id"].values, candidates_df["document_id"].values)
+            )
+            candidates_df = candidates_df.loc[[key not in already_scored for key in packed]]
+        if candidates_df.empty:
+            continue
+
+        merged_df = pd.merge(candidates_df, queries_df, left_on="query_id", right_index=True, how="inner")
+        merged_df = pd.merge(merged_df, corpus_df, left_on="document_id", right_index=True, how="inner")
+        if merged_df.empty:
+            continue
+
+        for query_text, document_text in zip(merged_df["query_text"].values, merged_df["document_text"].values):
+            sample_queries.append(str(query_text))
+            sample_docs.append(str(document_text))
+            if len(sample_docs) >= sample_size:
+                return sample_queries, sample_docs
+
+    return sample_queries, sample_docs
+
+
 def _write_report(report_path: str | None, report: dict) -> None:
     if not report_path:
         return
@@ -345,7 +443,7 @@ def rerank_candidates_adaptive(
     relevant_path: str,
     output_path: str,
     reranker_model_name: str,
-    reranker_batch_size: int,
+    reranker_batch_size: int | None,
     ranking_column: str,
     candidate_selected_column: str,
     candidate_score_column: str | None,
@@ -359,7 +457,20 @@ def rerank_candidates_adaptive(
     resume: bool,
     row_group_size: int,
     report_path: str | None,
+    auto_reranker_batch_size_candidates: str | None = None,
+    auto_reranker_batch_size_min: int = 1,
+    auto_reranker_batch_size_max: int = 64,
+    auto_reranker_batch_size_sample_size: int = 128,
+    auto_reranker_batch_size_memory_utilization: float = 0.70,
 ) -> None:
+    validate_batch_size_options(
+        reranker_batch_size,
+        auto_reranker_batch_size_min,
+        auto_reranker_batch_size_max,
+        auto_reranker_batch_size_sample_size,
+        auto_reranker_batch_size_memory_utilization,
+        "reranker",
+    )
     num_negatives = _positive_int(num_negatives, "num_negatives")
     initial_budget = _positive_int(initial_budget, "initial_budget")
     budget_step = _positive_int(budget_step, "budget_step")
@@ -406,6 +517,34 @@ def rerank_candidates_adaptive(
 
     tokenizer, reranker_model = get_reranker_model(reranker_model_name)
     print("Final reranker loaded.")
+    rerank_function = partial(rerank, model_name=reranker_model_name)
+    if reranker_batch_size is None:
+        candidates = parse_batch_size_candidates(
+            auto_reranker_batch_size_candidates,
+            minimum=auto_reranker_batch_size_min,
+            maximum=auto_reranker_batch_size_max,
+        )
+        sample_queries, sample_docs = _collect_reranker_sample_from_candidate_rows(
+            candidates_df,
+            queries,
+            corpus,
+            auto_reranker_batch_size_sample_size,
+            already_scored=set(already_scored_rows),
+        )
+        reranker_batch_size = benchmark_reranker_batch_size(
+            tokenizer,
+            reranker_model,
+            sample_queries,
+            sample_docs,
+            candidates,
+            rerank_function,
+            memory_utilization=auto_reranker_batch_size_memory_utilization,
+        )
+    else:
+        print(f"Using explicit reranker batch size: {reranker_batch_size}")
+    assert reranker_batch_size is not None
+    safe_rerank = OOMRetryReranker(rerank_function, reranker_batch_size)
+    print(f"Effective reranker batch size: {reranker_batch_size}")
 
     output_schema = _output_schema(candidates_path, ranking_column, include_adaptive_fields=True)
     newly_scored = 0
@@ -459,13 +598,12 @@ def rerank_candidates_adaptive(
                         budget_limit = min(max_budget, budget_limit + budget_step)
                         continue
 
-                    scores = rerank(
+                    scores = safe_rerank(
                         tokenizer,
                         reranker_model,
                         rerank_queries,
                         rerank_docs,
                         batch_size=reranker_batch_size,
-                        model_name=reranker_model_name,
                     )
                     percentiles = _percentile_from_ecdf(np.array(scores, dtype=float), ecdf_x, ecdf_y)
 
@@ -539,7 +677,7 @@ def rerank_candidates(
     corpus_path: str,
     output_path: str,
     reranker_model_name: str,
-    reranker_batch_size: int,
+    reranker_batch_size: int | None,
     ranking_column: str = "final_ranking",
     candidate_selected_column: str = "candidate_selected",
     selected_only: bool = True,
@@ -557,11 +695,22 @@ def rerank_candidates(
     budget_step: int = 10,
     max_budget: int = 80,
     report_path: str | None = None,
+    auto_reranker_batch_size_candidates: str | None = None,
+    auto_reranker_batch_size_min: int = 1,
+    auto_reranker_batch_size_max: int = 64,
+    auto_reranker_batch_size_sample_size: int = 128,
+    auto_reranker_batch_size_memory_utilization: float = 0.70,
 ) -> None:
     if not ranking_column:
         raise ValueError("ranking_column must not be empty")
-    if reranker_batch_size <= 0:
-        raise ValueError("reranker_batch_size must be greater than 0")
+    validate_batch_size_options(
+        reranker_batch_size,
+        auto_reranker_batch_size_min,
+        auto_reranker_batch_size_max,
+        auto_reranker_batch_size_sample_size,
+        auto_reranker_batch_size_memory_utilization,
+        "reranker",
+    )
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
     if row_group_size <= 0:
@@ -593,6 +742,11 @@ def rerank_candidates(
             resume=resume,
             row_group_size=row_group_size,
             report_path=report_path,
+            auto_reranker_batch_size_candidates=auto_reranker_batch_size_candidates,
+            auto_reranker_batch_size_min=auto_reranker_batch_size_min,
+            auto_reranker_batch_size_max=auto_reranker_batch_size_max,
+            auto_reranker_batch_size_sample_size=auto_reranker_batch_size_sample_size,
+            auto_reranker_batch_size_memory_utilization=auto_reranker_batch_size_memory_utilization,
         )
         return
 
@@ -620,6 +774,37 @@ def rerank_candidates(
 
     tokenizer, reranker_model = get_reranker_model(reranker_model_name)
     print("Final reranker loaded.")
+    rerank_function = partial(rerank, model_name=reranker_model_name)
+    if reranker_batch_size is None:
+        candidates = parse_batch_size_candidates(
+            auto_reranker_batch_size_candidates,
+            minimum=auto_reranker_batch_size_min,
+            maximum=auto_reranker_batch_size_max,
+        )
+        sample_queries, sample_docs = _collect_reranker_sample_from_candidate_file(
+            candidates_path,
+            queries_df,
+            corpus_df,
+            selected_only,
+            candidate_selected_column,
+            already_scored,
+            auto_reranker_batch_size_sample_size,
+            chunk_size,
+        )
+        reranker_batch_size = benchmark_reranker_batch_size(
+            tokenizer,
+            reranker_model,
+            sample_queries,
+            sample_docs,
+            candidates,
+            rerank_function,
+            memory_utilization=auto_reranker_batch_size_memory_utilization,
+        )
+    else:
+        print(f"Using explicit reranker batch size: {reranker_batch_size}")
+    assert reranker_batch_size is not None
+    safe_rerank = OOMRetryReranker(rerank_function, reranker_batch_size)
+    print(f"Effective reranker batch size: {reranker_batch_size}")
 
     output_schema = _output_schema(candidates_path, ranking_column)
     pf = pq.ParquetFile(candidates_path)
@@ -670,13 +855,12 @@ def rerank_candidates(
                 if merged_df.empty:
                     continue
 
-                scores = rerank(
+                scores = safe_rerank(
                     tokenizer,
                     reranker_model,
                     merged_df["query_text"].values.tolist(),
                     merged_df["document_text"].values.tolist(),
                     batch_size=reranker_batch_size,
-                    model_name=reranker_model_name,
                 )
 
                 rows = [
@@ -708,7 +892,34 @@ def main() -> None:
     parser.add_argument(
         "--reranker_batch_size",
         type=int,
-        default=config("FINAL_RERANKER_BATCH_SIZE", cast=int, default=config("RERANKER_BATCH_SIZE", cast=int)),
+        default=_config_optional("FINAL_RERANKER_BATCH_SIZE", cast=int),
+        help="Explicit reranker batch size. If omitted, a short startup benchmark selects it automatically.",
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_candidates",
+        type=str,
+        default=config("FINAL_AUTO_RERANKER_BATCH_SIZE_CANDIDATES", default=None),
+        help="Comma-separated reranker batch sizes to benchmark. Defaults to powers of two between min and max.",
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_min",
+        type=int,
+        default=config("FINAL_AUTO_RERANKER_BATCH_SIZE_MIN", cast=int, default=1),
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_max",
+        type=int,
+        default=config("FINAL_AUTO_RERANKER_BATCH_SIZE_MAX", cast=int, default=64),
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_sample_size",
+        type=int,
+        default=config("FINAL_AUTO_RERANKER_BATCH_SIZE_SAMPLE_SIZE", cast=int, default=128),
+    )
+    parser.add_argument(
+        "--auto_reranker_batch_size_memory_utilization",
+        type=float,
+        default=config("FINAL_AUTO_RERANKER_BATCH_SIZE_MEMORY_UTILIZATION", cast=float, default=0.70),
     )
     parser.add_argument(
         "--ranking_column",
@@ -807,6 +1018,11 @@ def main() -> None:
         budget_step=args.budget_step,
         max_budget=args.max_budget,
         report_path=report_path,
+        auto_reranker_batch_size_candidates=args.auto_reranker_batch_size_candidates,
+        auto_reranker_batch_size_min=args.auto_reranker_batch_size_min,
+        auto_reranker_batch_size_max=args.auto_reranker_batch_size_max,
+        auto_reranker_batch_size_sample_size=args.auto_reranker_batch_size_sample_size,
+        auto_reranker_batch_size_memory_utilization=args.auto_reranker_batch_size_memory_utilization,
     )
 
 

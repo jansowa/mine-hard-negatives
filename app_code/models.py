@@ -16,6 +16,7 @@ def _import_torch():
 
     return torch
 
+
 try:
     from tensorrt import TensorRTDenseEmbeddings, TensorRTReranker, is_tensorrt_model_path
 except ImportError:
