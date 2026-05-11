@@ -7,7 +7,6 @@ from datetime import datetime
 from functools import partial
 
 import pandas as pd
-import torch
 from decouple import config
 from tqdm import tqdm
 
@@ -30,6 +29,19 @@ logging.basicConfig(
     handlers=[logging.FileHandler(log_filename), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+def _import_torch():
+    import torch
+
+    return torch
+
+
+def _import_torch_or_none():
+    try:
+        return _import_torch()
+    except ImportError:
+        return None
 
 
 def get_negative_mining_stage_defaults() -> dict:
@@ -72,6 +84,9 @@ def is_cuda_oom(exc: BaseException) -> bool:
 
 def clear_cuda_cache(device_id: int | None = None) -> None:
     try:
+        torch = _import_torch_or_none()
+        if torch is None:
+            return
         if torch.cuda.is_available():
             if device_id is None:
                 for gpu_id in range(torch.cuda.device_count()):
@@ -87,6 +102,9 @@ def clear_cuda_cache(device_id: int | None = None) -> None:
 
 def synchronize_cuda(device_id: int | None = None) -> None:
     try:
+        torch = _import_torch_or_none()
+        if torch is None:
+            return
         if torch.cuda.is_available():
             if device_id is None:
                 for gpu_id in range(torch.cuda.device_count()):
@@ -134,6 +152,9 @@ def collect_query_text_sample(queries: list[dict], sample_size: int) -> list[str
 
 
 def _cuda_memory_allocated(device_id: int | None) -> int | None:
+    torch = _import_torch_or_none()
+    if torch is None:
+        return None
     if device_id is None or not torch.cuda.is_available():
         return None
     try:
@@ -143,6 +164,9 @@ def _cuda_memory_allocated(device_id: int | None) -> int | None:
 
 
 def _cuda_peak_memory_allocated(device_id: int | None) -> int | None:
+    torch = _import_torch_or_none()
+    if torch is None:
+        return None
     if device_id is None or not torch.cuda.is_available():
         return None
     try:
@@ -152,6 +176,9 @@ def _cuda_peak_memory_allocated(device_id: int | None) -> int | None:
 
 
 def _reset_cuda_peak_memory(device_id: int | None) -> None:
+    torch = _import_torch_or_none()
+    if torch is None:
+        return
     if device_id is None or not torch.cuda.is_available():
         return
     try:
@@ -161,6 +188,9 @@ def _reset_cuda_peak_memory(device_id: int | None) -> None:
 
 
 def _cuda_free_memory(device_id: int | None) -> int | None:
+    torch = _import_torch_or_none()
+    if torch is None:
+        return None
     if device_id is None or not torch.cuda.is_available():
         return None
     try:
@@ -525,6 +555,7 @@ def find_negatives_multigpu(
         "reranker",
     )
 
+    torch = _import_torch()
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         raise RuntimeError("No CUDA devices available")

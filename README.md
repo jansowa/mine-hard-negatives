@@ -49,7 +49,7 @@ This starts the `executable` container and optional `vdb` service based on Qdran
 
 ## Updating Requirements
 
-The `.in` files are the source of truth. Compile pinned requirements with `uv`:
+The runtime `.in` files are the source of truth. Compile pinned requirements with `uv`:
 
 ```bash
 uv pip compile requirements-lancedb.in -o requirements-lancedb.txt \
@@ -66,6 +66,10 @@ uv pip compile requirements.in -o requirements.txt \
   --emit-index-url \
   --emit-find-links
 ```
+
+GitHub CI uses `requirements-ci.txt`, maintained alongside the deliberately lightweight `requirements-ci.in`
+direct dependency set for `make check`. Keep runtime mining dependencies such as PyTorch, LanceDB/Qdrant,
+Transformers, and FlagEmbedding in the production requirement files unless a unit test truly needs them.
 
 ## Code quality
 

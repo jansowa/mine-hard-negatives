@@ -1,12 +1,20 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
-import torch
 from decouple import config
-from langchain_huggingface import HuggingFaceEmbeddings
-from transformers import AutoModelForMaskedLM, AutoModelForSequenceClassification, AutoTokenizer
+
+if TYPE_CHECKING:
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+
+def _import_torch():
+    import torch
+
+    return torch
 
 try:
     from tensorrt import TensorRTDenseEmbeddings, TensorRTReranker, is_tensorrt_model_path
@@ -53,6 +61,9 @@ class SpladeEmbedding(SparseEmbeddingsBase):
     def __init__(
         self, model_name, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0
     ):
+        torch = _import_torch()
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForMaskedLM.from_pretrained(
             model_name, device_map=f"cuda:{gpu_id}", torch_dtype=torch.float16
@@ -62,6 +73,7 @@ class SpladeEmbedding(SparseEmbeddingsBase):
         self.batch_size = batch_size
 
     def _encode_splade_batch(self, texts: list[str]) -> list[SparseVectorLike]:
+        torch = _import_torch()
         inputs = self.tokenizer(
             texts,
             padding="longest",
@@ -105,6 +117,9 @@ def get_sparse_model(
 def get_dense_model(
     model_name: str, batch_size: int = config("EMBEDDER_BATCH_SIZE", cast=int, default=16), gpu_id: int = 0, prompt=""
 ) -> HuggingFaceEmbeddings:
+    torch = _import_torch()
+    from langchain_huggingface import HuggingFaceEmbeddings
+
     if is_tensorrt_model_path(model_name):
         return TensorRTDenseEmbeddings(model_name, batch_size=batch_size, prompt=prompt, gpu_id=gpu_id)
 
@@ -149,6 +164,10 @@ def get_reranker_model(
         )
         # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
+
+    torch = _import_torch()
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print(f"Using {torch.cuda.device_count()} GPUs for reranker model")
@@ -187,6 +206,7 @@ def rerank(
             results += model.compute_score(batch_texts, **additional_params)
         return results
 
+    torch = _import_torch()
     result_batches: list[np.ndarray] = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i : i + batch_size]

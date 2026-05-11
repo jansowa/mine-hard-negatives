@@ -1,0 +1,19 @@
+# Lightweight dependencies for GitHub CI.
+#
+# This pins the direct packages from requirements-ci.in and intentionally leaves
+# transitive resolution to pip. The production/HPC dependency sets remain in
+# requirements*.txt.
+datasets==4.8.4
+huggingface-hub==0.36.2
+langchain-core==1.2.28
+mypy==2.0.0
+numpy==2.4.4
+pandas==3.0.2
+polars==1.39.3
+pyarrow==23.0.1
+pytest==9.0.3
+python-decouple==3.8
+rapidfuzz==3.14.5
+ruff==0.15.12
+simhash==2.1.2
+tqdm==4.67.3

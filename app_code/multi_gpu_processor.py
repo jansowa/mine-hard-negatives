@@ -9,8 +9,13 @@ from queue import Empty, Queue
 
 import numpy as np
 import pandas as pd
-import torch
 from decouple import config
+
+
+def _import_torch():
+    import torch
+
+    return torch
 
 
 class TimingStats:
@@ -817,6 +822,7 @@ def setup_multi_gpu_models(
     if logger is None:
         logger = logging.getLogger(__name__)
 
+    torch = _import_torch()
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         raise RuntimeError("No CUDA devices available")

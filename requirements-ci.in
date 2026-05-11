@@ -1,0 +1,19 @@
+# Lightweight dependencies for GitHub CI.
+#
+# Keep this focused on linting, type-checking, and unit tests. Runtime mining
+# dependencies such as torch, transformers, lancedb, qdrant, and FlagEmbedding
+# are intentionally excluded from CI so GitHub jobs do not download GPU stacks.
+datasets
+huggingface-hub
+langchain-core
+mypy
+numpy
+pandas
+polars
+pyarrow
+pytest
+python-decouple
+rapidfuzz
+ruff
+simhash
+tqdm
