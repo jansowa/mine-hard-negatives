@@ -43,6 +43,15 @@ class FakeBackend:
         return []
 
 
+class PreparingBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.prepared_query_batches = []
+
+    def prepare_query_vectors(self, query_texts):
+        self.prepared_query_batches.append(list(query_texts))
+
+
 def _build_model_set_for_test():
     model_set = GPUModelSet.__new__(GPUModelSet)
     model_set.reranker_tokenizer = object()
@@ -117,6 +126,39 @@ def test_process_query_batch_marks_candidates_without_dropping_unselected():
     assert selected_by_doc == {"d1": True, "d2": False}
     assert all("candidate_percentile" in row for row in results)
     assert all(row["retrieval_source"] == "test" for row in results)
+
+
+def test_process_query_batch_prepares_query_vectors_once_per_query_batch():
+    model_set = _build_model_set_for_test()
+    model_set.candidate_target = 1
+    backend = PreparingBackend()
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size):
+        return [0.2] * len(docs)
+
+    results = model_set.process_query_batch(
+        [
+            {
+                "query_id": "q1",
+                "document_id": "positive-1",
+                "positive_ranking": 1.0,
+                "text": "query one",
+            },
+            {
+                "query_id": "q2",
+                "document_id": "positive-2",
+                "positive_ranking": 1.0,
+                "text": "query two",
+            },
+        ],
+        backend,
+        fake_rerank,
+        reranker_batch_size=8,
+    )
+
+    assert backend.prepared_query_batches == [["query one", "query two"]]
+    assert backend.search_calls == 4
+    assert {row["query_id"] for row in results} == {"q1", "q2"}
 
 
 def test_negative_percentile_rule_matches_export_threshold_formula():
