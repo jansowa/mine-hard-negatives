@@ -286,3 +286,51 @@ Expected smoke-test artifacts:
 - `./.smoke/relevant.parquet`
 - `./.smoke/relevant_with_score.parquet`
 - `./.smoke/negatives.parquet`
+
+## Quick two-stage smoke test (`.env.example.sdadas.two-stage`)
+
+This smoke test uses the same tiny sample JSONL, but follows the two-stage flow from
+`.env.example.sdadas.two-stage`: candidate reranking with the small reranker, then final reranking
+with the final reranker. Model names, paths, batch sizes, backend settings, score columns, and
+reranking thresholds come from `.env.example.sdadas.two-stage`.
+
+> Note: `find_negatives.py` requires CUDA GPUs in the current implementation.
+
+```bash
+# 0) Environment
+uv venv --python 3.12.3 .venv
+source .venv/bin/activate
+uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+
+# 1) Use the two-stage example env
+cp .env.example.sdadas.two-stage .env
+mkdir -p data
+cp app_code/data/input.jsonl data/input.jsonl
+
+# 2) Build tiny parquet inputs from sample jsonl
+python app_code/to_huggingface_dataset.py
+
+# 3) Ingest corpus to LanceDB
+python app_code/add_documents_to_db.py
+
+# 4) Stage 1: score positives and mine candidates with the candidate reranker
+python app_code/add_positives_ranks.py
+python app_code/find_negatives.py
+
+# 5) Stage 2: score positives and rerank candidates with the final reranker
+python app_code/add_positives_ranks.py --final-step
+python app_code/rerank_negative_candidates.py
+
+# 6) Build FlagEmbedding JSONL from final reranked negatives
+python app_code/create_flag_embedding_jsonl.py
+```
+
+Expected two-stage smoke-test artifacts:
+- `data/queries.parquet`
+- `data/corpus.parquet`
+- `data/relevant.parquet`
+- `data/relevant_with_candidate_score.parquet`
+- `data/negative_candidates.parquet`
+- `data/relevant_with_score.parquet`
+- `data/negatives.parquet`
+- `data/output.jsonl`
