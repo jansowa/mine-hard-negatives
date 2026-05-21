@@ -48,6 +48,12 @@ def _config_first_optional(names: tuple[str, ...], *, cast=None, default=None):
     return default
 
 
+def _positive_int_or_none(value: int | None) -> int | None:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
 def get_positive_ranks_stage_defaults(final_step: bool) -> dict:
     if final_step:
         return {
@@ -672,12 +678,15 @@ if __name__ == "__main__":
         help="Name of the output score column, e.g. positive_candidate_ranking.",
     )
     parser.add_argument(
-        "--skip", type=int, default=0, help="How many initial items to skip in relevant_path (by position in the file)."
+        "--skip",
+        type=int,
+        default=config("PIPELINE_SAMPLE_SKIP", cast=int, default=0),
+        help="How many initial items to skip in relevant_path (by position in the file).",
     )
     parser.add_argument(
         "--offset",
         type=int,
-        default=None,
+        default=_positive_int_or_none(config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0)),
         help="How many items in total to process from relevant_path window (after skip). If omitted, process to the end.",
     )
     args = parser.parse_args()

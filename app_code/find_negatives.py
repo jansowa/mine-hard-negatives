@@ -121,6 +121,12 @@ def collect_reranker_sample_pairs(
     return sample_queries, sample_docs
 
 
+def optional_positive_int(value: int | None) -> int | None:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
 def benchmark_model_sets_reranker_batch_size(
     model_sets,
     rerank_function,
@@ -175,6 +181,8 @@ def find_negatives_multigpu(
     top_k: int | None,
     force_resume: bool | None = None,
     query_batch_size: int = config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4),
+    query_skip: int = config("PIPELINE_SAMPLE_SKIP", cast=int, default=0),
+    query_limit: int | None = optional_positive_int(config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0)),
     profile_timing: bool = config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False),
     auto_embedding_batch_size_candidates: str | None = config(
         "NEGATIVE_AUTO_EMBEDDING_BATCH_SIZE_CANDIDATES", default=None
@@ -267,6 +275,18 @@ def find_negatives_multigpu(
         }
         for _, row in positives_df.iterrows()
     ]
+
+    if query_skip < 0:
+        query_skip = 0
+    if query_skip or query_limit is not None:
+        end = None if query_limit is None else query_skip + query_limit
+        queries_list = queries_list[query_skip:end]
+        logger.info(
+            "Applied query sample window: skip=%s, limit=%s, selected=%s",
+            query_skip,
+            query_limit,
+            len(queries_list),
+        )
 
     logger.info(f"Loaded {len(queries_list)} queries for processing")
 
@@ -491,6 +511,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--query_batch_size", type=int, default=config("NEGATIVE_QUERY_BATCH_SIZE", cast=int, default=4)
     )
+    parser.add_argument("--query_skip", type=int, default=config("PIPELINE_SAMPLE_SKIP", cast=int, default=0))
+    parser.add_argument(
+        "--query_limit",
+        type=int,
+        default=optional_positive_int(config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0)),
+        help="Limit query count for smoke runs. Values <=0 mean no limit.",
+    )
     parser.add_argument(
         "--ranking_column",
         type=str,
@@ -529,6 +556,8 @@ if __name__ == "__main__":
         args.top_k,
         args.resume,
         args.query_batch_size,
+        args.query_skip,
+        optional_positive_int(args.query_limit),
         config("NEGATIVE_PROFILE_TIMING", cast=bool, default=False)
         if args.profile_timing is None
         else args.profile_timing,

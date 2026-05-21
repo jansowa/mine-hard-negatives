@@ -108,6 +108,8 @@ ruff format app_code tests
    python app_code/clips_mqa_to_huggingface_dataset.py
    # or
    python app_code/natural_questions_to_huggingface_dataset.py
+   # or
+   python app_code/en_natural_questions_to_huggingface_dataset.py
    ```
 2. Load documents into vector DB:
    ```bash
