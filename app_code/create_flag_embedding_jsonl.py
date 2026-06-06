@@ -186,6 +186,10 @@ def process_negatives_streaming(
     oversample_factor: int,
     positive_score_column: str = "positive_ranking",
     negative_score_column: str = "ranking",
+    positive_original_score_column: str | None = None,
+    negative_original_score_column: str | None = None,
+    prompt: str = "",
+    dataset_type: str = "retrieval",
     backfill_policy: str = "relaxed",
     report_path: str | None = None,
 ):
@@ -216,21 +220,22 @@ def process_negatives_streaming(
     queries_dict = dict(zip(qdf["id"].to_list(), qdf["text"].to_list()))
     del qdf
 
-    rel = (
-        pl.scan_parquet(relevant_path)
-        .select(
-            [
-                pl.col("query_id"),
-                pl.col("document_id"),
-                pl.col(positive_score_column).alias("positive_ranking"),
-            ]
-        )
-        .with_columns(
-            pl.col("query_id").cast(pl.Utf8),
-            pl.col("document_id").cast(pl.Utf8),
-            pl.col("positive_ranking").cast(pl.Float64),
-        )
-    )
+    relevant_select = [
+        pl.col("query_id"),
+        pl.col("document_id"),
+        pl.col(positive_score_column).alias("positive_ranking"),
+    ]
+    if positive_original_score_column:
+        relevant_select.append(pl.col(positive_original_score_column).alias("original_positive_ranking"))
+    relevant_casts = [
+        pl.col("query_id").cast(pl.Utf8),
+        pl.col("document_id").cast(pl.Utf8),
+        pl.col("positive_ranking").cast(pl.Float64),
+    ]
+    if positive_original_score_column:
+        relevant_casts.append(pl.col("original_positive_ranking").cast(pl.Float64))
+
+    rel = pl.scan_parquet(relevant_path).select(relevant_select).with_columns(relevant_casts)
 
     pos_scores_all = np.sort(
         rel.select(pl.col("positive_ranking")).collect()["positive_ranking"].drop_nulls().to_numpy().copy()
@@ -248,16 +253,15 @@ def process_negatives_streaming(
     except Exception as e:
         print(f"Nie udało się wypisać mapy percentyli: {e}")
 
-    pos_grouped = (
-        rel.group_by("query_id")
-        .agg(
-            pl.col("document_id").implode().alias("pos_ids"),
-            pl.col("positive_ranking").implode().alias("pos_scores"),
-            pl.col("positive_ranking").min().alias("min_score"),
-        )
-        .with_columns(pl.col("min_score").cast(pl.Float64))
-        .collect()
-    )
+    pos_aggs = [
+        pl.col("document_id").implode().alias("pos_ids"),
+        pl.col("positive_ranking").implode().alias("pos_scores"),
+        pl.col("positive_ranking").min().alias("min_score"),
+    ]
+    if positive_original_score_column:
+        pos_aggs.append(pl.col("original_positive_ranking").implode().alias("original_pos_scores"))
+
+    pos_grouped = rel.group_by("query_id").agg(pos_aggs).with_columns(pl.col("min_score").cast(pl.Float64)).collect()
 
     min_scores = pos_grouped["min_score"].to_numpy()
     u_pos = percentile_from_ecdf(min_scores, ecdf_x, ecdf_y)
@@ -265,28 +269,31 @@ def process_negatives_streaming(
     thr2 = inv_percentile_from_ecdf(u_floor, ecdf_x, ecdf_y)
     thresholds = np.maximum(thr1, thr2)
 
-    thr_df = pl.DataFrame(
-        {
-            "query_id": pos_grouped["query_id"],
-            "pos_ids": pos_grouped["pos_ids"],
-            "pos_scores": pos_grouped["pos_scores"],
-            "min_score": pos_grouped["min_score"],
-            "u_pos": pl.Series(u_pos),
-            "threshold_rank": pl.Series(thresholds),
-        }
-    )
+    threshold_frame = {
+        "query_id": pos_grouped["query_id"],
+        "pos_ids": pos_grouped["pos_ids"],
+        "pos_scores": pos_grouped["pos_scores"],
+        "min_score": pos_grouped["min_score"],
+        "u_pos": pl.Series(u_pos),
+        "threshold_rank": pl.Series(thresholds),
+    }
+    if positive_original_score_column:
+        threshold_frame["original_pos_scores"] = pos_grouped["original_pos_scores"]
+    thr_df = pl.DataFrame(threshold_frame)
 
-    pos_map: dict[str, tuple[list[str], list[float]]] = {
-        qid: (row["pos_ids"], row["pos_scores"]) for qid, row in zip(thr_df["query_id"], thr_df.iter_rows(named=True))
+    pos_map: dict[str, dict] = {
+        qid: row for qid, row in zip(thr_df["query_id"], thr_df.iter_rows(named=True))
     }
 
-    neg_scan = pl.scan_parquet(negatives_path).select(
-        [
-            pl.col("query_id").cast(pl.Utf8),
-            pl.col("document_id").cast(pl.Utf8),
-            pl.col(negative_score_column).cast(pl.Float64).alias("ranking"),
-        ]
-    )
+    negative_select = [
+        pl.col("query_id").cast(pl.Utf8),
+        pl.col("document_id").cast(pl.Utf8),
+        pl.col(negative_score_column).cast(pl.Float64).alias("ranking"),
+    ]
+    if negative_original_score_column:
+        negative_select.append(pl.col(negative_original_score_column).cast(pl.Float64).alias("original_negative_ranking"))
+
+    neg_scan = pl.scan_parquet(negatives_path).select(negative_select)
 
     all_qids = thr_df["query_id"].to_list()
     total_q = len(all_qids)
@@ -302,11 +309,15 @@ def process_negatives_streaming(
 
         thr_chunk = thr_df.slice(start, end - start).select(["query_id", "threshold_rank"])
 
+        pair_fields = ["document_id", "ranking", "strict_negative"]
+        if negative_original_score_column:
+            pair_fields.append("original_negative_ranking")
+
         candidates = (
             neg_scan.join(thr_chunk.lazy(), on="query_id", how="inner")
             .with_columns((pl.col("ranking") <= pl.col("threshold_rank")).alias("strict_negative"))
             .group_by("query_id")
-            .agg(pl.struct(["document_id", "ranking", "strict_negative"]).alias("pairs"))
+            .agg(pl.struct(pair_fields).alias("pairs"))
             .collect()
         )
 
@@ -320,7 +331,7 @@ def process_negatives_streaming(
             for p in pairs:
                 need_ids_set.add(p["document_id"])
         for qid in qids_chunk:
-            pos_ids, _ = pos_map[qid]
+            pos_ids = pos_map[qid]["pos_ids"]
             need_ids_set.update(pos_ids)
 
         need_ids = list(need_ids_set)
@@ -336,10 +347,13 @@ def process_negatives_streaming(
         for qid, pairs in zip(candidates["query_id"].to_list(), candidates["pairs"].to_list()):
             chosen_ids: list[str] = []
             chosen_scores: list[float] = []
+            chosen_original_scores: list[float | None] = []
             chosen_tiers: list[str] = []
             bumped_local: list[str] = []
             seen_local: set[str] = set()
-            pos_ids, pos_scores = pos_map[qid]
+            pos_row = pos_map[qid]
+            pos_ids = pos_row["pos_ids"]
+            pos_scores = pos_row["pos_scores"]
             pos_ids_set = set(pos_ids)
 
             strict_pairs = sorted(
@@ -372,6 +386,8 @@ def process_negatives_streaming(
                     continue
                 chosen_ids.append(did)
                 chosen_scores.append(rnk)
+                if negative_original_score_column:
+                    chosen_original_scores.append(pair.get("original_negative_ranking"))
                 chosen_tiers.append(tier)
                 counts_map[did] = counts_map.get(did, 0) + 1
                 bumped_local.append(did)
@@ -393,15 +409,22 @@ def process_negatives_streaming(
             neg_texts = [texts_map.get(nid, "") for nid in chosen_ids]
 
             item = {
+                "query_id": qid,
                 "query": query_text,
                 "pos": pos_texts,
                 "neg": neg_texts,
                 "pos_scores": pos_scores,
                 "neg_scores": chosen_scores,
+                "prompt": prompt,
+                "type": dataset_type,
                 "pos_id": pos_ids,
                 "neg_id": chosen_ids,
                 "neg_selection_tier": chosen_tiers,
             }
+            if positive_original_score_column:
+                item["original_pos_scores"] = pos_row["original_pos_scores"]
+            if negative_original_score_column:
+                item["original_neg_scores"] = chosen_original_scores
             out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
             bumped_all.extend(bumped_local)
             stats["queries_written"] += 1
@@ -426,6 +449,10 @@ def process_negatives_streaming(
         "u_floor": u_floor,
         "positive_score_column": positive_score_column,
         "negative_score_column": negative_score_column,
+        "positive_original_score_column": positive_original_score_column,
+        "negative_original_score_column": negative_original_score_column,
+        "prompt": prompt,
+        "type": dataset_type,
         "backfill_policy": backfill_policy,
         "total_queries": total_q,
         **dict(stats),
@@ -459,6 +486,20 @@ def main():
         default=config("NEGATIVE_SCORE_COLUMN", default="ranking"),
         help="Score column to read from negatives_path.",
     )
+    parser.add_argument(
+        "--positive_original_score_column",
+        type=str,
+        default=config("POSITIVE_ORIGINAL_SCORE_COLUMN", default=None),
+        help="Optional original positive score column to export as original_pos_scores.",
+    )
+    parser.add_argument(
+        "--negative_original_score_column",
+        type=str,
+        default=config("NEGATIVE_ORIGINAL_SCORE_COLUMN", default=None),
+        help="Optional original negative score column to export as original_neg_scores.",
+    )
+    parser.add_argument("--prompt", type=str, default=config("FLAG_EMBEDDING_PROMPT", default=""))
+    parser.add_argument("--type", dest="dataset_type", type=str, default=config("FLAG_EMBEDDING_TYPE", default="retrieval"))
 
     parser.add_argument(
         "--beta",
@@ -520,6 +561,10 @@ def main():
         num_negatives=args.num_negatives,
         positive_score_column=args.positive_score_column,
         negative_score_column=args.negative_score_column,
+        positive_original_score_column=args.positive_original_score_column,
+        negative_original_score_column=args.negative_original_score_column,
+        prompt=args.prompt,
+        dataset_type=args.dataset_type,
         backfill_policy=args.backfill_policy,
         report_path=report_path,
         beta=args.beta,

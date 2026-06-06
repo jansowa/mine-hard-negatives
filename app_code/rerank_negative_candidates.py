@@ -121,6 +121,13 @@ def _positive_int(value: int, name: str) -> int:
     return value
 
 
+def _positive_int_or_unlimited(value: int, name: str) -> int:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to 0")
+    return value
+
+
 def _build_ecdf(sorted_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if len(sorted_values) == 0:
         raise ValueError("Cannot build ECDF from an empty score array")
@@ -474,8 +481,9 @@ def rerank_candidates_adaptive(
     num_negatives = _positive_int(num_negatives, "num_negatives")
     initial_budget = _positive_int(initial_budget, "initial_budget")
     budget_step = _positive_int(budget_step, "budget_step")
-    max_budget = _positive_int(max_budget, "max_budget")
-    if initial_budget > max_budget:
+    max_budget = _positive_int_or_unlimited(max_budget, "max_budget")
+    unlimited_budget = max_budget == 0
+    if not unlimited_budget and initial_budget > max_budget:
         raise ValueError("initial_budget must be less than or equal to max_budget")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -565,16 +573,18 @@ def rerank_candidates_adaptive(
                 existing_rows = scored_by_query.get(qid, [])
                 existing_doc_ids = {str(row["document_id"]) for row in existing_rows}
                 strict_count = _strict_final_count(existing_rows, ranking_column, threshold)
-                budget_limit = max(initial_budget, min(max_budget, len(existing_doc_ids)))
                 candidate_rows = group.to_dict("records")
+                query_max_budget = len(candidate_rows) if unlimited_budget else max_budget
+                query_max_budget = max(query_max_budget, min(len(existing_doc_ids), len(candidate_rows)))
+                budget_limit = min(query_max_budget, max(initial_budget, min(query_max_budget, len(existing_doc_ids))))
 
-                while strict_count < num_negatives and budget_limit <= max_budget:
+                while strict_count < num_negatives and budget_limit > 0 and budget_limit <= query_max_budget:
                     window = candidate_rows[: min(budget_limit, len(candidate_rows))]
                     rows_to_score = [row for row in window if str(row["document_id"]) not in existing_doc_ids]
                     if not rows_to_score:
-                        if budget_limit >= max_budget or len(window) >= len(candidate_rows):
+                        if budget_limit >= query_max_budget or len(window) >= len(candidate_rows):
                             break
-                        budget_limit = min(max_budget, budget_limit + budget_step)
+                        budget_limit = min(query_max_budget, budget_limit + budget_step)
                         continue
 
                     query_text = queries.get(qid)
@@ -593,9 +603,9 @@ def rerank_candidates_adaptive(
                         valid_rows.append(candidate_row)
 
                     if not valid_rows:
-                        if budget_limit >= max_budget or len(window) >= len(candidate_rows):
+                        if budget_limit >= query_max_budget or len(window) >= len(candidate_rows):
                             break
-                        budget_limit = min(max_budget, budget_limit + budget_step)
+                        budget_limit = min(query_max_budget, budget_limit + budget_step)
                         continue
 
                     scores = safe_rerank(
@@ -628,9 +638,9 @@ def rerank_candidates_adaptive(
                     newly_scored += len(rows)
 
                     if strict_count < num_negatives:
-                        if budget_limit >= max_budget or budget_limit >= len(candidate_rows):
+                        if budget_limit >= query_max_budget or budget_limit >= len(candidate_rows):
                             break
-                        budget_limit = min(max_budget, budget_limit + budget_step)
+                        budget_limit = min(query_max_budget, budget_limit + budget_step)
 
                 strict_histogram[min(strict_count, num_negatives)] += 1
                 query_report.append(
@@ -640,7 +650,7 @@ def rerank_candidates_adaptive(
                         "target_negatives": int(num_negatives),
                         "candidate_rows": int(len(candidate_rows)),
                         "scored_rows": int(len(existing_doc_ids)),
-                        "budget_limit": int(min(budget_limit, max_budget)),
+                        "budget_limit": int(min(budget_limit, query_max_budget)),
                     }
                 )
                 pbar.update(1)
@@ -657,6 +667,7 @@ def rerank_candidates_adaptive(
         "initial_budget": initial_budget,
         "budget_step": budget_step,
         "max_budget": max_budget,
+        "unlimited_budget": unlimited_budget,
         "queries_with_candidates": len(query_report),
         "complete_queries": complete_queries,
         "partial_queries": len(query_report) - complete_queries,
@@ -975,6 +986,7 @@ def main() -> None:
         "--max_budget",
         type=int,
         default=config("FINAL_RERANK_MAX_BUDGET", cast=int, default=max(1, num_negatives_default * 8)),
+        help="Maximum candidates to final-rerank per query. Use 0 to allow all candidates for each query.",
     )
     parser.add_argument("--report_path", type=str, default=config("FINAL_RERANK_REPORT_PATH", default=None))
     parser.add_argument("--selected-only", dest="selected_only", action="store_true")

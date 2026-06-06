@@ -5,10 +5,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
-from decouple import config
+from decouple import UndefinedValueError, config
 
 if TYPE_CHECKING:
     from langchain_huggingface import HuggingFaceEmbeddings
+
+
+def _config_optional(name: str, *, cast=None, default=None):
+    try:
+        value = config(name, default=None)
+    except UndefinedValueError:
+        return default
+    if value in {None, ""}:
+        return default
+    if cast is None:
+        return value
+    return cast(value)
 
 
 def _import_torch():
@@ -80,7 +92,7 @@ class SpladeEmbedding(SparseEmbeddingsBase):
             padding="longest",
             truncation=True,
             return_tensors="pt",
-            max_length=config("SPARSE_EMBEDDER_MAX_LENGTH", cast=int, default=None),
+            max_length=_config_optional("SPARSE_EMBEDDER_MAX_LENGTH", cast=int),
         ).to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -134,7 +146,9 @@ def get_dense_model(
         },
         encode_kwargs={"batch_size": batch_size, "prompt": prompt},
     )
-    embeddings._client.tokenizer.model_max_length = config("DENSE_EMBEDDER_MAX_LENGTH", cast=int, default=None)
+    dense_max_length = _config_optional("DENSE_EMBEDDER_MAX_LENGTH", cast=int)
+    if dense_max_length is not None:
+        embeddings._client.tokenizer.model_max_length = dense_max_length
     return embeddings
 
 
@@ -160,23 +174,32 @@ def get_reranker_model(
         from FlagEmbedding import FlagAutoReranker
 
         devices = [f"cuda:{gpu_id}"]
-        model = FlagAutoReranker.from_finetuned(
-            model_name, use_bf16=True, devices=devices, max_legnth=config("RERANKER_MAX_LENGTH")
-        )
+        model_kwargs: dict[str, Any] = {}
+        reranker_max_length = _config_optional("RERANKER_MAX_LENGTH", cast=int)
+        if reranker_max_length is not None:
+            model_kwargs["max_length"] = reranker_max_length
+        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, **model_kwargs)
         # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
 
     torch = _import_torch()
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    from sentence_transformers import CrossEncoder
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    print(f"Using {torch.cuda.device_count()} GPUs for reranker model")
-
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto"
-    )
-    return tokenizer, model
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+    model_kwargs: dict[str, Any] = {}
+    if torch.cuda.is_available():
+        model_kwargs["torch_dtype"] = torch.bfloat16
+    cross_encoder_kwargs: dict[str, Any] = {
+        "device": device,
+        "trust_remote_code": True,
+        "model_kwargs": model_kwargs,
+        "activation_fn": torch.nn.Identity(),
+    }
+    reranker_max_length = _config_optional("RERANKER_MAX_LENGTH", cast=int)
+    if reranker_max_length is not None:
+        cross_encoder_kwargs["max_length"] = reranker_max_length
+    model = CrossEncoder(model_name, **cross_encoder_kwargs)
+    return None, model
 
 
 def rerank(
@@ -194,6 +217,16 @@ def rerank(
 
     if hasattr(model, "score_pairs"):
         return model.score_pairs([(q, a) for q, a in texts], batch_size=batch_size)
+
+    if hasattr(model, "predict"):
+        scores = model.predict(
+            [(q, a) for q, a in texts],
+            batch_size=batch_size,
+            show_progress_bar=False,
+        )
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
+        return [float(score) for score in scores]
 
     if is_flag_embedding_reranker(model_name):
         results = []
@@ -214,7 +247,7 @@ def rerank(
         tokens = tokenizer(
             batch_texts,
             padding="longest",
-            max_length=config("RERANKER_MAX_LENGTH", cast=int, default=None),
+            max_length=_config_optional("RERANKER_MAX_LENGTH", cast=int),
             truncation=True,
             return_tensors="pt",
         ).to("cuda")

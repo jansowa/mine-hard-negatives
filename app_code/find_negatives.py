@@ -5,7 +5,7 @@ from datetime import datetime
 from functools import partial
 
 import pandas as pd
-from decouple import config
+from decouple import UndefinedValueError, config
 from tqdm import tqdm
 
 from batch_tuning import (
@@ -43,6 +43,18 @@ def _import_torch():
     import torch
 
     return torch
+
+
+def optional_config(name: str, *, cast=None, default=None):
+    try:
+        value = config(name, default=None)
+    except UndefinedValueError:
+        return default
+    if value in {None, ""}:
+        return default
+    if cast is None:
+        return value
+    return cast(value)
 
 
 def get_negative_mining_stage_defaults() -> dict:
@@ -505,7 +517,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top_k",
         type=int,
-        default=config("TOP_K", cast=int, default=None),
+        default=optional_config("TOP_K", cast=int),
         help="Deprecated compatibility option; iterative mining ignores this value.",
     )
     parser.add_argument(

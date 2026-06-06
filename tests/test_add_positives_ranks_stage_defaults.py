@@ -83,3 +83,42 @@ def test_process_relevant_auto_tunes_reranker_batch_size(monkeypatch, tmp_path):
     assert df["query_id"].tolist() == ["q1", "q2"]
     assert benchmark_calls == [(["query one", "query two"], ["doc one", "doc two"], [1, 3])]
     assert rerank_batch_sizes == [(3, "positive-model")]
+
+
+def test_process_relevant_preserves_extra_relevant_columns(monkeypatch, tmp_path):
+    queries_path = tmp_path / "queries.parquet"
+    corpus_path = tmp_path / "corpus.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    output_path = tmp_path / "relevant_with_score.parquet"
+
+    pd.DataFrame({"id": ["q1"], "text": ["query one"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame({"id": ["d1"], "text": ["doc one"]}).to_parquet(corpus_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1"],
+            "document_id": ["d1"],
+            "lightonai_positive_score": [0.75],
+        }
+    ).to_parquet(relevant_path, index=False)
+
+    monkeypatch.setattr(apr, "get_reranker_model", lambda _model_name: (object(), object()))
+    monkeypatch.setattr(apr, "rerank", lambda *_args, **_kwargs: [1.25])
+
+    apr.process_relevant(
+        queries_path=str(queries_path),
+        corpus_path=str(corpus_path),
+        relevant_path=str(relevant_path),
+        output_path=str(output_path),
+        chunk_size=2,
+        reranker_batch_size=1,
+        reranker_model_name="positive-model",
+        score_column="positive_ranking",
+    )
+
+    df = pd.read_parquet(output_path)
+    assert df.to_dict("list") == {
+        "query_id": ["q1"],
+        "document_id": ["d1"],
+        "lightonai_positive_score": [0.75],
+        "positive_ranking": [1.25],
+    }

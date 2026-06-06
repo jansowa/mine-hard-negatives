@@ -295,12 +295,31 @@ def _load_scored_pairs(output_path: str) -> set[str]:
     return _load_scored_pairs_from_files(paths)
 
 
+def _schema_without_score(path: str, score_column: str) -> pa.Schema:
+    fields = []
+    for field in pq.ParquetFile(path).schema_arrow:
+        if field.name == score_column:
+            continue
+        if field.name in {"query_id", "document_id"}:
+            fields.append(pa.field(field.name, pa.string()))
+        else:
+            fields.append(field)
+    return pa.schema(fields)
+
+
+def _schema_with_score(base_schema: pa.Schema, score_column: str) -> pa.Schema:
+    fields = [field for field in base_schema if field.name != score_column]
+    fields.append(pa.field(score_column, pa.float32()))
+    return pa.schema(fields)
+
+
 def _filter_relevant_to_missing(
     relevant_path: str,
     already_scored_pairs: set[str],
     skip: int,
     offset: int | None,
     tmp_dir: str,
+    score_column: str,
     chunk_size: int = 200_000,
 ) -> tuple[str, int]:
     pf = pq.ParquetFile(relevant_path)
@@ -327,7 +346,7 @@ def _filter_relevant_to_missing(
     if window_size == 0:
         return "", 0
 
-    filtered_schema = pa.schema([("query_id", pa.string()), ("document_id", pa.string())])
+    filtered_schema = _schema_without_score(relevant_path, score_column)
     filtered_path = os.path.join(tmp_dir, f"filtered_{uuid.uuid4().hex}.parquet")
     writer = pq.ParquetWriter(filtered_path, filtered_schema, compression="zstd", use_dictionary=True)
 
@@ -336,7 +355,7 @@ def _filter_relevant_to_missing(
 
     try:
         with tqdm(total=window_size, desc="Pre-filtering relevant (one-time)", unit="row") as pbar:
-            for batch in pf.iter_batches(batch_size=chunk_size, columns=["query_id", "document_id"]):
+            for batch in pf.iter_batches(batch_size=chunk_size):
                 batch_len = batch.num_rows
                 batch_start = seen_rows
                 batch_end = seen_rows + batch_len
@@ -360,6 +379,7 @@ def _filter_relevant_to_missing(
 
                 if not df.empty:
                     df = df.astype({"query_id": "string", "document_id": "string"}, copy=False)
+                    df = df[list(filtered_schema.names)]
                     tbl = pa.Table.from_pandas(df, schema=filtered_schema, preserve_index=False)
                     writer.write_table(tbl)
                     kept += len(df)
@@ -482,6 +502,7 @@ def process_relevant(
             skip=skip,
             offset=offset,
             tmp_dir=tmp_dir,
+            score_column=score_column,
             chunk_size=chunk_size,
         )
 
@@ -521,9 +542,8 @@ def process_relevant(
         safe_rerank = OOMRetryReranker(rerank_function, reranker_batch_size)
         print(f"Effective reranker batch size: {reranker_batch_size}")
 
-        relevant_extended_schema: pa.Schema = pa.schema(
-            [("query_id", pa.string()), ("document_id", pa.string()), (score_column, pa.float32())]
-        )
+        filtered_schema = pq.ParquetFile(filtered_relevant_path).schema_arrow
+        relevant_extended_schema: pa.Schema = _schema_with_score(filtered_schema, score_column)
         print("Schema for output parts defined.")
 
         if output_dir and not os.path.exists(output_dir):
@@ -538,7 +558,7 @@ def process_relevant(
         pf_filtered = pq.ParquetFile(filtered_relevant_path)
 
         with tqdm(total=rows_to_score, unit="row", desc="Scoring & writing (filtered)") as pbar:
-            for batch in pf_filtered.iter_batches(batch_size=chunk_size, columns=["query_id", "document_id"]):
+            for batch in pf_filtered.iter_batches(batch_size=chunk_size):
                 relevant_chunk_df: pd.DataFrame = batch.to_pandas()
                 if relevant_chunk_df.empty:
                     continue
@@ -561,13 +581,10 @@ def process_relevant(
                     batch_size=reranker_batch_size,
                 )
 
-                result_chunk_df: pd.DataFrame = pd.DataFrame(
-                    {
-                        "query_id": merged_chunk_df["query_id"].astype("string", copy=False),
-                        "document_id": merged_chunk_df["document_id"].astype("string", copy=False),
-                        score_column: pd.Series(scores_chunk, dtype="float32"),
-                    }
-                )
+                result_chunk_df: pd.DataFrame = merged_chunk_df[list(filtered_schema.names)].copy()
+                result_chunk_df["query_id"] = result_chunk_df["query_id"].astype("string", copy=False)
+                result_chunk_df["document_id"] = result_chunk_df["document_id"].astype("string", copy=False)
+                result_chunk_df[score_column] = pd.Series(scores_chunk, dtype="float32").to_numpy()
 
                 result_table_chunk: pa.Table = pa.Table.from_pandas(
                     result_chunk_df, schema=relevant_extended_schema, preserve_index=False

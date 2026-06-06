@@ -230,3 +230,68 @@ def test_rerank_candidates_adaptive_expands_only_until_target(monkeypatch, tmp_p
     assert all("d3" not in call for call in calls)
     assert scored_docs.index("d6") < scored_docs.index("d5")
     assert set(df.columns) >= {"final_selected", "final_threshold_rank", "final_rerank_budget"}
+
+
+def test_rerank_candidates_adaptive_zero_max_budget_means_all_candidates(monkeypatch, tmp_path):
+    queries_path = tmp_path / "queries.parquet"
+    corpus_path = tmp_path / "corpus.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    candidates_path = tmp_path / "negative_candidates.parquet"
+    output_path = tmp_path / "negatives.parquet"
+
+    pd.DataFrame({"id": ["q1"], "text": ["query one"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame(
+        {
+            "id": ["d1", "d2", "d3", "p1"],
+            "text": ["d1", "d2", "d3", "p1"],
+        }
+    ).to_parquet(corpus_path, index=False)
+    pd.DataFrame({"query_id": ["q1"], "document_id": ["p1"], "positive_ranking": [1.0]}).to_parquet(
+        relevant_path,
+        index=False,
+    )
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q1", "q1"],
+            "document_id": ["d1", "d2", "d3"],
+            "candidate_ranking": [0.9, 0.8, 0.7],
+            "candidate_selected": [True, True, True],
+            "retrieval_rank": [0, 1, 2],
+            "retrieval_source": ["lightonai", "lightonai", "lightonai"],
+        }
+    ).to_parquet(candidates_path, index=False)
+
+    monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+    final_scores = {"d1": 2.0, "d2": 0.5, "d3": 0.5}
+    calls = []
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        calls.append(list(docs))
+        return [final_scores[doc] for doc in docs]
+
+    monkeypatch.setattr(rnc, "rerank", fake_rerank)
+
+    rnc.rerank_candidates(
+        candidates_path=str(candidates_path),
+        queries_path=str(queries_path),
+        corpus_path=str(corpus_path),
+        relevant_path=str(relevant_path),
+        output_path=str(output_path),
+        reranker_model_name="final-model",
+        reranker_batch_size=2,
+        ranking_column="final_ranking",
+        rerank_mode="adaptive",
+        positive_score_column="positive_ranking",
+        num_negatives=2,
+        beta=1.0,
+        u_floor=0.0,
+        initial_budget=1,
+        budget_step=1,
+        max_budget=0,
+        resume=False,
+    )
+
+    df = pd.read_parquet(output_path)
+    assert df["document_id"].tolist() == ["d1", "d2", "d3"]
+    assert df["final_selected"].tolist() == [False, True, True]
+    assert calls == [["d1"], ["d2"], ["d3"]]

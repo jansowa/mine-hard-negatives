@@ -213,6 +213,16 @@ For timing diagnostics, run mining with `--profile-timing` or set `NEGATIVE_PROF
 
 With LanceDB, query embeddings are cached during negative mining to avoid recomputing the same query vector across offset groups. Control this with `LANCEDB_QUERY_VECTOR_CACHE_SIZE`; set it to `0` to disable the cache. LanceDB random fallback sampling also caches the table rows after the first fallback sample in a run.
 
+## Curated external negatives
+
+Tools for datasets mined outside this project live in `app_code/curated_negatives`. They normalise external
+datasets either directly to FlagEmbedding JSONL or, for large LightOn splits, to compact pipeline Parquet
+artifacts. The compact path reuses positive scoring, adaptive final reranking, and relaxed JSONL backfill while
+preserving previous scores under `original_pos_scores` and `original_neg_scores`. See
+`app_code/curated_negatives/README.md`; the shareable LightOn + mixedbread example env is
+`.env.example.lightonai.mxbai`, and the main entrypoint is
+`python app_code/curated_negatives/run_lightonai_adaptive_pipeline.py`.
+
 ## Quick end-to-end smoke test (sample JSONL)
 
 If you want to quickly verify that the full pipeline wiring works, you can run it on the tiny sample file already in the repo: `app_code/data/input.jsonl`.

@@ -114,3 +114,67 @@ def test_process_negatives_streaming_backfills_relaxed_candidates(tmp_path):
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["neg_id"] == ["n1", "n2"]
     assert rows[0]["neg_selection_tier"] == ["strict", "relaxed_backfill"]
+
+
+def test_process_negatives_streaming_exports_prompt_type_and_original_scores(tmp_path):
+    corpus_path = tmp_path / "corpus.parquet"
+    queries_path = tmp_path / "queries.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    negatives_path = tmp_path / "negatives.parquet"
+    output_path = tmp_path / "train.jsonl"
+
+    pd.DataFrame(
+        {
+            "id": ["p1", "n1", "n2"],
+            "text": ["positive text", "strict negative", "relaxed negative"],
+        }
+    ).to_parquet(corpus_path, index=False)
+    pd.DataFrame({"id": ["q1"], "text": ["question"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1"],
+            "document_id": ["p1"],
+            "positive_ranking": [1.0],
+            "lightonai_positive_score": [0.95],
+        }
+    ).to_parquet(relevant_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q1"],
+            "document_id": ["n1", "n2"],
+            "final_ranking": [0.5, 2.0],
+            "candidate_ranking": [0.4, 0.2],
+        }
+    ).to_parquet(negatives_path, index=False)
+
+    process_negatives_streaming(
+        corpus_path=str(corpus_path),
+        queries_path=str(queries_path),
+        relevant_path=str(relevant_path),
+        negatives_path=str(negatives_path),
+        output_path=str(output_path),
+        num_negatives=2,
+        positive_score_column="positive_ranking",
+        negative_score_column="final_ranking",
+        positive_original_score_column="lightonai_positive_score",
+        negative_original_score_column="candidate_ranking",
+        prompt="Represent this sentence for searching relevant passages:",
+        dataset_type="retrieval",
+        beta=0.5,
+        u_floor=0.0,
+        max_neg_reuse=10,
+        corpus_sqlite_path=str(tmp_path / "corpus.sqlite"),
+        negcount_sqlite_path=str(tmp_path / "negcount.sqlite"),
+        query_chunk_size=1,
+        oversample_factor=1,
+        backfill_policy="relaxed",
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["prompt"] == "Represent this sentence for searching relevant passages:"
+    assert rows[0]["type"] == "retrieval"
+    assert rows[0]["pos_scores"] == [1.0]
+    assert rows[0]["neg_scores"] == [0.5, 2.0]
+    assert rows[0]["original_pos_scores"] == [0.95]
+    assert rows[0]["original_neg_scores"] == [0.4, 0.2]
+    assert rows[0]["neg_selection_tier"] == ["strict", "relaxed_backfill"]
