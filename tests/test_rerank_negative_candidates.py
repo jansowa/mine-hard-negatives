@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -150,6 +151,66 @@ def test_rerank_candidates_resume_skips_already_scored_pairs(monkeypatch, tmp_pa
     assert df["document_id"].tolist() == ["d1", "d3"]
 
 
+def test_consolidate_existing_worker_output_without_loading_model(tmp_path):
+    queries_path, corpus_path, candidates_path = _write_inputs(tmp_path)
+    del queries_path, corpus_path
+    output_path = tmp_path / "negatives.parquet"
+    worker_path = tmp_path / "negatives_worker_0_0.jsonl"
+    worker_path.write_text(
+        '{"query_id":"q1","document_id":"d1","candidate_ranking":0.1,'
+        '"candidate_percentile":0.1,"candidate_selected":true,"retrieval_rank":0,'
+        '"retrieval_offset":0,"retrieval_score":0.9,"retrieval_source":"hybrid",'
+        '"final_ranking":1.5,"ranking":1.5,"final_percentile":0.8,'
+        '"final_threshold_rank":0.5,"final_selected":false,'
+        '"final_selection_tier":"candidate","final_rerank_budget":20}\n'
+        '{"query_id":',
+        encoding="utf-8",
+    )
+
+    assert rnc.consolidate_existing_worker_output(
+        candidates_path=str(candidates_path),
+        output_path=str(output_path),
+        ranking_column="final_ranking",
+        rerank_mode="adaptive",
+        row_group_size=1,
+    )
+
+    df = pd.read_parquet(output_path)
+    assert df[["query_id", "document_id", "final_ranking"]].to_dict("records") == [
+        {"query_id": "q1", "document_id": "d1", "final_ranking": 1.5}
+    ]
+
+
+def test_rerank_candidates_expanding_query_limit_scores_only_new_queries(monkeypatch, tmp_path):
+    queries_path, corpus_path, candidates_path = _write_inputs(tmp_path)
+    output_path = tmp_path / "negatives.parquet"
+    calls = []
+
+    monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        calls.append(list(docs))
+        return [1.0] * len(docs)
+
+    monkeypatch.setattr(rnc, "rerank", fake_rerank)
+
+    kwargs = {
+        "candidates_path": str(candidates_path),
+        "queries_path": str(queries_path),
+        "corpus_path": str(corpus_path),
+        "output_path": str(output_path),
+        "reranker_model_name": "final-model",
+        "reranker_batch_size": 2,
+        "chunk_size": 3,
+        "resume": True,
+    }
+    rnc.rerank_candidates(**kwargs, query_limit=1)
+    rnc.rerank_candidates(**kwargs, query_limit=None)
+
+    assert calls == [["doc one"], ["doc three"]]
+    assert set(pd.read_parquet(output_path)["document_id"]) == {"d1", "d3"}
+
+
 def test_rerank_candidates_adaptive_expands_only_until_target(monkeypatch, tmp_path):
     queries_path = tmp_path / "queries.parquet"
     corpus_path = tmp_path / "corpus.parquet"
@@ -295,3 +356,98 @@ def test_rerank_candidates_adaptive_zero_max_budget_means_all_candidates(monkeyp
     assert df["document_id"].tolist() == ["d1", "d2", "d3"]
     assert df["final_selected"].tolist() == [False, True, True]
     assert calls == [["d1"], ["d2"], ["d3"]]
+
+
+def test_rerank_candidates_adaptive_expanding_query_limit_reuses_scores(monkeypatch, tmp_path):
+    queries_path = tmp_path / "queries.parquet"
+    corpus_path = tmp_path / "corpus.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    candidates_path = tmp_path / "negative_candidates.parquet"
+    output_path = tmp_path / "negatives.parquet"
+
+    pd.DataFrame({"id": ["q1", "q2"], "text": ["query one", "query two"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame({"id": ["d1", "d2", "p1", "p2"], "text": ["d1", "d2", "p1", "p2"]}).to_parquet(
+        corpus_path,
+        index=False,
+    )
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q2"],
+            "document_id": ["p1", "p2"],
+            "positive_ranking": [1.0, 1.0],
+        }
+    ).to_parquet(relevant_path, index=False)
+    pd.DataFrame(
+        {
+            "query_id": ["q1", "q2"],
+            "document_id": ["d1", "d2"],
+            "candidate_ranking": [0.9, 0.8],
+            "candidate_selected": [True, True],
+            "retrieval_rank": [0, 0],
+            "retrieval_source": ["lightonai", "lightonai"],
+        }
+    ).to_parquet(candidates_path, index=False)
+
+    monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+    calls = []
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        calls.append(list(docs))
+        return [0.5] * len(docs)
+
+    monkeypatch.setattr(rnc, "rerank", fake_rerank)
+    kwargs = {
+        "candidates_path": str(candidates_path),
+        "queries_path": str(queries_path),
+        "corpus_path": str(corpus_path),
+        "relevant_path": str(relevant_path),
+        "output_path": str(output_path),
+        "reranker_model_name": "final-model",
+        "reranker_batch_size": 2,
+        "ranking_column": "final_ranking",
+        "rerank_mode": "adaptive",
+        "positive_score_column": "positive_ranking",
+        "num_negatives": 1,
+        "beta": 1.0,
+        "u_floor": 0.0,
+        "initial_budget": 1,
+        "budget_step": 1,
+        "max_budget": 0,
+        "resume": True,
+    }
+
+    rnc.rerank_candidates(**kwargs, query_limit=1)
+    rnc.rerank_candidates(**kwargs, query_limit=None)
+
+    assert calls == [["d1"], ["d2"]]
+    assert set(pd.read_parquet(output_path)["document_id"]) == {"d1", "d2"}
+
+
+def test_adaptive_resume_state_prefers_worker_and_drops_complete_query_documents(tmp_path):
+    worker_path = tmp_path / "negatives_worker_0_0.jsonl"
+    output_path = tmp_path / "negatives.parquet"
+    worker_rows = [
+        {"query_id": "q1", "document_id": "d1", "final_ranking": 0.1},
+        {"query_id": "q1", "document_id": "d2", "final_ranking": 0.2},
+        {"query_id": "q1", "document_id": "d3", "final_ranking": 0.3},
+        {"query_id": "q2", "document_id": "d4", "final_ranking": 0.9},
+    ]
+    worker_path.write_text("\n".join(json.dumps(row) for row in worker_rows) + "\n", encoding="utf-8")
+    pd.DataFrame(
+        [{"query_id": "q2", "document_id": "only-in-parquet", "final_ranking": 0.1}]
+    ).to_parquet(output_path, index=False)
+
+    scored_docs, strict_counts, scored_counts, complete_queries, unique_pairs = rnc._load_adaptive_resume_state(
+        worker_file=str(worker_path),
+        output_path=str(output_path),
+        ranking_column="final_ranking",
+        thresholds={"q1": 0.5, "q2": 0.5},
+        selected_query_ids={"q1", "q2"},
+        num_negatives=2,
+    )
+
+    assert scored_docs == {"q2": {"d4"}}
+    assert strict_counts == {"q1": 2}
+    assert scored_counts == {"q1": 2, "q2": 1}
+    assert complete_queries == {"q1"}
+    assert unique_pairs == 3

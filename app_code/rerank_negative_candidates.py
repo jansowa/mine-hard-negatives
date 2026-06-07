@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sqlite3
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from functools import partial
@@ -19,6 +20,7 @@ from batch_tuning import (
     parse_batch_size_candidates,
     validate_batch_size_options,
 )
+from create_flag_embedding_jsonl import build_or_load_corpus_sqlite, fetch_texts_batch, sqlite_connect
 from models import get_reranker_model, rerank
 
 ADAPTIVE_RERANK_FIELDS = (
@@ -128,6 +130,15 @@ def _positive_int_or_unlimited(value: int, name: str) -> int:
     return value
 
 
+def _query_window_ids(queries_df: pd.DataFrame, query_skip: int, query_limit: int | None) -> list[str]:
+    if query_skip < 0:
+        raise ValueError("query_skip must be greater than or equal to 0")
+    if query_limit is not None and query_limit < 0:
+        raise ValueError("query_limit must be greater than or equal to 0 or None")
+    end = None if not query_limit else query_skip + query_limit
+    return queries_df["id"].astype(str).tolist()[query_skip:end]
+
+
 def _build_ecdf(sorted_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if len(sorted_values) == 0:
         raise ValueError("Cannot build ECDF from an empty score array")
@@ -218,6 +229,73 @@ def _load_scored_rows(paths: Iterable[str], ranking_column: str) -> dict[str, di
     return rows
 
 
+def _load_adaptive_resume_state(
+    worker_file: str,
+    output_path: str,
+    ranking_column: str,
+    thresholds: dict[str, float],
+    selected_query_ids: set[str],
+    num_negatives: int,
+) -> tuple[dict[str, set[str]], dict[str, int], dict[str, int], set[str], int]:
+    source_path = worker_file if os.path.isfile(worker_file) else output_path
+    if not os.path.isfile(source_path):
+        return {}, {}, {}, set(), 0
+
+    scored_doc_ids: dict[str, set[str]] = defaultdict(set)
+    strict_doc_ids: dict[str, set[str]] = defaultdict(set)
+    scored_counts: dict[str, int] = defaultdict(int)
+    complete_query_ids: set[str] = set()
+    unique_pairs = 0
+
+    def consume(query_id, document_id, score) -> None:
+        nonlocal unique_pairs
+        qid = str(query_id)
+        if qid not in selected_query_ids or qid in complete_query_ids or score is None:
+            return
+        did = str(document_id)
+        query_docs = scored_doc_ids[qid]
+        if did in query_docs:
+            return
+        query_docs.add(did)
+        scored_counts[qid] += 1
+        unique_pairs += 1
+        if float(score) <= thresholds[qid]:
+            strict_doc_ids[qid].add(did)
+            if len(strict_doc_ids[qid]) >= num_negatives:
+                complete_query_ids.add(qid)
+                scored_doc_ids.pop(qid, None)
+                strict_doc_ids.pop(qid, None)
+
+    if source_path.endswith(".jsonl"):
+        with open(source_path, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    if handle.read().strip():
+                        raise
+                    break
+                consume(row["query_id"], row["document_id"], row.get(ranking_column, row.get("ranking")))
+    else:
+        pf = pq.ParquetFile(source_path)
+        score_column = ranking_column if ranking_column in pf.schema_arrow.names else "ranking"
+        for batch in pf.iter_batches(columns=["query_id", "document_id", score_column], batch_size=200_000):
+            table = pa.Table.from_batches([batch])
+            for query_id, document_id, score in zip(
+                table.column("query_id").to_pylist(),
+                table.column("document_id").to_pylist(),
+                table.column(score_column).to_pylist(),
+            ):
+                consume(query_id, document_id, score)
+
+    strict_counts = {qid: len(doc_ids) for qid, doc_ids in strict_doc_ids.items()}
+    for qid in complete_query_ids:
+        strict_counts[qid] = num_negatives
+    return dict(scored_doc_ids), strict_counts, dict(scored_counts), complete_query_ids, unique_pairs
+
+
 def _output_schema(candidates_path: str, ranking_column: str, include_adaptive_fields: bool = False) -> pa.Schema:
     candidate_schema = pq.ParquetFile(candidates_path).schema_arrow
     fields = []
@@ -292,7 +370,13 @@ def consolidate_worker_jsonl(worker_file: str, output_path: str, schema: pa.Sche
             for line in handle:
                 if not line.strip():
                     continue
-                buffer.append(json.loads(line))
+                try:
+                    buffer.append(json.loads(line))
+                except json.JSONDecodeError:
+                    if handle.read().strip():
+                        raise
+                    print("Skipping incomplete final line from interrupted worker JSONL.")
+                    break
                 if len(buffer) >= row_group_size:
                     write_buffer(buffer)
                     buffer = []
@@ -315,6 +399,28 @@ def consolidate_worker_jsonl(worker_file: str, output_path: str, schema: pa.Sche
         raise
 
 
+def consolidate_existing_worker_output(
+    candidates_path: str,
+    output_path: str,
+    ranking_column: str = "final_ranking",
+    rerank_mode: str = "adaptive",
+    row_group_size: int = 100_000,
+) -> bool:
+    if os.path.isfile(output_path):
+        return True
+    if row_group_size <= 0:
+        raise ValueError("row_group_size must be greater than 0")
+
+    worker_file = _worker_file(output_path)
+    if not os.path.isfile(worker_file):
+        return False
+
+    print(f"Final output is missing; consolidating existing reranker scores from {worker_file}")
+    schema = _output_schema(candidates_path, ranking_column, include_adaptive_fields=rerank_mode == "adaptive")
+    consolidate_worker_jsonl(worker_file, output_path, schema, row_group_size=row_group_size)
+    return os.path.isfile(output_path)
+
+
 def _strict_final_count(rows: Iterable[dict], ranking_column: str, threshold: float) -> int:
     doc_ids = set()
     for row in rows:
@@ -327,9 +433,14 @@ def _strict_final_count(rows: Iterable[dict], ranking_column: str, threshold: fl
 
 
 def _candidate_score_column(candidates_df: pd.DataFrame, preferred_column: str | None) -> str:
+    return _candidate_score_column_from_names(candidates_df.columns, preferred_column)
+
+
+def _candidate_score_column_from_names(column_names: Iterable[str], preferred_column: str | None) -> str:
+    available = set(column_names)
     candidates = [preferred_column, "candidate_ranking", "ranking", "retrieval_score"]
     for column in candidates:
-        if column and column in candidates_df.columns:
+        if column and column in available:
             return column
     raise ValueError("Could not find a candidate score column in candidates_path")
 
@@ -352,23 +463,66 @@ def _prepare_candidates(candidates_df: pd.DataFrame, candidate_score_column: str
     return candidates_df.drop_duplicates(subset=["query_id", "document_id"], keep="first")
 
 
+def _iter_candidate_query_groups(
+    candidates_path: str,
+    candidate_score_column: str,
+    candidate_selected_column: str,
+    selected_query_ids: set[str],
+    batch_size: int = 100_000,
+):
+    parquet_file = pq.ParquetFile(candidates_path)
+    current_query_id: str | None = None
+    current_rows: list[dict[str, Any]] = []
+    completed_query_ids: set[str] = set()
+
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        for row in pa.Table.from_batches([batch]).to_pylist():
+            query_id = str(row["query_id"])
+            if query_id != current_query_id:
+                if current_query_id is not None:
+                    completed_query_ids.add(current_query_id)
+                    if current_rows:
+                        yield current_query_id, _prepare_candidates(
+                            pd.DataFrame(current_rows),
+                            candidate_score_column,
+                            candidate_selected_column,
+                        )
+                if query_id in completed_query_ids:
+                    raise ValueError(
+                        "Candidate rows must be grouped by query_id for memory-bounded adaptive reranking"
+                    )
+                current_query_id = query_id
+                current_rows = []
+            if query_id in selected_query_ids:
+                current_rows.append(row)
+
+    if current_query_id is not None and current_rows:
+        yield current_query_id, _prepare_candidates(
+            pd.DataFrame(current_rows),
+            candidate_score_column,
+            candidate_selected_column,
+        )
+
+
 def _collect_reranker_sample_from_candidate_rows(
     candidates_df: pd.DataFrame,
     queries: dict[str, str],
     corpus: dict[str, str],
     sample_size: int,
-    already_scored: set[str] | None = None,
+    already_scored_by_query: dict[str, set[str]] | None = None,
+    complete_query_ids: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     if sample_size <= 0:
         return [], []
 
-    already_scored = already_scored or set()
+    already_scored_by_query = already_scored_by_query or {}
+    complete_query_ids = complete_query_ids or set()
     sample_queries: list[str] = []
     sample_docs: list[str] = []
     for row in candidates_df[["query_id", "document_id"]].itertuples(index=False):
         query_id = str(row.query_id)
         document_id = str(row.document_id)
-        if _pack_pair(query_id, document_id) in already_scored:
+        if query_id in complete_query_ids or document_id in already_scored_by_query.get(query_id, set()):
             continue
         query_text = queries.get(query_id)
         document_text = corpus.get(document_id)
@@ -378,6 +532,51 @@ def _collect_reranker_sample_from_candidate_rows(
         sample_docs.append(document_text)
         if len(sample_docs) >= sample_size:
             break
+    return sample_queries, sample_docs
+
+
+def _collect_adaptive_reranker_sample(
+    candidates_path: str,
+    candidate_score_column: str,
+    candidate_selected_column: str,
+    selected_query_ids: set[str],
+    already_scored_by_query: dict[str, set[str]],
+    complete_query_ids: set[str],
+    queries: dict[str, str],
+    corpus_conn: sqlite3.Connection,
+    sample_size: int,
+) -> tuple[list[str], list[str]]:
+    if sample_size <= 0:
+        return [], []
+
+    sample_queries: list[str] = []
+    sample_docs: list[str] = []
+    for query_id, group in _iter_candidate_query_groups(
+        candidates_path,
+        candidate_score_column,
+        candidate_selected_column,
+        selected_query_ids,
+    ):
+        if query_id in complete_query_ids:
+            continue
+        query_text = queries.get(query_id)
+        if query_text is None:
+            continue
+        scored_doc_ids = already_scored_by_query.get(query_id, set())
+        needed_ids = [
+            str(document_id)
+            for document_id in group["document_id"].tolist()
+            if str(document_id) not in scored_doc_ids
+        ][: sample_size - len(sample_docs)]
+        texts = fetch_texts_batch(corpus_conn, needed_ids)
+        for document_id in needed_ids:
+            document_text = texts.get(document_id)
+            if document_text is None:
+                continue
+            sample_queries.append(query_text)
+            sample_docs.append(document_text)
+            if len(sample_docs) >= sample_size:
+                return sample_queries, sample_docs
     return sample_queries, sample_docs
 
 
@@ -447,6 +646,7 @@ def rerank_candidates_adaptive(
     candidates_path: str,
     queries_path: str,
     corpus_path: str,
+    corpus_sqlite_path: str | None,
     relevant_path: str,
     output_path: str,
     reranker_model_name: str,
@@ -461,6 +661,8 @@ def rerank_candidates_adaptive(
     initial_budget: int,
     budget_step: int,
     max_budget: int,
+    query_skip: int,
+    query_limit: int | None,
     resume: bool,
     row_group_size: int,
     report_path: str | None,
@@ -502,26 +704,48 @@ def rerank_candidates_adaptive(
     print(f"Loading queries from {queries_path}")
     queries_df = pd.read_parquet(queries_path, columns=["id", "text"])
     queries_df["id"] = queries_df["id"].astype("string")
+    selected_query_ids = set(_query_window_ids(queries_df, query_skip, query_limit))
+    selected_query_ids.intersection_update(thresholds)
+    queries_df = queries_df[queries_df["id"].astype(str).isin(selected_query_ids)]
     queries = dict(zip(queries_df["id"].astype(str), queries_df["text"].astype(str)))
 
-    print(f"Loading corpus from {corpus_path}")
-    corpus_df = pd.read_parquet(corpus_path, columns=["id", "text"])
-    corpus_df["id"] = corpus_df["id"].astype("string")
-    corpus = dict(zip(corpus_df["id"].astype(str), corpus_df["text"].astype(str)))
+    if corpus_sqlite_path is None:
+        corpus_sqlite_path = f"{os.path.splitext(corpus_path)[0]}.sqlite"
+    build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path)
+    corpus_conn = sqlite_connect(corpus_sqlite_path)
 
     print(f"Loading candidate metadata from {candidates_path}")
-    candidates_df = pd.read_parquet(candidates_path)
-    score_column = _candidate_score_column(candidates_df, candidate_score_column)
-    candidates_df = _prepare_candidates(candidates_df, score_column, candidate_selected_column)
-    candidates_df = candidates_df[candidates_df["query_id"].astype(str).isin(thresholds)]
+    score_column = _candidate_score_column_from_names(
+        pq.ParquetFile(candidates_path).schema_arrow.names,
+        candidate_score_column,
+    )
 
-    already_scored_rows = _load_scored_rows([worker_file, output_path], ranking_column) if resume else {}
-    if already_scored_rows:
-        print(f"Resume enabled: found {len(already_scored_rows):,} already reranked pairs")
-
-    scored_by_query: dict[str, list[dict]] = defaultdict(list)
-    for row in already_scored_rows.values():
-        scored_by_query[str(row["query_id"])].append(row)
+    if resume:
+        (
+            scored_doc_ids_by_query,
+            strict_counts_by_query,
+            scored_counts_by_query,
+            complete_query_ids,
+            already_scored_count,
+        ) = _load_adaptive_resume_state(
+            worker_file=worker_file,
+            output_path=output_path,
+            ranking_column=ranking_column,
+            thresholds=thresholds,
+            selected_query_ids=selected_query_ids,
+            num_negatives=num_negatives,
+        )
+    else:
+        scored_doc_ids_by_query = {}
+        strict_counts_by_query = {}
+        scored_counts_by_query = {}
+        complete_query_ids = set()
+        already_scored_count = 0
+    if already_scored_count:
+        print(
+            f"Resume enabled: found {already_scored_count:,} already reranked pairs; "
+            f"{len(complete_query_ids):,} queries already satisfy the strict-negative target"
+        )
 
     tokenizer, reranker_model = get_reranker_model(reranker_model_name)
     print("Final reranker loaded.")
@@ -532,12 +756,16 @@ def rerank_candidates_adaptive(
             minimum=auto_reranker_batch_size_min,
             maximum=auto_reranker_batch_size_max,
         )
-        sample_queries, sample_docs = _collect_reranker_sample_from_candidate_rows(
-            candidates_df,
+        sample_queries, sample_docs = _collect_adaptive_reranker_sample(
+            candidates_path,
+            score_column,
+            candidate_selected_column,
+            selected_query_ids,
+            scored_doc_ids_by_query,
+            complete_query_ids,
             queries,
-            corpus,
+            corpus_conn,
             auto_reranker_batch_size_sample_size,
-            already_scored=set(already_scored_rows),
         )
         reranker_batch_size = benchmark_reranker_batch_size(
             tokenizer,
@@ -560,9 +788,14 @@ def rerank_candidates_adaptive(
     query_report: list[AdaptiveQueryReportRow] = []
     strict_histogram: Counter[int] = Counter()
 
-    grouped = candidates_df.groupby("query_id", sort=False)
+    grouped = _iter_candidate_query_groups(
+        candidates_path,
+        score_column,
+        candidate_selected_column,
+        selected_query_ids,
+    )
     with open(worker_file, "a", encoding="utf-8") as output_handle:
-        with tqdm(total=len(grouped), unit="query", desc="Adaptive final reranking") as pbar:
+        with tqdm(total=len(selected_query_ids), unit="query", desc="Adaptive final reranking") as pbar:
             for query_id, group in grouped:
                 qid = str(query_id)
                 threshold = thresholds.get(qid)
@@ -570,13 +803,15 @@ def rerank_candidates_adaptive(
                     pbar.update(1)
                     continue
 
-                existing_rows = scored_by_query.get(qid, [])
-                existing_doc_ids = {str(row["document_id"]) for row in existing_rows}
-                strict_count = _strict_final_count(existing_rows, ranking_column, threshold)
+                existing_doc_ids = scored_doc_ids_by_query.pop(qid, set())
+                strict_count = strict_counts_by_query.pop(qid, 0)
+                scored_count = scored_counts_by_query.pop(qid, len(existing_doc_ids))
+                if qid in complete_query_ids:
+                    strict_count = num_negatives
                 candidate_rows = group.to_dict("records")
                 query_max_budget = len(candidate_rows) if unlimited_budget else max_budget
-                query_max_budget = max(query_max_budget, min(len(existing_doc_ids), len(candidate_rows)))
-                budget_limit = min(query_max_budget, max(initial_budget, min(query_max_budget, len(existing_doc_ids))))
+                query_max_budget = max(query_max_budget, min(scored_count, len(candidate_rows)))
+                budget_limit = min(query_max_budget, max(initial_budget, min(query_max_budget, scored_count)))
 
                 while strict_count < num_negatives and budget_limit > 0 and budget_limit <= query_max_budget:
                     window = candidate_rows[: min(budget_limit, len(candidate_rows))]
@@ -591,9 +826,13 @@ def rerank_candidates_adaptive(
                     rerank_queries: list[str] = []
                     rerank_docs: list[str] = []
                     valid_rows: list[dict[str, Any]] = []
+                    texts = fetch_texts_batch(
+                        corpus_conn,
+                        [str(candidate_row["document_id"]) for candidate_row in rows_to_score],
+                    )
                     for candidate_row in rows_to_score:
                         document_id = str(candidate_row["document_id"])
-                        document_text = corpus.get(document_id)
+                        document_text = texts.get(document_id)
                         if query_text is None or document_text is None:
                             skipped_missing_text += 1
                             existing_doc_ids.add(document_id)
@@ -630,7 +869,7 @@ def rerank_candidates_adaptive(
                         row = _row_for_output(candidate_row, score, ranking_column, output_schema, extra_values)
                         rows.append(row)
                         existing_doc_ids.add(str(row["document_id"]))
-                        scored_by_query[qid].append(row)
+                        scored_count += 1
                         if final_selected:
                             strict_count += 1
 
@@ -649,12 +888,13 @@ def rerank_candidates_adaptive(
                         "strict_final_negatives": int(strict_count),
                         "target_negatives": int(num_negatives),
                         "candidate_rows": int(len(candidate_rows)),
-                        "scored_rows": int(len(existing_doc_ids)),
+                        "scored_rows": int(scored_count),
                         "budget_limit": int(min(budget_limit, query_max_budget)),
                     }
                 )
                 pbar.update(1)
 
+    corpus_conn.close()
     print(f"Newly reranked pairs: {newly_scored:,}")
     consolidate_worker_jsonl(worker_file, output_path, output_schema, row_group_size=row_group_size)
 
@@ -668,6 +908,8 @@ def rerank_candidates_adaptive(
         "budget_step": budget_step,
         "max_budget": max_budget,
         "unlimited_budget": unlimited_budget,
+        "query_skip": query_skip,
+        "query_limit": query_limit,
         "queries_with_candidates": len(query_report),
         "complete_queries": complete_queries,
         "partial_queries": len(query_report) - complete_queries,
@@ -705,6 +947,9 @@ def rerank_candidates(
     initial_budget: int = 20,
     budget_step: int = 10,
     max_budget: int = 80,
+    query_skip: int = 0,
+    query_limit: int | None = None,
+    corpus_sqlite_path: str | None = None,
     report_path: str | None = None,
     auto_reranker_batch_size_candidates: str | None = None,
     auto_reranker_batch_size_min: int = 1,
@@ -736,6 +981,7 @@ def rerank_candidates(
             candidates_path=candidates_path,
             queries_path=queries_path,
             corpus_path=corpus_path,
+            corpus_sqlite_path=corpus_sqlite_path,
             relevant_path=relevant_path,
             output_path=output_path,
             reranker_model_name=reranker_model_name,
@@ -750,6 +996,8 @@ def rerank_candidates(
             initial_budget=initial_budget,
             budget_step=budget_step,
             max_budget=max_budget,
+            query_skip=query_skip,
+            query_limit=query_limit,
             resume=resume,
             row_group_size=row_group_size,
             report_path=report_path,
@@ -772,6 +1020,8 @@ def rerank_candidates(
     print(f"Loading queries from {queries_path}")
     queries_df = pd.read_parquet(queries_path, columns=["id", "text"])
     queries_df["id"] = queries_df["id"].astype("string")
+    selected_query_ids = set(_query_window_ids(queries_df, query_skip, query_limit))
+    queries_df = queries_df[queries_df["id"].astype(str).isin(selected_query_ids)]
     queries_df = queries_df.rename(columns={"text": "query_text"}).set_index("id")
 
     print(f"Loading corpus from {corpus_path}")
@@ -896,6 +1146,7 @@ def main() -> None:
     )
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"))
+    parser.add_argument("--corpus_sqlite_path", type=str, default=config("CORPUS_SQLITE_PATH", default=None))
     parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
     parser.add_argument(
         "--reranker_model_name", type=str, default=config("FINAL_RERANKER_NAME", default=config("RERANKER_NAME"))
@@ -988,6 +1239,14 @@ def main() -> None:
         default=config("FINAL_RERANK_MAX_BUDGET", cast=int, default=max(1, num_negatives_default * 8)),
         help="Maximum candidates to final-rerank per query. Use 0 to allow all candidates for each query.",
     )
+    parser.add_argument("--query_skip", type=int, default=config("PIPELINE_SAMPLE_SKIP", cast=int, default=0))
+    sample_limit = config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0)
+    parser.add_argument(
+        "--query_limit",
+        type=int,
+        default=sample_limit if sample_limit > 0 else None,
+        help="Limit query count for smoke runs. Values <=0 mean no limit.",
+    )
     parser.add_argument("--report_path", type=str, default=config("FINAL_RERANK_REPORT_PATH", default=None))
     parser.add_argument("--selected-only", dest="selected_only", action="store_true")
     parser.add_argument("--all-candidates", dest="selected_only", action="store_false")
@@ -1029,6 +1288,9 @@ def main() -> None:
         initial_budget=args.initial_budget,
         budget_step=args.budget_step,
         max_budget=args.max_budget,
+        query_skip=args.query_skip,
+        query_limit=args.query_limit,
+        corpus_sqlite_path=args.corpus_sqlite_path,
         report_path=report_path,
         auto_reranker_batch_size_candidates=args.auto_reranker_batch_size_candidates,
         auto_reranker_batch_size_min=args.auto_reranker_batch_size_min,

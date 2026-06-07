@@ -122,3 +122,39 @@ def test_process_relevant_preserves_extra_relevant_columns(monkeypatch, tmp_path
         "lightonai_positive_score": [0.75],
         "positive_ranking": [1.25],
     }
+
+
+def test_process_relevant_expanding_limit_scores_only_missing_pairs(monkeypatch, tmp_path):
+    queries_path = tmp_path / "queries.parquet"
+    corpus_path = tmp_path / "corpus.parquet"
+    relevant_path = tmp_path / "relevant.parquet"
+    output_path = tmp_path / "relevant_with_score.parquet"
+
+    pd.DataFrame({"id": ["q1", "q2"], "text": ["query one", "query two"]}).to_parquet(queries_path, index=False)
+    pd.DataFrame({"id": ["d1", "d2"], "text": ["doc one", "doc two"]}).to_parquet(corpus_path, index=False)
+    pd.DataFrame({"query_id": ["q1", "q2"], "document_id": ["d1", "d2"]}).to_parquet(relevant_path, index=False)
+
+    monkeypatch.setattr(apr, "get_reranker_model", lambda _model_name: (object(), object()))
+    calls = []
+
+    def fake_rerank(_tokenizer, _model, _queries, docs, batch_size, model_name):
+        calls.append(list(docs))
+        return [1.0] * len(docs)
+
+    monkeypatch.setattr(apr, "rerank", fake_rerank)
+    kwargs = {
+        "queries_path": str(queries_path),
+        "corpus_path": str(corpus_path),
+        "relevant_path": str(relevant_path),
+        "output_path": str(output_path),
+        "chunk_size": 2,
+        "reranker_batch_size": 2,
+        "reranker_model_name": "positive-model",
+        "score_column": "positive_ranking",
+    }
+
+    apr.process_relevant(**kwargs, offset=1)
+    apr.process_relevant(**kwargs, offset=None)
+
+    assert calls == [["doc one"], ["doc two"]]
+    assert set(pd.read_parquet(output_path)["document_id"]) == {"d1", "d2"}

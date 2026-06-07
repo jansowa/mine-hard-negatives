@@ -3,6 +3,7 @@ import glob
 import os
 import re
 import shutil
+import sqlite3
 import uuid
 from collections.abc import Iterable
 from functools import partial
@@ -19,6 +20,7 @@ from batch_tuning import (
     parse_batch_size_candidates,
     validate_batch_size_options,
 )
+from create_flag_embedding_jsonl import build_or_load_corpus_sqlite, fetch_texts_batch, sqlite_connect
 from models import get_reranker_model, rerank
 
 _MISSING = object()
@@ -227,7 +229,8 @@ def _finalize_single_file(parts_dir: str, output_path: str, schema: pa.schema, c
         print(f"[Finalize] No parts found in: {parts_dir}")
         return
 
-    print(f"[Finalize] Merging {len(parts)} parts into: {output_path}")
+    sources = ([output_path] if os.path.isfile(output_path) else []) + parts
+    print(f"[Finalize] Merging {len(sources)} source file(s) into: {output_path}")
 
     temp_out = f"{output_path}.tmp-{uuid.uuid4().hex}"
     if os.path.exists(temp_out):
@@ -236,9 +239,9 @@ def _finalize_single_file(parts_dir: str, output_path: str, schema: pa.schema, c
     writer = pq.ParquetWriter(temp_out, schema=schema, compression=compression, use_dictionary=True)
 
     try:
-        with tqdm(total=len(parts), desc="Finalizing (merging parts)", unit="part") as pbar:
-            for part_path in parts:
-                table = pq.read_table(part_path)
+        with tqdm(total=len(sources), desc="Finalizing (merging parts)", unit="part") as pbar:
+            for source_path in sources:
+                table = pq.read_table(source_path)
                 if table.schema != schema:
                     table = table.cast(schema)
                 writer.write_table(table)
@@ -407,7 +410,8 @@ def _filter_relevant_to_missing(
 def _collect_reranker_sample_pairs(
     filtered_relevant_path: str,
     queries_df: pd.DataFrame,
-    corpus_df: pd.DataFrame,
+    corpus_df: pd.DataFrame | None,
+    corpus_conn: sqlite3.Connection | None,
     sample_size: int,
     chunk_size: int,
 ) -> tuple[list[str], list[str]]:
@@ -424,10 +428,7 @@ def _collect_reranker_sample_pairs(
         if relevant_chunk_df.empty:
             continue
 
-        merged_chunk_df: pd.DataFrame = pd.merge(
-            relevant_chunk_df, queries_df, left_on="query_id", right_index=True, how="inner"
-        )
-        merged_chunk_df = pd.merge(merged_chunk_df, corpus_df, left_on="document_id", right_index=True, how="inner")
+        merged_chunk_df = _merge_pair_texts(relevant_chunk_df, queries_df, corpus_df, corpus_conn)
         if merged_chunk_df.empty:
             continue
 
@@ -440,6 +441,26 @@ def _collect_reranker_sample_pairs(
                 return sample_queries, sample_docs
 
     return sample_queries, sample_docs
+
+
+def _merge_pair_texts(
+    pairs_df: pd.DataFrame,
+    queries_df: pd.DataFrame,
+    corpus_df: pd.DataFrame | None,
+    corpus_conn: sqlite3.Connection | None,
+) -> pd.DataFrame:
+    merged_df = pd.merge(pairs_df, queries_df, left_on="query_id", right_index=True, how="inner")
+    if merged_df.empty:
+        return merged_df
+    if corpus_df is not None:
+        return pd.merge(merged_df, corpus_df, left_on="document_id", right_index=True, how="inner")
+    if corpus_conn is None:
+        raise ValueError("Either corpus_df or corpus_conn is required")
+
+    document_ids = merged_df["document_id"].astype(str).tolist()
+    texts = fetch_texts_batch(corpus_conn, list(dict.fromkeys(document_ids)))
+    merged_df["document_text"] = merged_df["document_id"].astype(str).map(texts)
+    return merged_df.dropna(subset=["document_text"])
 
 
 def process_relevant(
@@ -458,6 +479,7 @@ def process_relevant(
     auto_reranker_batch_size_max: int = 64,
     auto_reranker_batch_size_sample_size: int = 128,
     auto_reranker_batch_size_memory_utilization: float = 0.70,
+    corpus_sqlite_path: str | None = None,
 ) -> None:
     if not score_column:
         raise ValueError("score_column must not be empty")
@@ -483,11 +505,19 @@ def process_relevant(
         queries_df["id"] = queries_df["id"].astype("string")
         queries_df = queries_df.rename(columns={"text": "query_text"}).set_index("id")
 
-        corpus_df: pd.DataFrame = pd.read_parquet(corpus_path, columns=["id", "text"])
-        corpus_df["id"] = corpus_df["id"].astype("string")
-        corpus_df = corpus_df.rename(columns={"text": "document_text"}).set_index("id")
-        print("Files queries.parquet and corpus.parquet loaded and prepared.")
-        print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
+        corpus_df: pd.DataFrame | None = None
+        corpus_conn: sqlite3.Connection | None = None
+        if corpus_sqlite_path:
+            build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path)
+            corpus_conn = sqlite_connect(corpus_sqlite_path)
+            print("Queries loaded; corpus texts will be fetched from SQLite.")
+            print(f"Queries DataFrame shape: {queries_df.shape}")
+        else:
+            corpus_df = pd.read_parquet(corpus_path, columns=["id", "text"])
+            corpus_df["id"] = corpus_df["id"].astype("string")
+            corpus_df = corpus_df.rename(columns={"text": "document_text"}).set_index("id")
+            print("Files queries.parquet and corpus.parquet loaded and prepared.")
+            print(f"Queries DataFrame shape: {queries_df.shape}, Corpus DataFrame shape: {corpus_df.shape}")
 
         already_scored_pairs: set[str] = _load_scored_pairs(output_path)
         already_scored_count = len(already_scored_pairs)
@@ -524,6 +554,7 @@ def process_relevant(
                 filtered_relevant_path,
                 queries_df,
                 corpus_df,
+                corpus_conn,
                 auto_reranker_batch_size_sample_size,
                 chunk_size,
             )
@@ -563,12 +594,7 @@ def process_relevant(
                 if relevant_chunk_df.empty:
                     continue
 
-                merged_chunk_df: pd.DataFrame = pd.merge(
-                    relevant_chunk_df, queries_df, left_on="query_id", right_index=True, how="inner"
-                )
-                merged_chunk_df = pd.merge(
-                    merged_chunk_df, corpus_df, left_on="document_id", right_index=True, how="inner"
-                )
+                merged_chunk_df = _merge_pair_texts(relevant_chunk_df, queries_df, corpus_df, corpus_conn)
                 if merged_chunk_df.empty:
                     pbar.update(len(relevant_chunk_df))
                     continue
@@ -618,6 +644,11 @@ def process_relevant(
         traceback.print_exc()
     finally:
         try:
+            if "corpus_conn" in locals() and corpus_conn is not None:
+                corpus_conn.close()
+        except Exception:
+            pass
+        try:
             if (
                 "filtered_relevant_path" in locals()
                 and filtered_relevant_path
@@ -637,6 +668,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--corpus_path", type=str, default=config("CORPUS_PATH"), help="Path to parquet file with corpus"
+    )
+    parser.add_argument(
+        "--corpus_sqlite_path",
+        type=str,
+        default=config("CORPUS_SQLITE_PATH", default=None),
+        help="Optional SQLite corpus index used instead of loading the complete corpus into memory.",
     )
     parser.add_argument(
         "--relevant_path",
@@ -748,4 +785,5 @@ if __name__ == "__main__":
             if args.auto_reranker_batch_size_memory_utilization is not None
             else auto_defaults["memory_utilization"]
         ),
+        corpus_sqlite_path=args.corpus_sqlite_path,
     )

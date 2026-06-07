@@ -77,6 +77,8 @@ def _score_rows(
         query = str(row["query"])
         pos = as_text_list(row.get("pos"), "pos")
         neg = as_text_list(row.get("neg"), "neg")
+        if "pos_is_synthetic" not in row:
+            row["pos_is_synthetic"] = [False] * len(pos)
 
         pos_start = None
         if score_positives:
@@ -288,4 +290,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

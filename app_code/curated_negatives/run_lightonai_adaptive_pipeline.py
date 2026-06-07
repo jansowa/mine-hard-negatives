@@ -13,15 +13,21 @@ if __package__ in {None, ""}:
     from curated_negatives.lightonai_to_pipeline_artifacts import (
         export_lightonai_pipeline_artifacts,
         parse_splits,
+        pipeline_artifacts_exist,
         split_output_dir,
     )
 else:
     from .lightonai_to_flag_embedding import DEFAULT_DATASET_NAME
-    from .lightonai_to_pipeline_artifacts import export_lightonai_pipeline_artifacts, parse_splits, split_output_dir
+    from .lightonai_to_pipeline_artifacts import (
+        export_lightonai_pipeline_artifacts,
+        parse_splits,
+        pipeline_artifacts_exist,
+        split_output_dir,
+    )
 
 from add_positives_ranks import get_positive_ranks_auto_batch_defaults, process_relevant
 from create_flag_embedding_jsonl import process_negatives_streaming
-from rerank_negative_candidates import rerank_candidates
+from rerank_negative_candidates import consolidate_existing_worker_output, rerank_candidates
 
 STAGE_ORDER = ("artifacts", "positives", "negatives", "jsonl")
 
@@ -62,6 +68,12 @@ def _config_first(names: tuple[str, ...], *, cast=None, default=None):
     return default
 
 
+def _positive_int_or_none(value: int | None) -> int | None:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
 def _parse_stages(raw_stages: str) -> list[str]:
     stages = [stage.strip() for stage in raw_stages.split(",") if stage.strip()]
     if not stages:
@@ -99,16 +111,25 @@ def run_lightonai_split(
     load_num_proc: int | None,
 ) -> None:
     paths = split_paths(output_root, split)
+    query_skip = config("PIPELINE_SAMPLE_SKIP", cast=int, default=0)
+    query_limit = _positive_int_or_none(config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0))
     print(f"\n=== LightOn split: {split} -> {paths.output_dir} ===")
 
     if "artifacts" in stages:
-        export_lightonai_pipeline_artifacts(
-            output_dir=paths.output_dir,
-            dataset_name=dataset_name,
-            split=split,
-            hf_cache_dir=hf_cache_dir,
-            load_num_proc=load_num_proc,
-        )
+        if pipeline_artifacts_exist(paths.output_dir) and not config(
+            "LIGHTONAI_REBUILD_ARTIFACTS",
+            cast=bool,
+            default=False,
+        ):
+            print("Artifacts already exist; skipping artifact rebuild.")
+        else:
+            export_lightonai_pipeline_artifacts(
+                output_dir=paths.output_dir,
+                dataset_name=dataset_name,
+                split=split,
+                hf_cache_dir=hf_cache_dir,
+                load_num_proc=load_num_proc,
+            )
 
     if "positives" in stages:
         auto_defaults = get_positive_ranks_auto_batch_defaults(final_step=True)
@@ -127,11 +148,14 @@ def run_lightonai_split(
                 ("FINAL_POSITIVE_RANKS_SCORE_COLUMN", "FINAL_POSITIVE_SCORE_COLUMN", "POSITIVE_SCORE_COLUMN"),
                 default="positive_ranking",
             ),
+            skip=query_skip,
+            offset=query_limit,
             auto_reranker_batch_size_candidates=auto_defaults["candidates"],
             auto_reranker_batch_size_min=auto_defaults["min"],
             auto_reranker_batch_size_max=auto_defaults["max"],
             auto_reranker_batch_size_sample_size=auto_defaults["sample_size"],
             auto_reranker_batch_size_memory_utilization=auto_defaults["memory_utilization"],
+            corpus_sqlite_path=paths.corpus_sqlite_path,
         )
 
     if "negatives" in stages:
@@ -162,6 +186,9 @@ def run_lightonai_split(
             initial_budget=config("FINAL_RERANK_INITIAL_BUDGET", cast=int, default=max(1, num_negatives * 2)),
             budget_step=config("FINAL_RERANK_BUDGET_STEP", cast=int, default=max(1, num_negatives)),
             max_budget=config("FINAL_RERANK_MAX_BUDGET", cast=int, default=max(1, num_negatives * 8)),
+            query_skip=query_skip,
+            query_limit=query_limit,
+            corpus_sqlite_path=paths.corpus_sqlite_path,
             report_path=paths.negatives_report_path,
             auto_reranker_batch_size_candidates=config("FINAL_AUTO_RERANKER_BATCH_SIZE_CANDIDATES", default=None),
             auto_reranker_batch_size_min=config("FINAL_AUTO_RERANKER_BATCH_SIZE_MIN", cast=int, default=1),
@@ -175,6 +202,17 @@ def run_lightonai_split(
         )
 
     if "jsonl" in stages:
+        if not consolidate_existing_worker_output(
+            candidates_path=paths.negative_candidates_path,
+            output_path=paths.negatives_path,
+            ranking_column=config("FINAL_RANKING_COLUMN", default="final_ranking"),
+            rerank_mode=config("FINAL_RERANK_MODE", default="adaptive"),
+            row_group_size=config("NEGATIVES_PARQUET_ROW_GROUP_SIZE", cast=int, default=100_000),
+        ):
+            raise FileNotFoundError(
+                f"Neither {paths.negatives_path} nor its worker JSONL exists. "
+                "Run the negatives stage before exporting JSONL."
+            )
         process_negatives_streaming(
             corpus_path=paths.corpus_path,
             queries_path=paths.queries_path,
@@ -200,6 +238,18 @@ def run_lightonai_split(
             dataset_type=config("FLAG_EMBEDDING_TYPE", default="retrieval"),
             backfill_policy=config("BACKFILL_POLICY", default="relaxed"),
             report_path=paths.jsonl_report_path,
+            mine_positives=config("MINE_POSITIVES", cast=bool, default=False),
+            max_mined_positives=config("MAX_MINED_POSITIVES", cast=int, default=1),
+            u_sanity_ceiling=config("U_SANITY_CEILING", cast=float, default=0.90),
+            u_absolute_ceiling=config("U_ABSOLUTE_CEILING", cast=float, default=0.995),
+            u_positive_beta=config("U_POSITIVE_BETA", cast=float, default=0.95),
+            positive_near_duplicate_threshold=config(
+                "POSITIVE_NEAR_DUPLICATE_THRESHOLD",
+                cast=float,
+                default=0.80,
+            ),
+            query_skip=query_skip,
+            query_limit=query_limit,
         )
 
 

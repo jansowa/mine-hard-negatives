@@ -54,6 +54,7 @@ def test_lightonai_processor_maps_to_flag_embedding_row():
         "neg": ["first negative", "second negative"],
         "pos_scores": [1.0],
         "neg_scores": [0.4, 0.8],
+        "pos_is_synthetic": [False],
         "prompt": "Represent this sentence for searching relevant passages:",
         "type": "retrieval",
         "source_dataset": "lightonai/embeddings-fine-tuning",
@@ -102,11 +103,11 @@ def test_lightonai_pipeline_artifacts_are_compact_parquet_files(tmp_path):
         "lightonai_positive_score": [0.9, 0.8],
     }
     assert candidates_df["query_id"].tolist() == ["10", "10", "20"]
-    assert candidates_df["document_id"].tolist() == ["2", "3", "2"]
-    assert candidates_df["candidate_ranking"].tolist() == [0.4, 0.6, 0.1]
-    assert candidates_df["lightonai_score"].tolist() == [0.4, 0.6, 0.1]
+    assert candidates_df["document_id"].tolist() == ["3", "2", "2"]
+    assert candidates_df["candidate_ranking"].tolist() == [0.6, 0.4, 0.1]
+    assert candidates_df["lightonai_score"].tolist() == [0.6, 0.4, 0.1]
     assert candidates_df["candidate_selected"].tolist() == [True, True, True]
-    assert candidates_df["retrieval_rank"].tolist() == [0, 1, 0]
+    assert candidates_df["retrieval_rank"].tolist() == [1, 0, 0]
     assert candidates_df["retrieval_source"].tolist() == ["lightonai", "lightonai", "lightonai"]
     assert not {"query", "document", "text", "query_text", "document_text"} & set(candidates_df.columns)
 
@@ -178,6 +179,10 @@ def test_lightonai_pipeline_runner_uses_env_defaults_and_split_dirs(monkeypatch,
     monkeypatch.setenv("MAX_NEG_REUSE", "17")
     monkeypatch.setenv("POSITIVE_ORIGINAL_SCORE_COLUMN", "lightonai_positive_score")
     monkeypatch.setenv("NEGATIVE_ORIGINAL_SCORE_COLUMN", "candidate_ranking")
+    monkeypatch.setenv("PIPELINE_SAMPLE_SKIP", "2")
+    monkeypatch.setenv("PIPELINE_SAMPLE_LIMIT", "5")
+    monkeypatch.setenv("MINE_POSITIVES", "true")
+    monkeypatch.setenv("MAX_MINED_POSITIVES", "1")
 
     monkeypatch.setattr(runner, "export_lightonai_pipeline_artifacts", lambda **kwargs: calls.append(("artifacts", kwargs)))
 
@@ -190,6 +195,7 @@ def test_lightonai_pipeline_runner_uses_env_defaults_and_split_dirs(monkeypatch,
         calls.append(("negatives", kwargs))
 
     monkeypatch.setattr(runner, "rerank_candidates", fake_rerank_candidates)
+    monkeypatch.setattr(runner, "consolidate_existing_worker_output", lambda **_kwargs: True)
 
     def fake_process_negatives_streaming(**kwargs):
         calls.append(("jsonl", kwargs))
@@ -208,12 +214,42 @@ def test_lightonai_pipeline_runner_uses_env_defaults_and_split_dirs(monkeypatch,
     assert calls[4][1]["output_dir"] == str(tmp_path / "nq")
     assert calls[1][1]["queries_path"] == str(tmp_path / "fiqa" / "queries.parquet")
     assert calls[1][1]["output_path"] == str(tmp_path / "fiqa" / "relevant_with_score.parquet")
+    assert calls[1][1]["skip"] == 2
+    assert calls[1][1]["offset"] == 5
     assert calls[2][1]["num_negatives"] == 7
     assert calls[2][1]["max_budget"] == 0
     assert calls[2][1]["candidate_score_column"] == "candidate_ranking"
+    assert calls[2][1]["query_skip"] == 2
+    assert calls[2][1]["query_limit"] == 5
     assert calls[3][1]["output_path"] == str(tmp_path / "fiqa" / "train.jsonl")
     assert calls[3][1]["positive_original_score_column"] == "lightonai_positive_score"
     assert calls[3][1]["negative_original_score_column"] == "candidate_ranking"
+    assert calls[3][1]["mine_positives"] is True
+    assert calls[3][1]["query_skip"] == 2
+    assert calls[3][1]["query_limit"] == 5
+
+
+def test_lightonai_pipeline_runner_reuses_complete_artifacts(monkeypatch, tmp_path):
+    import curated_negatives.run_lightonai_adaptive_pipeline as runner
+
+    split_dir = tmp_path / "fiqa"
+    split_dir.mkdir()
+    for filename in ("queries.parquet", "corpus.parquet", "relevant.parquet", "negative_candidates.parquet"):
+        (split_dir / filename).write_bytes(b"existing")
+
+    monkeypatch.setenv("LIGHTONAI_REBUILD_ARTIFACTS", "false")
+
+    def fail_export(**_kwargs):
+        raise AssertionError("complete artifacts should be reused")
+
+    monkeypatch.setattr(runner, "export_lightonai_pipeline_artifacts", fail_export)
+
+    run_lightonai_pipeline(
+        splits=["fiqa"],
+        output_root=str(tmp_path),
+        dataset_name="lightonai/embeddings-fine-tuning",
+        stages=["artifacts"],
+    )
 
 
 def test_score_flag_embedding_jsonl_moves_existing_scores_and_writes_reranker_scores(monkeypatch, tmp_path):
@@ -268,9 +304,11 @@ def test_score_flag_embedding_jsonl_moves_existing_scores_and_writes_reranker_sc
         len("query one") + len("negative a"),
         len("query one") + len("negative b"),
     ]
+    assert rows[0]["pos_is_synthetic"] == [False]
     assert "original_pos_scores" not in rows[1]
     assert rows[1]["pos_scores"] == [len("query two") + len("other positive")]
     assert rows[1]["neg_scores"] == [len("query two") + len("other negative")]
+    assert rows[1]["pos_is_synthetic"] == [False]
 
 
 def test_score_flag_embedding_jsonl_resume_skips_rows_from_incomplete_file(monkeypatch, tmp_path):

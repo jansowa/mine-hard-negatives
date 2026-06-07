@@ -110,6 +110,7 @@ class LightOnKDToFlagEmbedding:
             "neg": negative_texts,
             "pos_scores": [positive_score],
             "neg_scores": negative_scores,
+            "pos_is_synthetic": [False],
             "prompt": self.prompt,
             "type": self.dataset_type,
             "source_dataset": self.source_dataset,
@@ -172,8 +173,8 @@ def build_lightonai_flag_embedding_dataset(
         include_ids=include_ids,
     )
 
-    filter_kwargs = {"desc": f"Filtering {split} rows with <{num_negatives} valid negatives"}
-    map_kwargs = {
+    filter_kwargs: dict[str, Any] = {"desc": f"Filtering {split} rows with <{num_negatives} valid negatives"}
+    map_kwargs: dict[str, Any] = {
         "remove_columns": scores.column_names,
         "desc": f"Creating FlagEmbedding rows for {split}",
     }
@@ -184,6 +185,15 @@ def build_lightonai_flag_embedding_dataset(
     return scores.filter(processor.has_enough_negatives, **filter_kwargs).map(
         processor.map_to_flag_embedding,
         **map_kwargs,
+    )
+
+
+def _ensure_pos_is_synthetic(dataset: datasets.Dataset) -> datasets.Dataset:
+    if "pos_is_synthetic" in dataset.column_names:
+        return dataset
+    return dataset.map(
+        lambda row: {"pos_is_synthetic": [False] * len(row.get("pos") or [])},
+        desc="Adding synthetic-positive metadata",
     )
 
 
@@ -203,7 +213,7 @@ def load_or_build_lightonai_flag_embedding_dataset(
     cache_path = os.path.join(processed_cache_dir, split) if processed_cache_dir else None
     if cache_path and os.path.isdir(cache_path):
         print(f"Loaded processed {split} split from {cache_path}")
-        return datasets.load_from_disk(cache_path)
+        return _ensure_pos_is_synthetic(datasets.load_from_disk(cache_path))
 
     dataset = build_lightonai_flag_embedding_dataset(
         dataset_name=dataset_name,
@@ -220,7 +230,7 @@ def load_or_build_lightonai_flag_embedding_dataset(
     if cache_path:
         ensure_parent_dir(os.path.join(cache_path, "dataset_info.json"))
         dataset.save_to_disk(cache_path)
-    return dataset
+    return _ensure_pos_is_synthetic(dataset)
 
 
 def export_lightonai_split_to_jsonl(

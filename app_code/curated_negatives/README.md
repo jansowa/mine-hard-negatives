@@ -38,6 +38,7 @@ LIGHTONAI_DATASET_NAME="lightonai/embeddings-fine-tuning"
 LIGHTONAI_SPLITS="fiqa"
 LIGHTONAI_PIPELINE_ROOT="data/lightonai_pipeline"
 LIGHTONAI_STAGES="artifacts,positives,negatives,jsonl"
+LIGHTONAI_REBUILD_ARTIFACTS=false
 ```
 
 `FINAL_RERANK_MAX_BUDGET=0` means adaptive final reranking may inspect all LightOn candidates for a query
@@ -68,6 +69,8 @@ LIGHTONAI_SPLITS="fiqa,nq,msmarco"
 ```
 
 and run the same command again. Each split gets its own folder under `LIGHTONAI_PIPELINE_ROOT`.
+Complete existing compact artifacts are reused automatically. Set
+`LIGHTONAI_REBUILD_ARTIFACTS=true` only when a split must be downloaded and rebuilt intentionally.
 
 You can also run a subset of stages, for example after artifacts already exist:
 
@@ -77,6 +80,40 @@ python app_code/curated_negatives/run_lightonai_adaptive_pipeline.py --stages po
 
 Original LightOn scores are preserved under `original_pos_scores` and `original_neg_scores`; final reranker
 scores remain the main `pos_scores` and `neg_scores`.
+
+### Smoke runs, resume, and synthetic positives
+
+Use a deterministic query window for a quick LightOn experiment:
+
+```dotenv
+PIPELINE_SAMPLE_SKIP=0
+PIPELINE_SAMPLE_LIMIT=100
+```
+
+Later set `PIPELINE_SAMPLE_LIMIT=0` and run the same command. Positive and candidate score artifacts keep
+completed query-document pairs, so the reranker scores only missing pairs. The final JSONL is rebuilt for the
+currently selected query window.
+
+If final reranking was interrupted after scores reached `negatives_worker_0_0.jsonl` but before
+`negatives.parquet` was created, running only the `jsonl` stage automatically consolidates that worker file.
+This does not load the reranker or calculate new scores.
+
+Synthetic-positive mining runs only while exporting JSONL. It considers candidates already scored by the final
+reranker; it never expands adaptive reranking and never invokes a model:
+
+```dotenv
+MINE_POSITIVES=true
+MAX_MINED_POSITIVES=1
+U_SANITY_CEILING=0.90
+U_ABSOLUTE_CEILING=0.995
+U_POSITIVE_BETA=0.95
+POSITIVE_NEAR_DUPLICATE_THRESHOLD=0.80
+```
+
+All `U_*` thresholds operate on percentiles of final-reranker scores for organic positives. A candidate must pass
+the sanity ceiling and either the absolute ceiling or the beta-relative threshold. Candidates with at least 80%
+word-token overlap with any organic or already selected synthetic positive are rejected. Every exported row
+contains `pos_is_synthetic`, aligned with `pos`, `pos_id`, and `pos_scores`.
 
 For the older name used in LightOn's sample code, pass:
 

@@ -186,6 +186,31 @@ The JSONL builder first chooses strict final negatives. With `BACKFILL_POLICY=re
 slots from the safest final-scored relaxed candidates instead of silently producing very short negative lists.
 It also writes an export report with the final negatives-per-query histogram.
 
+## Optional synthetic-positive mining
+
+`create_flag_embedding_jsonl.py` can promote already reranked candidates to synthetic positives. This works for
+the standard one-stage flow, optional two-stage flow, and curated LightOn flow. It does not call the reranker or
+expand candidate search; only score rows already present in `NEGATIVES_PATH` are considered.
+
+Enable the conservative defaults in `.env`:
+
+```dotenv
+MINE_POSITIVES=true
+MAX_MINED_POSITIVES=1
+U_SANITY_CEILING=0.90
+U_ABSOLUTE_CEILING=0.995
+U_POSITIVE_BETA=0.95
+POSITIVE_NEAR_DUPLICATE_THRESHOLD=0.80
+```
+
+The thresholds use percentiles of the final reranker's organic-positive score distribution. A candidate must
+pass `U_SANITY_CEILING` and either `U_ABSOLUTE_CEILING` or the beta-relative threshold against the strongest
+organic positive for that query. Candidates with at least 80% word-token overlap with an organic or already
+selected synthetic positive are rejected.
+
+Every final JSONL row contains `pos_is_synthetic`, aligned with `pos`, `pos_id`, and `pos_scores`. Synthetic
+positive IDs are excluded from the negative list.
+
 ## Backend notes
 
 - `VECTOR_DB_BACKEND=lancedb` uses dense retrieval + LanceDB BM25/hybrid.

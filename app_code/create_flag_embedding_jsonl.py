@@ -4,13 +4,17 @@ os.environ.setdefault("POLARS_MAX_THREADS", "12")
 
 import argparse
 import json
+import re
 import sqlite3
 from collections import Counter
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 from decouple import config
 from tqdm.auto import tqdm
+
+WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 # --------------------------- SQLite utils ---------------------------
 
@@ -102,6 +106,11 @@ def inc_counts_batch(conn: sqlite3.Connection, ids: list[str]):
     )
 
 
+def reset_neg_counts(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM neg_count")
+    conn.commit()
+
+
 def write_report(report_path: str | None, report: dict) -> None:
     if not report_path:
         return
@@ -137,6 +146,26 @@ def inv_percentile_from_ecdf(p: np.ndarray | float, ecdf_x: np.ndarray, ecdf_y: 
     return ecdf_x[idx]
 
 
+def token_counts(text: str) -> Counter[str]:
+    return Counter(WORD_RE.findall((text or "").casefold()))
+
+
+def token_overlap_ratio(left: str, right: str) -> float:
+    left_counts = token_counts(left)
+    right_counts = token_counts(right)
+    denominator = min(sum(left_counts.values()), sum(right_counts.values()))
+    if denominator == 0:
+        return 1.0 if left_counts == right_counts else 0.0
+    overlap = sum((left_counts & right_counts).values())
+    return overlap / denominator
+
+
+def is_near_duplicate(candidate_text: str, reference_texts: list[str], threshold: float) -> bool:
+    if not candidate_text.strip():
+        return True
+    return any(token_overlap_ratio(candidate_text, reference_text) >= threshold for reference_text in reference_texts)
+
+
 # --------------------------- Build corpus SQLite ---------------------------
 
 
@@ -146,23 +175,24 @@ def build_or_load_corpus_sqlite(
     conn = sqlite_connect(corpus_sqlite_path)
     ensure_corpus_db(conn)
 
+    parquet_file = pq.ParquetFile(corpus_path)
+    expected_rows = parquet_file.metadata.num_rows
     cur = conn.execute("SELECT COUNT(1) FROM corpus;")
-    if cur.fetchone()[0] > 0:
+    existing_rows = int(cur.fetchone()[0])
+    if existing_rows == expected_rows:
         conn.close()
         return
 
-    ds = pl.scan_parquet(corpus_path).select([pl.col(id_col).cast(pl.Utf8), pl.col(text_col).cast(pl.Utf8)])
-
-    df = ds.collect()
-
-    n = df.height
-    with tqdm(total=n, desc="Budowanie bazy korpusu (SQLite)", unit="rows") as pbar:
-        for start in range(0, n, block_rows):
-            end = min(start + block_rows, n)
-            chunk = df.slice(start, end - start)
-            rows = zip(chunk[id_col].to_list(), chunk[text_col].to_list())
+    with tqdm(total=expected_rows, desc="Budowanie bazy korpusu (SQLite)", unit="rows") as pbar:
+        for batch in parquet_file.iter_batches(columns=[id_col, text_col], batch_size=block_rows):
+            ids = batch.column(batch.schema.get_field_index(id_col)).to_pylist()
+            texts = batch.column(batch.schema.get_field_index(text_col)).to_pylist()
+            rows = (
+                (str(row_id), "" if text is None else str(text))
+                for row_id, text in zip(ids, texts)
+            )
             bulk_upsert_corpus(conn, rows)
-            pbar.update(end - start)
+            pbar.update(batch.num_rows)
 
     conn.close()
 
@@ -192,6 +222,14 @@ def process_negatives_streaming(
     dataset_type: str = "retrieval",
     backfill_policy: str = "relaxed",
     report_path: str | None = None,
+    mine_positives: bool = False,
+    max_mined_positives: int = 1,
+    u_sanity_ceiling: float = 0.90,
+    u_absolute_ceiling: float = 0.995,
+    u_positive_beta: float = 0.95,
+    positive_near_duplicate_threshold: float = 0.80,
+    query_skip: int = 0,
+    query_limit: int | None = None,
 ):
     if not positive_score_column:
         raise ValueError("positive_score_column must not be empty")
@@ -199,6 +237,23 @@ def process_negatives_streaming(
         raise ValueError("negative_score_column must not be empty")
     if backfill_policy not in {"none", "relaxed"}:
         raise ValueError("backfill_policy must be one of: none, relaxed")
+    if max_mined_positives < 0:
+        raise ValueError("max_mined_positives must be greater than or equal to 0")
+    if query_skip < 0:
+        raise ValueError("query_skip must be greater than or equal to 0")
+    if query_limit is not None and query_limit < 0:
+        raise ValueError("query_limit must be greater than or equal to 0 or None")
+    if query_limit == 0:
+        query_limit = None
+    for name, value in (
+        ("u_sanity_ceiling", u_sanity_ceiling),
+        ("u_absolute_ceiling", u_absolute_ceiling),
+        ("positive_near_duplicate_threshold", positive_near_duplicate_threshold),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
+    if u_positive_beta < 0.0:
+        raise ValueError("u_positive_beta must be greater than or equal to 0")
 
     try:
         pl.enable_string_cache()
@@ -213,10 +268,12 @@ def process_negatives_streaming(
 
     neg_conn = sqlite_connect(negcount_sqlite_path)
     ensure_negcount_db(neg_conn)
+    reset_neg_counts(neg_conn)
 
     qdf = pl.read_parquet(queries_path, columns=["id", "text"]).with_columns(
         pl.col("id").cast(pl.Utf8), pl.col("text").cast(pl.Utf8)
     )
+    ordered_query_ids = qdf["id"].to_list()
     queries_dict = dict(zip(qdf["id"].to_list(), qdf["text"].to_list()))
     del qdf
 
@@ -257,6 +314,7 @@ def process_negatives_streaming(
         pl.col("document_id").implode().alias("pos_ids"),
         pl.col("positive_ranking").implode().alias("pos_scores"),
         pl.col("positive_ranking").min().alias("min_score"),
+        pl.col("positive_ranking").max().alias("max_score"),
     ]
     if positive_original_score_column:
         pos_aggs.append(pl.col("original_positive_ranking").implode().alias("original_pos_scores"))
@@ -265,6 +323,7 @@ def process_negatives_streaming(
 
     min_scores = pos_grouped["min_score"].to_numpy()
     u_pos = percentile_from_ecdf(min_scores, ecdf_x, ecdf_y)
+    u_strongest_pos = percentile_from_ecdf(pos_grouped["max_score"].to_numpy(), ecdf_x, ecdf_y)
     thr1 = inv_percentile_from_ecdf(beta * u_pos, ecdf_x, ecdf_y)
     thr2 = inv_percentile_from_ecdf(u_floor, ecdf_x, ecdf_y)
     thresholds = np.maximum(thr1, thr2)
@@ -274,6 +333,7 @@ def process_negatives_streaming(
         "pos_ids": pos_grouped["pos_ids"],
         "pos_scores": pos_grouped["pos_scores"],
         "min_score": pos_grouped["min_score"],
+        "u_strongest_pos": pl.Series(u_strongest_pos),
         "u_pos": pl.Series(u_pos),
         "threshold_rank": pl.Series(thresholds),
     }
@@ -295,7 +355,10 @@ def process_negatives_streaming(
 
     neg_scan = pl.scan_parquet(negatives_path).select(negative_select)
 
-    all_qids = thr_df["query_id"].to_list()
+    eligible_qids = set(thr_df["query_id"].to_list())
+    all_qids = [qid for qid in ordered_query_ids if qid in eligible_qids]
+    end = None if query_limit is None else query_skip + query_limit
+    all_qids = all_qids[query_skip:end]
     total_q = len(all_qids)
 
     out_f = open(output_path, "w", encoding="utf-8")
@@ -307,7 +370,12 @@ def process_negatives_streaming(
         end = min(start + query_chunk_size, total_q)
         qids_chunk = all_qids[start:end]
 
-        thr_chunk = thr_df.slice(start, end - start).select(["query_id", "threshold_rank"])
+        thr_chunk = pl.DataFrame(
+            {
+                "query_id": qids_chunk,
+                "threshold_rank": [pos_map[qid]["threshold_rank"] for qid in qids_chunk],
+            }
+        )
 
         pair_fields = ["document_id", "ranking", "strict_negative"]
         if negative_original_score_column:
@@ -352,9 +420,50 @@ def process_negatives_streaming(
             bumped_local: list[str] = []
             seen_local: set[str] = set()
             pos_row = pos_map[qid]
-            pos_ids = pos_row["pos_ids"]
-            pos_scores = pos_row["pos_scores"]
+            pos_ids = list(pos_row["pos_ids"])
+            pos_scores = list(pos_row["pos_scores"])
             pos_ids_set = set(pos_ids)
+            original_pos_scores = (
+                list(pos_row.get("original_pos_scores") or [])
+                if positive_original_score_column
+                else [None] * len(pos_ids)
+            )
+
+            mined_positive_ids: list[str] = []
+            mined_positive_scores: list[float] = []
+            mined_positive_original_scores: list[float | None] = []
+            if mine_positives and max_mined_positives > 0:
+                accepted_positive_texts = [texts_map.get(pid, "") for pid in pos_ids]
+                positive_candidates = sorted(pairs, key=lambda pair: pair["ranking"], reverse=True)
+                for pair in positive_candidates:
+                    did = pair["document_id"]
+                    if did in pos_ids_set or did in mined_positive_ids:
+                        continue
+                    candidate_percentile = float(percentile_from_ecdf(pair["ranking"], ecdf_x, ecdf_y))
+                    if candidate_percentile < u_sanity_ceiling:
+                        continue
+                    if (
+                        candidate_percentile < u_absolute_ceiling
+                        and candidate_percentile < float(pos_row["u_strongest_pos"]) * u_positive_beta
+                    ):
+                        continue
+                    candidate_text = texts_map.get(did, "")
+                    if is_near_duplicate(candidate_text, accepted_positive_texts, positive_near_duplicate_threshold):
+                        stats["synthetic_positive_near_duplicate_filtered"] += 1
+                        continue
+                    mined_positive_ids.append(did)
+                    mined_positive_scores.append(pair["ranking"])
+                    mined_positive_original_scores.append(pair.get("original_negative_ranking"))
+                    accepted_positive_texts.append(candidate_text)
+                    if len(mined_positive_ids) >= max_mined_positives:
+                        break
+
+            pos_ids.extend(mined_positive_ids)
+            pos_scores.extend(mined_positive_scores)
+            pos_ids_set.update(mined_positive_ids)
+            if mined_positive_ids:
+                stats["queries_with_synthetic_positives"] += 1
+                stats["synthetic_positives_written"] += len(mined_positive_ids)
 
             strict_pairs = sorted(
                 (p for p in pairs if p["strict_negative"]),
@@ -419,10 +528,12 @@ def process_negatives_streaming(
                 "type": dataset_type,
                 "pos_id": pos_ids,
                 "neg_id": chosen_ids,
+                "pos_is_synthetic": [False] * (len(pos_ids) - len(mined_positive_ids))
+                + [True] * len(mined_positive_ids),
                 "neg_selection_tier": chosen_tiers,
             }
-            if positive_original_score_column:
-                item["original_pos_scores"] = pos_row["original_pos_scores"]
+            if positive_original_score_column or negative_original_score_column:
+                item["original_pos_scores"] = original_pos_scores + mined_positive_original_scores
             if negative_original_score_column:
                 item["original_neg_scores"] = chosen_original_scores
             out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -454,6 +565,14 @@ def process_negatives_streaming(
         "prompt": prompt,
         "type": dataset_type,
         "backfill_policy": backfill_policy,
+        "mine_positives": mine_positives,
+        "max_mined_positives": max_mined_positives,
+        "u_sanity_ceiling": u_sanity_ceiling,
+        "u_absolute_ceiling": u_absolute_ceiling,
+        "u_positive_beta": u_positive_beta,
+        "positive_near_duplicate_threshold": positive_near_duplicate_threshold,
+        "query_skip": query_skip,
+        "query_limit": query_limit,
         "total_queries": total_q,
         **dict(stats),
         "negatives_per_query_histogram": {str(key): value for key, value in sorted(neg_count_histogram.items())},
@@ -545,6 +664,37 @@ def main():
         help="Whether to fill missing strict negatives with the safest final-scored relaxed candidates.",
     )
     parser.add_argument("--report_path", type=str, default=config("EXPORT_REPORT_PATH", default=None))
+    parser.add_argument("--mine_positives", dest="mine_positives", action="store_true")
+    parser.add_argument("--no_mine_positives", dest="mine_positives", action="store_false")
+    parser.set_defaults(mine_positives=config("MINE_POSITIVES", cast=bool, default=False))
+    parser.add_argument(
+        "--max_mined_positives",
+        type=int,
+        default=config("MAX_MINED_POSITIVES", cast=int, default=1),
+    )
+    parser.add_argument(
+        "--u_sanity_ceiling",
+        type=float,
+        default=config("U_SANITY_CEILING", cast=float, default=0.90),
+    )
+    parser.add_argument(
+        "--u_absolute_ceiling",
+        type=float,
+        default=config("U_ABSOLUTE_CEILING", cast=float, default=0.995),
+    )
+    parser.add_argument(
+        "--u_positive_beta",
+        type=float,
+        default=config("U_POSITIVE_BETA", cast=float, default=0.95),
+    )
+    parser.add_argument(
+        "--positive_near_duplicate_threshold",
+        type=float,
+        default=config("POSITIVE_NEAR_DUPLICATE_THRESHOLD", cast=float, default=0.80),
+    )
+    parser.add_argument("--query_skip", type=int, default=config("PIPELINE_SAMPLE_SKIP", cast=int, default=0))
+    sample_limit = config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0)
+    parser.add_argument("--query_limit", type=int, default=sample_limit if sample_limit > 0 else None)
 
     args = parser.parse_args()
     report_path = args.report_path or f"{args.output_path}.report.json"
@@ -574,6 +724,14 @@ def main():
         negcount_sqlite_path=args.negcount_sqlite_path,
         query_chunk_size=args.query_chunk_size,
         oversample_factor=args.oversample_factor,
+        mine_positives=args.mine_positives,
+        max_mined_positives=args.max_mined_positives,
+        u_sanity_ceiling=args.u_sanity_ceiling,
+        u_absolute_ceiling=args.u_absolute_ceiling,
+        u_positive_beta=args.u_positive_beta,
+        positive_near_duplicate_threshold=args.positive_near_duplicate_threshold,
+        query_skip=args.query_skip,
+        query_limit=args.query_limit,
     )
 
 

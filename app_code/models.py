@@ -174,11 +174,11 @@ def get_reranker_model(
         from FlagEmbedding import FlagAutoReranker
 
         devices = [f"cuda:{gpu_id}"]
-        model_kwargs: dict[str, Any] = {}
+        flag_embedding_kwargs: dict[str, Any] = {}
         reranker_max_length = _config_optional("RERANKER_MAX_LENGTH", cast=int)
         if reranker_max_length is not None:
-            model_kwargs["max_length"] = reranker_max_length
-        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, **model_kwargs)
+            flag_embedding_kwargs["max_length"] = reranker_max_length
+        model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, **flag_embedding_kwargs)
         # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model
 
@@ -186,13 +186,13 @@ def get_reranker_model(
     from sentence_transformers import CrossEncoder
 
     device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
-    model_kwargs: dict[str, Any] = {}
+    cross_encoder_model_kwargs: dict[str, Any] = {}
     if torch.cuda.is_available():
-        model_kwargs["torch_dtype"] = torch.bfloat16
+        cross_encoder_model_kwargs["torch_dtype"] = torch.bfloat16
     cross_encoder_kwargs: dict[str, Any] = {
         "device": device,
         "trust_remote_code": True,
-        "model_kwargs": model_kwargs,
+        "model_kwargs": cross_encoder_model_kwargs,
         "activation_fn": torch.nn.Identity(),
     }
     reranker_max_length = _config_optional("RERANKER_MAX_LENGTH", cast=int)
