@@ -7,6 +7,41 @@ FlagEmbedding JSONL shape:
 {"query": "...", "pos": ["..."], "neg": ["..."], "pos_scores": [1.0], "neg_scores": [0.2], "prompt": "", "type": "retrieval"}
 ```
 
+## Quickest way to run LightOn mining
+
+From the project root, create and activate a virtual environment, install dependencies, and prepare a local
+`.env` file:
+
+```bash
+uv venv --python 3.12.3 .venv
+source .venv/bin/activate
+uv pip install --torch-backend cu128 --build-constraint build-constraints.txt -r requirements-lancedb.txt
+cp .env.example.lightonai.mxbai .env
+```
+
+In `.env`, select the LightOn splits to process. This is the main variable that normally needs to be changed:
+
+```dotenv
+LIGHTONAI_SPLITS="fiqa"
+```
+
+Multiple splits can be provided as a comma-separated list:
+
+```dotenv
+LIGHTONAI_SPLITS="fiqa,trivia,fever"
+```
+
+Available values are: `fiqa`, `trivia`, `hotpotqa`, `nq`, `msmarco`, `fever`, and `squadv2`.
+
+Run the complete pipeline:
+
+```bash
+python app_code/curated_negatives/run_lightonai_adaptive_pipeline.py
+```
+
+Each split is written to its own `data/lightonai_pipeline/<split>/` directory. Running the same command again
+resumes processing and reuses existing artifacts and scores.
+
 ## Recommended LightOn adaptive pipeline
 
 The LightOn dataset card describes three configs: `queries`, `documents`, and `scores`. In `scores`, the
