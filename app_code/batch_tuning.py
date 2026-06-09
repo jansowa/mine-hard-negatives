@@ -198,6 +198,18 @@ def _format_bytes(value: int | None) -> str:
     return f"{out:.1f} GiB"
 
 
+def _transient_peak_extra(
+    baseline_allocated: int | None,
+    peak_allocated: int | None,
+    final_allocated: int | None,
+) -> int | None:
+    if baseline_allocated is None or peak_allocated is None or final_allocated is None:
+        return None
+
+    persistent_allocated = max(baseline_allocated, final_allocated)
+    return max(0, peak_allocated - persistent_allocated)
+
+
 def _should_skip_candidate_for_memory(
     candidate: int,
     previous_candidate: int | None,
@@ -271,9 +283,8 @@ def benchmark_batch_size(
         elapsed = max(time.perf_counter() - started_at, 1e-9)
         items_per_second = sample_count / elapsed
         peak_allocated = _cuda_peak_memory_allocated(device_id)
-        peak_extra = None
-        if baseline_allocated is not None and peak_allocated is not None:
-            peak_extra = max(0, peak_allocated - baseline_allocated)
+        final_allocated = _cuda_memory_allocated(device_id)
+        peak_extra = _transient_peak_extra(baseline_allocated, peak_allocated, final_allocated)
 
         _info(
             logger,
@@ -345,6 +356,17 @@ def benchmark_reranker_batch_size(
             docs,
             batch_size=candidate,
         )
+
+    if docs:
+        rerank_function(
+            reranker_tokenizer,
+            reranker_model,
+            queries[:1],
+            docs[:1],
+            batch_size=1,
+        )
+        synchronize_cuda(device_id)
+        clear_cuda_cache(device_id)
 
     return benchmark_batch_size(
         label=label,
