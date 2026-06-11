@@ -170,7 +170,12 @@ def is_near_duplicate(candidate_text: str, reference_texts: list[str], threshold
 
 
 def build_or_load_corpus_sqlite(
-    corpus_path: str, corpus_sqlite_path: str, id_col="id", text_col="text", block_rows: int = 1_000_000
+    corpus_path: str,
+    corpus_sqlite_path: str,
+    id_col="id",
+    text_col="text",
+    block_rows: int = 1_000_000,
+    low_memory_optimizations: bool = False,
 ):
     conn = sqlite_connect(corpus_sqlite_path)
     ensure_corpus_db(conn)
@@ -183,16 +188,28 @@ def build_or_load_corpus_sqlite(
         conn.close()
         return
 
-    with tqdm(total=expected_rows, desc="Budowanie bazy korpusu (SQLite)", unit="rows") as pbar:
-        for batch in parquet_file.iter_batches(columns=[id_col, text_col], batch_size=block_rows):
-            ids = batch.column(batch.schema.get_field_index(id_col)).to_pylist()
-            texts = batch.column(batch.schema.get_field_index(text_col)).to_pylist()
-            rows = (
-                (str(row_id), "" if text is None else str(text))
-                for row_id, text in zip(ids, texts)
-            )
-            bulk_upsert_corpus(conn, rows)
-            pbar.update(batch.num_rows)
+    if low_memory_optimizations:
+        with tqdm(total=expected_rows, desc="Budowanie bazy korpusu (SQLite)", unit="rows") as pbar:
+            for batch in parquet_file.iter_batches(columns=[id_col, text_col], batch_size=block_rows):
+                ids = batch.column(batch.schema.get_field_index(id_col)).to_pylist()
+                texts = batch.column(batch.schema.get_field_index(text_col)).to_pylist()
+                rows = (
+                    (str(row_id), "" if text is None else str(text))
+                    for row_id, text in zip(ids, texts)
+                )
+                bulk_upsert_corpus(conn, rows)
+                pbar.update(batch.num_rows)
+    else:
+        dataset = pl.scan_parquet(corpus_path).select(
+            [pl.col(id_col).cast(pl.Utf8), pl.col(text_col).cast(pl.Utf8)]
+        )
+        frame = dataset.collect()
+        with tqdm(total=frame.height, desc="Budowanie bazy korpusu (SQLite)", unit="rows") as pbar:
+            for start in range(0, frame.height, block_rows):
+                end = min(start + block_rows, frame.height)
+                chunk = frame.slice(start, end - start)
+                bulk_upsert_corpus(conn, zip(chunk[id_col].to_list(), chunk[text_col].to_list()))
+                pbar.update(end - start)
 
     conn.close()
 
@@ -230,6 +247,7 @@ def process_negatives_streaming(
     positive_near_duplicate_threshold: float = 0.80,
     query_skip: int = 0,
     query_limit: int | None = None,
+    low_memory_optimizations: bool = False,
 ):
     if not positive_score_column:
         raise ValueError("positive_score_column must not be empty")
@@ -264,6 +282,7 @@ def process_negatives_streaming(
         corpus_path=corpus_path,
         corpus_sqlite_path=corpus_sqlite_path,
         block_rows=1_000_000,
+        low_memory_optimizations=low_memory_optimizations,
     )
 
     neg_conn = sqlite_connect(negcount_sqlite_path)
@@ -565,6 +584,7 @@ def process_negatives_streaming(
         "prompt": prompt,
         "type": dataset_type,
         "backfill_policy": backfill_policy,
+        "low_memory_optimizations": low_memory_optimizations,
         "mine_positives": mine_positives,
         "max_mined_positives": max_mined_positives,
         "u_sanity_ceiling": u_sanity_ceiling,
@@ -664,6 +684,9 @@ def main():
         help="Whether to fill missing strict negatives with the safest final-scored relaxed candidates.",
     )
     parser.add_argument("--report_path", type=str, default=config("EXPORT_REPORT_PATH", default=None))
+    parser.add_argument("--low-memory-optimizations", dest="low_memory_optimizations", action="store_true")
+    parser.add_argument("--no-low-memory-optimizations", dest="low_memory_optimizations", action="store_false")
+    parser.set_defaults(low_memory_optimizations=config("LOW_MEMORY_OPTIMIZATIONS", cast=bool, default=False))
     parser.add_argument("--mine_positives", dest="mine_positives", action="store_true")
     parser.add_argument("--no_mine_positives", dest="mine_positives", action="store_false")
     parser.set_defaults(mine_positives=config("MINE_POSITIVES", cast=bool, default=False))
@@ -732,6 +755,7 @@ def main():
         positive_near_duplicate_threshold=args.positive_near_duplicate_threshold,
         query_skip=args.query_skip,
         query_limit=args.query_limit,
+        low_memory_optimizations=args.low_memory_optimizations,
     )
 
 

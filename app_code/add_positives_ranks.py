@@ -480,6 +480,7 @@ def process_relevant(
     auto_reranker_batch_size_sample_size: int = 128,
     auto_reranker_batch_size_memory_utilization: float = 0.70,
     corpus_sqlite_path: str | None = None,
+    low_memory_optimizations: bool = False,
 ) -> None:
     if not score_column:
         raise ValueError("score_column must not be empty")
@@ -507,8 +508,10 @@ def process_relevant(
 
         corpus_df: pd.DataFrame | None = None
         corpus_conn: sqlite3.Connection | None = None
-        if corpus_sqlite_path:
-            build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path)
+        if low_memory_optimizations:
+            if corpus_sqlite_path is None:
+                corpus_sqlite_path = f"{os.path.splitext(corpus_path)[0]}.sqlite"
+            build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path, low_memory_optimizations=True)
             corpus_conn = sqlite_connect(corpus_sqlite_path)
             print("Queries loaded; corpus texts will be fetched from SQLite.")
             print(f"Queries DataFrame shape: {queries_df.shape}")
@@ -675,6 +678,9 @@ if __name__ == "__main__":
         default=config("CORPUS_SQLITE_PATH", default=None),
         help="Optional SQLite corpus index used instead of loading the complete corpus into memory.",
     )
+    parser.add_argument("--low-memory-optimizations", dest="low_memory_optimizations", action="store_true")
+    parser.add_argument("--no-low-memory-optimizations", dest="low_memory_optimizations", action="store_false")
+    parser.set_defaults(low_memory_optimizations=config("LOW_MEMORY_OPTIMIZATIONS", cast=bool, default=False))
     parser.add_argument(
         "--relevant_path",
         type=str,
@@ -786,4 +792,5 @@ if __name__ == "__main__":
             else auto_defaults["memory_utilization"]
         ),
         corpus_sqlite_path=args.corpus_sqlite_path,
+        low_memory_optimizations=args.low_memory_optimizations,
     )

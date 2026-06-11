@@ -171,7 +171,26 @@ def write_lightonai_pipeline_artifacts(
     queries: datasets.Dataset,
     documents: datasets.Dataset,
     scores: datasets.Dataset,
+    low_memory_optimizations: bool = False,
 ) -> None:
+    if not low_memory_optimizations:
+        query_frame, corpus_frame, relevant_frame, candidates_frame = build_lightonai_pipeline_artifact_frames(
+            queries,
+            documents,
+            scores,
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        query_frame.to_parquet(os.path.join(output_dir, "queries.parquet"), index=False)
+        corpus_frame.to_parquet(os.path.join(output_dir, "corpus.parquet"), index=False)
+        relevant_frame.to_parquet(os.path.join(output_dir, "relevant.parquet"), index=False)
+        candidates_frame.to_parquet(os.path.join(output_dir, "negative_candidates.parquet"), index=False)
+        print(
+            "Wrote LightOn pipeline artifacts to "
+            f"{output_dir}: {len(query_frame):,} queries, {len(corpus_frame):,} documents, "
+            f"{len(relevant_frame):,} positives, {len(candidates_frame):,} candidates"
+        )
+        return
+
     os.makedirs(output_dir, exist_ok=True)
     query_count = _write_id_text_dataset(
         queries,
@@ -331,12 +350,19 @@ def export_lightonai_pipeline_artifacts(
     split: str = "fiqa",
     hf_cache_dir: str | None = None,
     load_num_proc: int | None = None,
+    low_memory_optimizations: bool = False,
 ) -> None:
     ensure_parent_dir(os.path.join(output_dir, "queries.parquet"))
     scores = _load_lightonai_component(dataset_name, "scores", split, hf_cache_dir, load_num_proc)
     queries = _load_lightonai_component(dataset_name, "queries", split, hf_cache_dir, load_num_proc)
     documents = _load_lightonai_component(dataset_name, "documents", split, hf_cache_dir, load_num_proc)
-    write_lightonai_pipeline_artifacts(output_dir, queries, documents, scores)
+    write_lightonai_pipeline_artifacts(
+        output_dir,
+        queries,
+        documents,
+        scores,
+        low_memory_optimizations=low_memory_optimizations,
+    )
 
 
 def main() -> None:
@@ -353,6 +379,9 @@ def main() -> None:
     )
     parser.add_argument("--hf_cache_dir", type=str, default=config("LIGHTONAI_HF_CACHE_DIR", default=None))
     parser.add_argument("--load_num_proc", type=int, default=_config_optional("LIGHTONAI_LOAD_NUM_PROC", cast=int))
+    parser.add_argument("--low-memory-optimizations", dest="low_memory_optimizations", action="store_true")
+    parser.add_argument("--no-low-memory-optimizations", dest="low_memory_optimizations", action="store_false")
+    parser.set_defaults(low_memory_optimizations=config("LOW_MEMORY_OPTIMIZATIONS", cast=bool, default=False))
     args = parser.parse_args()
 
     output_dir = args.output_dir or split_output_dir(args.output_root, args.split)
@@ -362,6 +391,7 @@ def main() -> None:
         split=args.split,
         hf_cache_dir=args.hf_cache_dir,
         load_num_proc=args.load_num_proc,
+        low_memory_optimizations=args.low_memory_optimizations,
     )
 
 

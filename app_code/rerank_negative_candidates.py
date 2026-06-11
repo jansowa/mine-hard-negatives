@@ -97,7 +97,12 @@ def _load_scored_pairs_from_jsonl(path: str) -> set[str]:
         for line in handle:
             if not line.strip():
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                if handle.read().strip():
+                    raise
+                break
             scored.add(_pack_pair(row["query_id"], row["document_id"]))
     return scored
 
@@ -189,7 +194,12 @@ def _load_scored_rows_from_jsonl(path: str, ranking_column: str) -> dict[str, di
         for line in handle:
             if not line.strip():
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                if handle.read().strip():
+                    raise
+                break
             if ranking_column not in row and "ranking" not in row:
                 continue
             rows[_pack_pair(row["query_id"], row["document_id"])] = row
@@ -671,6 +681,7 @@ def rerank_candidates_adaptive(
     auto_reranker_batch_size_max: int = 64,
     auto_reranker_batch_size_sample_size: int = 128,
     auto_reranker_batch_size_memory_utilization: float = 0.70,
+    low_memory_optimizations: bool = False,
 ) -> None:
     validate_batch_size_options(
         reranker_batch_size,
@@ -709,43 +720,79 @@ def rerank_candidates_adaptive(
     queries_df = queries_df[queries_df["id"].astype(str).isin(selected_query_ids)]
     queries = dict(zip(queries_df["id"].astype(str), queries_df["text"].astype(str)))
 
-    if corpus_sqlite_path is None:
-        corpus_sqlite_path = f"{os.path.splitext(corpus_path)[0]}.sqlite"
-    build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path)
-    corpus_conn = sqlite_connect(corpus_sqlite_path)
+    corpus_conn: sqlite3.Connection | None = None
+    corpus: dict[str, str] = {}
+    candidates_df: pd.DataFrame | None = None
+    scored_by_query: dict[str, list[dict]] = defaultdict(list)
 
-    print(f"Loading candidate metadata from {candidates_path}")
-    score_column = _candidate_score_column_from_names(
-        pq.ParquetFile(candidates_path).schema_arrow.names,
-        candidate_score_column,
-    )
+    if low_memory_optimizations:
+        print("Low-memory optimizations enabled: using SQLite corpus lookups and streamed candidates.")
+        if corpus_sqlite_path is None:
+            corpus_sqlite_path = f"{os.path.splitext(corpus_path)[0]}.sqlite"
+        build_or_load_corpus_sqlite(corpus_path, corpus_sqlite_path, low_memory_optimizations=True)
+        corpus_conn = sqlite_connect(corpus_sqlite_path)
 
-    if resume:
-        (
-            scored_doc_ids_by_query,
-            strict_counts_by_query,
-            scored_counts_by_query,
-            complete_query_ids,
-            already_scored_count,
-        ) = _load_adaptive_resume_state(
-            worker_file=worker_file,
-            output_path=output_path,
-            ranking_column=ranking_column,
-            thresholds=thresholds,
-            selected_query_ids=selected_query_ids,
-            num_negatives=num_negatives,
+        print(f"Loading candidate metadata from {candidates_path}")
+        score_column = _candidate_score_column_from_names(
+            pq.ParquetFile(candidates_path).schema_arrow.names,
+            candidate_score_column,
         )
+
+        if resume:
+            (
+                scored_doc_ids_by_query,
+                strict_counts_by_query,
+                scored_counts_by_query,
+                complete_query_ids,
+                already_scored_count,
+            ) = _load_adaptive_resume_state(
+                worker_file=worker_file,
+                output_path=output_path,
+                ranking_column=ranking_column,
+                thresholds=thresholds,
+                selected_query_ids=selected_query_ids,
+                num_negatives=num_negatives,
+            )
+        else:
+            scored_doc_ids_by_query = {}
+            strict_counts_by_query = {}
+            scored_counts_by_query = {}
+            complete_query_ids = set()
+            already_scored_count = 0
     else:
-        scored_doc_ids_by_query = {}
+        print("Low-memory optimizations disabled: using the original in-memory adaptive reranking path.")
+        print(f"Loading corpus from {corpus_path}")
+        corpus_df = pd.read_parquet(corpus_path, columns=["id", "text"])
+        corpus_df["id"] = corpus_df["id"].astype("string")
+        corpus = dict(zip(corpus_df["id"].astype(str), corpus_df["text"].astype(str)))
+
+        print(f"Loading candidate metadata from {candidates_path}")
+        candidates_df = pd.read_parquet(candidates_path)
+        score_column = _candidate_score_column(candidates_df, candidate_score_column)
+        candidates_df = _prepare_candidates(candidates_df, score_column, candidate_selected_column)
+        candidates_df = candidates_df[candidates_df["query_id"].astype(str).isin(selected_query_ids)]
+
+        already_scored_rows = _load_scored_rows([worker_file, output_path], ranking_column) if resume else {}
+        for row in already_scored_rows.values():
+            qid = str(row["query_id"])
+            if qid in selected_query_ids:
+                scored_by_query[qid].append(row)
+        scored_doc_ids_by_query = {
+            qid: {str(row["document_id"]) for row in rows}
+            for qid, rows in scored_by_query.items()
+        }
         strict_counts_by_query = {}
         scored_counts_by_query = {}
         complete_query_ids = set()
-        already_scored_count = 0
+        already_scored_count = len(already_scored_rows)
     if already_scored_count:
-        print(
-            f"Resume enabled: found {already_scored_count:,} already reranked pairs; "
-            f"{len(complete_query_ids):,} queries already satisfy the strict-negative target"
-        )
+        if low_memory_optimizations:
+            print(
+                f"Resume enabled: found {already_scored_count:,} already reranked pairs; "
+                f"{len(complete_query_ids):,} queries already satisfy the strict-negative target"
+            )
+        else:
+            print(f"Resume enabled: found {already_scored_count:,} already reranked pairs")
 
     tokenizer, reranker_model = get_reranker_model(reranker_model_name)
     print("Final reranker loaded.")
@@ -756,17 +803,28 @@ def rerank_candidates_adaptive(
             minimum=auto_reranker_batch_size_min,
             maximum=auto_reranker_batch_size_max,
         )
-        sample_queries, sample_docs = _collect_adaptive_reranker_sample(
-            candidates_path,
-            score_column,
-            candidate_selected_column,
-            selected_query_ids,
-            scored_doc_ids_by_query,
-            complete_query_ids,
-            queries,
-            corpus_conn,
-            auto_reranker_batch_size_sample_size,
-        )
+        if low_memory_optimizations:
+            assert corpus_conn is not None
+            sample_queries, sample_docs = _collect_adaptive_reranker_sample(
+                candidates_path,
+                score_column,
+                candidate_selected_column,
+                selected_query_ids,
+                scored_doc_ids_by_query,
+                complete_query_ids,
+                queries,
+                corpus_conn,
+                auto_reranker_batch_size_sample_size,
+            )
+        else:
+            assert candidates_df is not None
+            sample_queries, sample_docs = _collect_reranker_sample_from_candidate_rows(
+                candidates_df,
+                queries,
+                corpus,
+                auto_reranker_batch_size_sample_size,
+                already_scored_by_query=scored_doc_ids_by_query,
+            )
         reranker_batch_size = benchmark_reranker_batch_size(
             tokenizer,
             reranker_model,
@@ -788,14 +846,20 @@ def rerank_candidates_adaptive(
     query_report: list[AdaptiveQueryReportRow] = []
     strict_histogram: Counter[int] = Counter()
 
-    grouped = _iter_candidate_query_groups(
-        candidates_path,
-        score_column,
-        candidate_selected_column,
-        selected_query_ids,
-    )
+    if low_memory_optimizations:
+        grouped = _iter_candidate_query_groups(
+            candidates_path,
+            score_column,
+            candidate_selected_column,
+            selected_query_ids,
+        )
+        progress_total = len(selected_query_ids)
+    else:
+        assert candidates_df is not None
+        grouped = candidates_df.groupby("query_id", sort=False)
+        progress_total = len(grouped)
     with open(worker_file, "a", encoding="utf-8") as output_handle:
-        with tqdm(total=len(selected_query_ids), unit="query", desc="Adaptive final reranking") as pbar:
+        with tqdm(total=progress_total, unit="query", desc="Adaptive final reranking") as pbar:
             for query_id, group in grouped:
                 qid = str(query_id)
                 threshold = thresholds.get(qid)
@@ -803,11 +867,17 @@ def rerank_candidates_adaptive(
                     pbar.update(1)
                     continue
 
-                existing_doc_ids = scored_doc_ids_by_query.pop(qid, set())
-                strict_count = strict_counts_by_query.pop(qid, 0)
-                scored_count = scored_counts_by_query.pop(qid, len(existing_doc_ids))
-                if qid in complete_query_ids:
-                    strict_count = num_negatives
+                if low_memory_optimizations:
+                    existing_doc_ids = scored_doc_ids_by_query.pop(qid, set())
+                    strict_count = strict_counts_by_query.pop(qid, 0)
+                    scored_count = scored_counts_by_query.pop(qid, len(existing_doc_ids))
+                    if qid in complete_query_ids:
+                        strict_count = num_negatives
+                else:
+                    existing_rows = scored_by_query.get(qid, [])
+                    existing_doc_ids = {str(row["document_id"]) for row in existing_rows}
+                    strict_count = _strict_final_count(existing_rows, ranking_column, threshold)
+                    scored_count = len(existing_doc_ids)
                 candidate_rows = group.to_dict("records")
                 query_max_budget = len(candidate_rows) if unlimited_budget else max_budget
                 query_max_budget = max(query_max_budget, min(scored_count, len(candidate_rows)))
@@ -826,10 +896,14 @@ def rerank_candidates_adaptive(
                     rerank_queries: list[str] = []
                     rerank_docs: list[str] = []
                     valid_rows: list[dict[str, Any]] = []
-                    texts = fetch_texts_batch(
-                        corpus_conn,
-                        [str(candidate_row["document_id"]) for candidate_row in rows_to_score],
-                    )
+                    if low_memory_optimizations:
+                        assert corpus_conn is not None
+                        texts = fetch_texts_batch(
+                            corpus_conn,
+                            [str(candidate_row["document_id"]) for candidate_row in rows_to_score],
+                        )
+                    else:
+                        texts = corpus
                     for candidate_row in rows_to_score:
                         document_id = str(candidate_row["document_id"])
                         document_text = texts.get(document_id)
@@ -869,6 +943,8 @@ def rerank_candidates_adaptive(
                         row = _row_for_output(candidate_row, score, ranking_column, output_schema, extra_values)
                         rows.append(row)
                         existing_doc_ids.add(str(row["document_id"]))
+                        if not low_memory_optimizations:
+                            scored_by_query[qid].append(row)
                         scored_count += 1
                         if final_selected:
                             strict_count += 1
@@ -894,13 +970,15 @@ def rerank_candidates_adaptive(
                 )
                 pbar.update(1)
 
-    corpus_conn.close()
+    if corpus_conn is not None:
+        corpus_conn.close()
     print(f"Newly reranked pairs: {newly_scored:,}")
     consolidate_worker_jsonl(worker_file, output_path, output_schema, row_group_size=row_group_size)
 
     complete_queries = sum(1 for row in query_report if row["strict_final_negatives"] >= num_negatives)
     report = {
         "mode": "adaptive",
+        "low_memory_optimizations": low_memory_optimizations,
         "target_negatives": num_negatives,
         "beta": beta,
         "u_floor": u_floor,
@@ -956,6 +1034,7 @@ def rerank_candidates(
     auto_reranker_batch_size_max: int = 64,
     auto_reranker_batch_size_sample_size: int = 128,
     auto_reranker_batch_size_memory_utilization: float = 0.70,
+    low_memory_optimizations: bool = False,
 ) -> None:
     if not ranking_column:
         raise ValueError("ranking_column must not be empty")
@@ -1006,6 +1085,7 @@ def rerank_candidates(
             auto_reranker_batch_size_max=auto_reranker_batch_size_max,
             auto_reranker_batch_size_sample_size=auto_reranker_batch_size_sample_size,
             auto_reranker_batch_size_memory_utilization=auto_reranker_batch_size_memory_utilization,
+            low_memory_optimizations=low_memory_optimizations,
         )
         return
 
@@ -1147,6 +1227,9 @@ def main() -> None:
     parser.add_argument("--queries_path", type=str, default=config("QUERIES_PATH"))
     parser.add_argument("--corpus_path", type=str, default=config("CORPUS_PATH"))
     parser.add_argument("--corpus_sqlite_path", type=str, default=config("CORPUS_SQLITE_PATH", default=None))
+    parser.add_argument("--low-memory-optimizations", dest="low_memory_optimizations", action="store_true")
+    parser.add_argument("--no-low-memory-optimizations", dest="low_memory_optimizations", action="store_false")
+    parser.set_defaults(low_memory_optimizations=config("LOW_MEMORY_OPTIMIZATIONS", cast=bool, default=False))
     parser.add_argument("--output_path", type=str, default=config("NEGATIVES_PATH"))
     parser.add_argument(
         "--reranker_model_name", type=str, default=config("FINAL_RERANKER_NAME", default=config("RERANKER_NAME"))
@@ -1297,6 +1380,7 @@ def main() -> None:
         auto_reranker_batch_size_max=args.auto_reranker_batch_size_max,
         auto_reranker_batch_size_sample_size=args.auto_reranker_batch_size_sample_size,
         auto_reranker_batch_size_memory_utilization=args.auto_reranker_batch_size_memory_utilization,
+        low_memory_optimizations=args.low_memory_optimizations,
     )
 
 
