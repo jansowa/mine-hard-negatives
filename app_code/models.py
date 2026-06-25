@@ -136,14 +136,17 @@ def get_dense_model(
     if is_tensorrt_model_path(model_name):
         return TensorRTDenseEmbeddings(model_name, batch_size=batch_size, prompt=prompt, gpu_id=gpu_id)
 
+    dense_model_kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "model_kwargs": {
+            "torch_dtype": torch.bfloat16,
+            "device_map": f"cuda:{gpu_id}",
+        }
+    }
+
     embeddings = HuggingFaceEmbeddings(
         model_name=model_name,
-        model_kwargs={
-            "model_kwargs": {
-                "torch_dtype": torch.bfloat16,
-                "device_map": f"cuda:{gpu_id}",
-            }
-        },
+        model_kwargs=dense_model_kwargs,
         encode_kwargs={"batch_size": batch_size, "prompt": prompt},
     )
     dense_max_length = _config_optional("DENSE_EMBEDDER_MAX_LENGTH", cast=int)

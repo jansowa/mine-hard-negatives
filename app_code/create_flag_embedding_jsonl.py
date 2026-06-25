@@ -52,6 +52,19 @@ def ensure_negcount_db(conn: sqlite3.Connection):
     conn.commit()
 
 
+def parquet_columns(path: str) -> set[str]:
+    return set(pq.read_schema(path).names)
+
+
+def optional_existing_column(path: str, column_name: str | None, label: str) -> str | None:
+    if not column_name:
+        return None
+    if column_name in parquet_columns(path):
+        return column_name
+    print(f"Optional {label} column {column_name!r} is missing in {path}; skipping it.")
+    return None
+
+
 def bulk_upsert_corpus(conn: sqlite3.Connection, rows, batch_size: int = 50_000):
     cur = conn.cursor()
     cur.execute("BEGIN")
@@ -272,6 +285,17 @@ def process_negatives_streaming(
             raise ValueError(f"{name} must be between 0 and 1")
     if u_positive_beta < 0.0:
         raise ValueError("u_positive_beta must be greater than or equal to 0")
+
+    positive_original_score_column = optional_existing_column(
+        relevant_path,
+        positive_original_score_column,
+        "positive original score",
+    )
+    negative_original_score_column = optional_existing_column(
+        negatives_path,
+        negative_original_score_column,
+        "negative original score",
+    )
 
     try:
         pl.enable_string_cache()

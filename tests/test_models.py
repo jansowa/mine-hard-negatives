@@ -7,7 +7,36 @@ import sentence_transformers
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 
 import models
-from models import get_reranker_model, rerank
+from models import get_dense_model, get_reranker_model, rerank
+
+
+def test_dense_model_always_enables_trust_remote_code(monkeypatch):
+    calls = []
+    fake_torch = types.SimpleNamespace(bfloat16=object())
+
+    class FakeHuggingFaceEmbeddings:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self._client = types.SimpleNamespace(tokenizer=types.SimpleNamespace(model_max_length=None))
+
+    monkeypatch.setattr(models, "_import_torch", lambda: fake_torch)
+    monkeypatch.setattr("langchain_huggingface.HuggingFaceEmbeddings", FakeHuggingFaceEmbeddings)
+
+    get_dense_model("sdadas/stella-pl-retrieval-mini-8k", batch_size=3, gpu_id=2, prompt="query: ")
+
+    assert calls == [
+        {
+            "model_name": "sdadas/stella-pl-retrieval-mini-8k",
+            "model_kwargs": {
+                "model_kwargs": {
+                    "torch_dtype": fake_torch.bfloat16,
+                    "device_map": "cuda:2",
+                },
+                "trust_remote_code": True,
+            },
+            "encode_kwargs": {"batch_size": 3, "prompt": "query: "},
+        }
+    ]
 
 
 def test_non_flag_rerankers_use_generic_cross_encoder_path(monkeypatch):
