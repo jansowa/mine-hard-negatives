@@ -128,6 +128,31 @@ ruff format app_code tests
    python app_code/create_flag_embedding_jsonl.py
    ```
 
+## nfcorpus-pl / nfcorpus-pl-qrels
+
+The Polish NF Corpus artifacts can be prepared directly from Hugging Face without running remote dataset scripts.
+The converter downloads `queries.jsonl.gz`, `corpus.jsonl.gz`, and qrels TSV files, then writes the standard
+pipeline files:
+
+- `queries.parquet`: `id`, `text`
+- `corpus.parquet`: `id`, `text` where `text` is `title + "\n" + body` by default
+- `relevant.parquet`: `query_id`, `document_id`, `qrel_score`, `qrel_split`
+
+```bash
+cp .env.example.nfcorpus-pl.two-stage .env
+python app_code/nfcorpus_pl_to_huggingface_dataset.py
+python app_code/add_documents_to_db.py
+python app_code/add_positives_ranks.py
+python app_code/find_negatives.py
+python app_code/add_positives_ranks.py --final-step
+python app_code/rerank_negative_candidates.py
+python app_code/create_flag_embedding_jsonl.py
+```
+
+By default `NFCORPUS_QRELS_SPLITS="train,validation,test"` merges all qrels. Use, for example,
+`NFCORPUS_QRELS_SPLITS="train"` when you only want the training split. `NFCORPUS_CORPUS_TEXT_MODE` can be
+set to `text` or `title` if you do not want the default title+body document text.
+
 ## Optional two-stage negative reranking
 
 For cheaper mining, you can split negative scoring into a small-reranker candidate pass and a final large-reranker pass. The intermediate candidate artifact is intentionally light: it stores IDs, retrieval metadata, and candidate scores, but not duplicated query/document texts. A complete example configuration is available in `.env.example.sdadas.two-stage`; with that file copied to `.env`, the commands below do not need path/model flags.
