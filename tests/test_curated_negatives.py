@@ -4,6 +4,7 @@ from pathlib import Path
 
 import datasets
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 
@@ -64,7 +65,8 @@ def test_lightonai_processor_maps_to_flag_embedding_row():
     }
 
 
-def test_lightonai_pipeline_artifacts_are_compact_parquet_files(tmp_path):
+@pytest.mark.parametrize("low_memory_optimizations", [False, True])
+def test_lightonai_pipeline_artifacts_are_compact_parquet_files(tmp_path, low_memory_optimizations):
     queries = datasets.Dataset.from_list(
         [
             {"query_id": 10, "query": "query ten"},
@@ -85,7 +87,13 @@ def test_lightonai_pipeline_artifacts_are_compact_parquet_files(tmp_path):
         ]
     )
 
-    write_lightonai_pipeline_artifacts(str(tmp_path), queries, documents, scores)
+    write_lightonai_pipeline_artifacts(
+        str(tmp_path),
+        queries,
+        documents,
+        scores,
+        low_memory_optimizations=low_memory_optimizations,
+    )
 
     queries_df = pd.read_parquet(tmp_path / "queries.parquet")
     corpus_df = pd.read_parquet(tmp_path / "corpus.parquet")
@@ -183,6 +191,7 @@ def test_lightonai_pipeline_runner_uses_env_defaults_and_split_dirs(monkeypatch,
     monkeypatch.setenv("PIPELINE_SAMPLE_LIMIT", "5")
     monkeypatch.setenv("MINE_POSITIVES", "true")
     monkeypatch.setenv("MAX_MINED_POSITIVES", "1")
+    monkeypatch.setenv("LOW_MEMORY_OPTIMIZATIONS", "true")
 
     monkeypatch.setattr(runner, "export_lightonai_pipeline_artifacts", lambda **kwargs: calls.append(("artifacts", kwargs)))
 
@@ -211,22 +220,26 @@ def test_lightonai_pipeline_runner_uses_env_defaults_and_split_dirs(monkeypatch,
 
     assert [name for name, _ in calls] == ["artifacts", "positives", "negatives", "jsonl"] * 2
     assert calls[0][1]["output_dir"] == str(tmp_path / "fiqa")
+    assert calls[0][1]["low_memory_optimizations"] is True
     assert calls[4][1]["output_dir"] == str(tmp_path / "nq")
     assert calls[1][1]["queries_path"] == str(tmp_path / "fiqa" / "queries.parquet")
     assert calls[1][1]["output_path"] == str(tmp_path / "fiqa" / "relevant_with_score.parquet")
     assert calls[1][1]["skip"] == 2
     assert calls[1][1]["offset"] == 5
+    assert calls[1][1]["low_memory_optimizations"] is True
     assert calls[2][1]["num_negatives"] == 7
     assert calls[2][1]["max_budget"] == 0
     assert calls[2][1]["candidate_score_column"] == "candidate_ranking"
     assert calls[2][1]["query_skip"] == 2
     assert calls[2][1]["query_limit"] == 5
+    assert calls[2][1]["low_memory_optimizations"] is True
     assert calls[3][1]["output_path"] == str(tmp_path / "fiqa" / "train.jsonl")
     assert calls[3][1]["positive_original_score_column"] == "lightonai_positive_score"
     assert calls[3][1]["negative_original_score_column"] == "candidate_ranking"
     assert calls[3][1]["mine_positives"] is True
     assert calls[3][1]["query_skip"] == 2
     assert calls[3][1]["query_limit"] == 5
+    assert calls[3][1]["low_memory_optimizations"] is True
 
 
 def test_lightonai_pipeline_runner_reuses_complete_artifacts(monkeypatch, tmp_path):

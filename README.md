@@ -197,6 +197,10 @@ scores only the initial budget with the large reranker, and expands the per-quer
 threshold still yields fewer than `NUM_NEGATIVES` strict negatives. It writes `final_ranking`, a compatibility
 `ranking` alias, final-selection metadata, and a JSON report.
 
+By default, the pipeline keeps the original in-memory behavior. Set `LOW_MEMORY_OPTIMIZATIONS=true` to use
+SQLite-backed corpus lookups, streamed adaptive candidates and resume state, and chunked SQLite/artifact
+construction. These techniques reduce peak RAM usage but can add storage I/O.
+
 ```bash
 python app_code/rerank_negative_candidates.py
 ```

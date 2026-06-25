@@ -113,6 +113,7 @@ def run_lightonai_split(
     paths = split_paths(output_root, split)
     query_skip = config("PIPELINE_SAMPLE_SKIP", cast=int, default=0)
     query_limit = _positive_int_or_none(config("PIPELINE_SAMPLE_LIMIT", cast=int, default=0))
+    low_memory_optimizations = config("LOW_MEMORY_OPTIMIZATIONS", cast=bool, default=False)
     print(f"\n=== LightOn split: {split} -> {paths.output_dir} ===")
 
     if "artifacts" in stages:
@@ -129,6 +130,7 @@ def run_lightonai_split(
                 split=split,
                 hf_cache_dir=hf_cache_dir,
                 load_num_proc=load_num_proc,
+                low_memory_optimizations=low_memory_optimizations,
             )
 
     if "positives" in stages:
@@ -156,6 +158,7 @@ def run_lightonai_split(
             auto_reranker_batch_size_sample_size=auto_defaults["sample_size"],
             auto_reranker_batch_size_memory_utilization=auto_defaults["memory_utilization"],
             corpus_sqlite_path=paths.corpus_sqlite_path,
+            low_memory_optimizations=low_memory_optimizations,
         )
 
     if "negatives" in stages:
@@ -189,6 +192,7 @@ def run_lightonai_split(
             query_skip=query_skip,
             query_limit=query_limit,
             corpus_sqlite_path=paths.corpus_sqlite_path,
+            low_memory_optimizations=low_memory_optimizations,
             report_path=paths.negatives_report_path,
             auto_reranker_batch_size_candidates=config("FINAL_AUTO_RERANKER_BATCH_SIZE_CANDIDATES", default=None),
             auto_reranker_batch_size_min=config("FINAL_AUTO_RERANKER_BATCH_SIZE_MIN", cast=int, default=1),
@@ -250,6 +254,7 @@ def run_lightonai_split(
             ),
             query_skip=query_skip,
             query_limit=query_limit,
+            low_memory_optimizations=low_memory_optimizations,
         )
 
 

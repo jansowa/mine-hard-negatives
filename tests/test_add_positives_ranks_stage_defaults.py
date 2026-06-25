@@ -52,6 +52,11 @@ def test_process_relevant_auto_tunes_reranker_batch_size(monkeypatch, tmp_path):
     pd.DataFrame({"query_id": ["q1", "q2"], "document_id": ["d1", "d2"]}).to_parquet(relevant_path, index=False)
 
     monkeypatch.setattr(apr, "get_reranker_model", lambda _model_name: (object(), object()))
+    monkeypatch.setattr(
+        apr,
+        "build_or_load_corpus_sqlite",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SQLite must require explicit low-memory opt-in")),
+    )
     benchmark_calls = []
 
     def fake_benchmark(_tokenizer, _model, sample_queries, sample_docs, candidates, _rerank_function, **_kwargs):
@@ -77,6 +82,7 @@ def test_process_relevant_auto_tunes_reranker_batch_size(monkeypatch, tmp_path):
         reranker_model_name="positive-model",
         auto_reranker_batch_size_candidates="1,3",
         auto_reranker_batch_size_sample_size=2,
+        corpus_sqlite_path=str(tmp_path / "corpus.sqlite"),
     )
 
     df = pd.read_parquet(output_path)
@@ -113,6 +119,8 @@ def test_process_relevant_preserves_extra_relevant_columns(monkeypatch, tmp_path
         reranker_batch_size=1,
         reranker_model_name="positive-model",
         score_column="positive_ranking",
+        corpus_sqlite_path=str(tmp_path / "corpus.sqlite"),
+        low_memory_optimizations=True,
     )
 
     df = pd.read_parquet(output_path)

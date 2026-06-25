@@ -253,6 +253,11 @@ def test_rerank_candidates_adaptive_expands_only_until_target(monkeypatch, tmp_p
     ).to_parquet(candidates_path, index=False)
 
     monkeypatch.setattr(rnc, "get_reranker_model", lambda _model_name: (object(), object()))
+    monkeypatch.setattr(
+        rnc,
+        "build_or_load_corpus_sqlite",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("default adaptive mode must not build SQLite")),
+    )
 
     final_scores = {"d1": 0.5, "d2": 0.5, "d3": 0.5, "d4": 2.0, "d5": 0.5, "d6": 0.5}
     calls = []
@@ -350,6 +355,7 @@ def test_rerank_candidates_adaptive_zero_max_budget_means_all_candidates(monkeyp
         budget_step=1,
         max_budget=0,
         resume=False,
+        low_memory_optimizations=True,
     )
 
     df = pd.read_parquet(output_path)
@@ -417,10 +423,20 @@ def test_rerank_candidates_adaptive_expanding_query_limit_reuses_scores(monkeypa
     }
 
     rnc.rerank_candidates(**kwargs, query_limit=1)
-    rnc.rerank_candidates(**kwargs, query_limit=None)
+    rnc.rerank_candidates(**kwargs, query_limit=None, low_memory_optimizations=False)
 
     assert calls == [["d1"], ["d2"]]
     assert set(pd.read_parquet(output_path)["document_id"]) == {"d1", "d2"}
+
+
+def test_default_resume_ignores_incomplete_final_worker_line(tmp_path):
+    worker_path = tmp_path / "negatives_worker_0_0.jsonl"
+    complete_row = {"query_id": "q1", "document_id": "d1", "final_ranking": 0.5}
+    worker_path.write_text(json.dumps(complete_row) + "\n{\"query_id\": \"q2\"", encoding="utf-8")
+
+    rows = rnc._load_scored_rows_from_jsonl(str(worker_path), "final_ranking")
+
+    assert rows == {"q1\td1": complete_row}
 
 
 def test_adaptive_resume_state_prefers_worker_and_drops_complete_query_documents(tmp_path):

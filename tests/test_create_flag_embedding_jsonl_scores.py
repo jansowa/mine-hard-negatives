@@ -61,6 +61,7 @@ def test_process_negatives_streaming_reads_custom_negative_score_column(tmp_path
         negcount_sqlite_path=str(tmp_path / "negcount.sqlite"),
         query_chunk_size=1,
         oversample_factor=1,
+        low_memory_optimizations=True,
     )
 
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
@@ -122,6 +123,7 @@ def test_process_negatives_streaming_backfills_relaxed_candidates(tmp_path):
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["neg_id"] == ["n1", "n2"]
     assert rows[0]["neg_selection_tier"] == ["strict", "relaxed_backfill"]
+    assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["low_memory_optimizations"] is False
 
 
 def test_process_negatives_streaming_exports_prompt_type_and_original_scores(tmp_path):
