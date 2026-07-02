@@ -11,6 +11,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from decouple import UndefinedValueError, config
+from tqdm.auto import tqdm
 
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,20 +76,24 @@ def _write_id_text_dataset(
     id_column: str,
     text_column: str,
     batch_size: int = 100_000,
+    desc: str | None = None,
 ) -> int:
     schema = pa.schema([("id", pa.string()), ("text", pa.string())])
     temp_path = f"{output_path}.tmp-{uuid.uuid4().hex}"
     writer = pq.ParquetWriter(temp_path, schema, compression="zstd", use_dictionary=True)
     row_count = 0
     try:
-        for batch in dataset.iter(batch_size=batch_size):
-            ids = [str(value) for value in batch[id_column]]
-            texts = ["" if value is None else str(value) for value in batch[text_column]]
-            writer.write_table(pa.Table.from_pydict({"id": ids, "text": texts}, schema=schema))
-            row_count += len(ids)
+        progress_desc = desc or f"Writing {os.path.basename(output_path)}"
+        with tqdm(total=len(dataset), desc=progress_desc, unit="row") as pbar:
+            for batch in dataset.iter(batch_size=batch_size):
+                ids = [str(value) for value in batch[id_column]]
+                texts = ["" if value is None else str(value) for value in batch[text_column]]
+                writer.write_table(pa.Table.from_pydict({"id": ids, "text": texts}, schema=schema))
+                row_count += len(ids)
+                pbar.update(len(ids))
         writer.close()
         os.replace(temp_path, output_path)
-    except Exception:
+    except BaseException:
         writer.close()
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -197,12 +202,14 @@ def write_lightonai_pipeline_artifacts(
         os.path.join(output_dir, "queries.parquet"),
         "query_id",
         "query",
+        desc="Writing LightOn queries",
     )
     corpus_count = _write_id_text_dataset(
         documents,
         os.path.join(output_dir, "corpus.parquet"),
         "document_id",
         "document",
+        desc="Writing LightOn corpus",
     )
 
     relevant_schema = pa.schema(
@@ -276,51 +283,53 @@ def write_lightonai_pipeline_artifacts(
         current_candidates = {}
 
     try:
-        for batch in scores.iter(batch_size=256):
-            for query_id, document_ids, lightonai_scores in zip(
-                batch["query_id"],
-                batch["document_ids"],
-                batch["scores"],
-            ):
-                if not document_ids or not lightonai_scores:
-                    continue
-                query_id = str(query_id)
-                if query_id != current_query_id:
-                    flush_candidate_query()
-                    if query_id in completed_query_ids:
-                        raise ValueError(
-                            "LightOn score rows must be grouped by query_id for memory-bounded artifact creation"
-                        )
-                    current_query_id = query_id
-                positive_id = str(document_ids[0])
-                current_positive_ids.add(positive_id)
-                relevant_rows.append(
-                    {
-                        "query_id": query_id,
-                        "document_id": positive_id,
-                        "lightonai_positive_score": float(lightonai_scores[0]),
-                    }
-                )
-                relevant_count += 1
-
-                for retrieval_rank, (document_id, score) in enumerate(zip(document_ids[1:], lightonai_scores[1:])):
-                    negative_id = str(document_id)
-                    if negative_id == positive_id:
+        with tqdm(total=len(scores), desc="Writing LightOn score artifacts", unit="row") as pbar:
+            for batch in scores.iter(batch_size=256):
+                pbar.update(len(batch["query_id"]))
+                for query_id, document_ids, lightonai_scores in zip(
+                    batch["query_id"],
+                    batch["document_ids"],
+                    batch["scores"],
+                ):
+                    if not document_ids or not lightonai_scores:
                         continue
-                    score = float(score)
-                    previous = current_candidates.get(negative_id)
-                    if previous is None or score > float(previous["candidate_ranking"]):
-                        current_candidates[negative_id] = {
+                    query_id = str(query_id)
+                    if query_id != current_query_id:
+                        flush_candidate_query()
+                        if query_id in completed_query_ids:
+                            raise ValueError(
+                                "LightOn score rows must be grouped by query_id for memory-bounded artifact creation"
+                            )
+                        current_query_id = query_id
+                    positive_id = str(document_ids[0])
+                    current_positive_ids.add(positive_id)
+                    relevant_rows.append(
+                        {
                             "query_id": query_id,
-                            "document_id": negative_id,
-                            "candidate_ranking": score,
-                            "lightonai_score": score,
-                            "candidate_selected": True,
-                            "retrieval_rank": int(retrieval_rank),
-                            "retrieval_source": "lightonai",
+                            "document_id": positive_id,
+                            "lightonai_positive_score": float(lightonai_scores[0]),
                         }
-                if len(relevant_rows) >= flush_rows:
-                    flush_relevant()
+                    )
+                    relevant_count += 1
+
+                    for retrieval_rank, (document_id, score) in enumerate(zip(document_ids[1:], lightonai_scores[1:])):
+                        negative_id = str(document_id)
+                        if negative_id == positive_id:
+                            continue
+                        score = float(score)
+                        previous = current_candidates.get(negative_id)
+                        if previous is None or score > float(previous["candidate_ranking"]):
+                            current_candidates[negative_id] = {
+                                "query_id": query_id,
+                                "document_id": negative_id,
+                                "candidate_ranking": score,
+                                "lightonai_score": score,
+                                "candidate_selected": True,
+                                "retrieval_rank": int(retrieval_rank),
+                                "retrieval_source": "lightonai",
+                            }
+                    if len(relevant_rows) >= flush_rows:
+                        flush_relevant()
 
         flush_candidate_query()
         flush_relevant()
@@ -329,7 +338,7 @@ def write_lightonai_pipeline_artifacts(
         candidates_writer.close()
         os.replace(relevant_temp, relevant_path)
         os.replace(candidates_temp, candidates_path)
-    except Exception:
+    except BaseException:
         relevant_writer.close()
         candidates_writer.close()
         for temp_path in (relevant_temp, candidates_temp):
@@ -368,9 +377,17 @@ def export_lightonai_pipeline_artifacts(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert LightOn splits into compact pipeline Parquet artifacts.")
     default_splits = config("LIGHTONAI_SPLITS", default=config("LIGHTONAI_SPLIT", default="fiqa"))
-    parser.add_argument("--dataset_name", type=str, default=config("LIGHTONAI_DATASET_NAME", default=DEFAULT_DATASET_NAME))
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=config("LIGHTONAI_DATASET_NAME", default=DEFAULT_DATASET_NAME),
+    )
     parser.add_argument("--split", type=str, default=first_split(default_splits))
-    parser.add_argument("--output_root", type=str, default=config("LIGHTONAI_PIPELINE_ROOT", default="data/lightonai_pipeline"))
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default=config("LIGHTONAI_PIPELINE_ROOT", default="data/lightonai_pipeline"),
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
