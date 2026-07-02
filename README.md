@@ -49,7 +49,13 @@ This starts the `executable` container and optional `vdb` service based on Qdran
 
 ## Updating Requirements
 
-The runtime `.in` files are the source of truth. Compile pinned requirements with `uv`:
+The runtime `.in` files are the source of truth. Compile pinned requirements with `make`:
+
+```bash
+make compile-runtime-requirements
+```
+
+This runs the equivalent `uv` commands:
 
 ```bash
 uv pip compile requirements-lancedb.in -o requirements-lancedb.txt \

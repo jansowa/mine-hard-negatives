@@ -7,7 +7,8 @@ lancedb
 python-decouple
 datasets
 pandas
-transformers==4.51
+# Required by BAAI/bge-reranker-v2.5-gemma2-lightweight.
+transformers==4.46.0
 langchain-huggingface
 numpy
 mypy
