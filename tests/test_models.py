@@ -103,6 +103,34 @@ def test_flag_embedding_reranker_receives_correct_max_length(monkeypatch):
     ]
 
 
+def test_lightweight_bge_reranker_uses_bf16_flagembedding_path(monkeypatch):
+    calls = []
+
+    class FakeFlagAutoReranker:
+        @classmethod
+        def from_finetuned(cls, model_name, **kwargs):
+            calls.append((model_name, kwargs))
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "FlagEmbedding",
+        types.SimpleNamespace(FlagAutoReranker=FakeFlagAutoReranker),
+    )
+
+    get_reranker_model("BAAI/bge-reranker-v2.5-gemma2-lightweight")
+
+    assert calls == [
+        (
+            "BAAI/bge-reranker-v2.5-gemma2-lightweight",
+            {
+                "use_bf16": True,
+                "devices": ["cuda:0"],
+            },
+        )
+    ]
+
+
 def test_rerank_uses_predict_models():
     class PredictModel:
         def predict(self, pairs, batch_size, show_progress_bar):

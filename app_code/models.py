@@ -181,6 +181,7 @@ def get_reranker_model(
         reranker_max_length = _config_optional("RERANKER_MAX_LENGTH", cast=int)
         if reranker_max_length is not None:
             flag_embedding_kwargs["max_length"] = reranker_max_length
+        # The LLM-based BGE rerankers are large; keep this path explicitly half precision.
         model = FlagAutoReranker.from_finetuned(model_name, use_bf16=True, devices=devices, **flag_embedding_kwargs)
         # model = FlagAutoReranker.from_finetuned(model_name, use_fp16=True, devices='cpu')
         return None, model

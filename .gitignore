@@ -18,3 +18,5 @@ trt_models/
 logs
 merge_data
 runs
+data
+lancedb_data
