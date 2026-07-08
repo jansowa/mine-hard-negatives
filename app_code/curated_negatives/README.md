@@ -169,6 +169,30 @@ python app_code/curated_negatives/lightonai_to_flag_embedding.py \
   --output_dir data/lightonai_flag_embedding
 ```
 
+## Translate a LightOn HotpotQA JSONL to Polish
+
+The integer LightOn HotpotQA query and document IDs are zero-based line indexes into the corresponding
+BEIR/CLARIN files. The translator uses that exact mapping to replace every `query`, `pos`, and `neg` text while
+preserving IDs, scores, and all other fields:
+
+```bash
+python app_code/curated_negatives/translate_lightonai_beir_pl_jsonl.py \
+  --input_path data/lightonai_pipeline/hotpotqa/train.jsonl
+```
+
+This creates `data/lightonai_pipeline/hotpotqa/train_pl.jsonl`. Missing source files are downloaded from
+`clarin-knext/hotpotqa-pl` to `data/hotpotqa_pl_source`. The conversion fails instead of producing a partially
+translated file if any required query or document index is unavailable.
+
+The same line-index mapping is available for other corresponding LightOn and CLARIN BEIR-PL datasets. For FIQA:
+
+```bash
+python app_code/curated_negatives/translate_lightonai_beir_pl_jsonl.py \
+  --input_path data/lightonai_pipeline/fiqa/train.jsonl \
+  --source_dataset clarin-knext/fiqa-pl \
+  --source_dir data/fiqa_pl_source
+```
+
 ## Rescore an existing FlagEmbedding JSONL
 
 This computes fresh reranker scores for positives and negatives. Existing `pos_scores` and `neg_scores`

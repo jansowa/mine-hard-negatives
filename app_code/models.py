@@ -163,6 +163,37 @@ def is_llm_lightweight_reranker(model_name: str) -> bool:
     return model_name.endswith("lightweight")
 
 
+def _has_chat_template(processor: Any) -> bool:
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template:
+        return True
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    return bool(getattr(tokenizer, "chat_template", None))
+
+
+def _disable_message_modality_without_chat_template(model: Any) -> None:
+    try:
+        transformer = model[0]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return
+
+    modality_config = getattr(transformer, "modality_config", None)
+    if not isinstance(modality_config, dict):
+        return
+    if "message" not in modality_config or "text" not in modality_config:
+        return
+
+    processor = getattr(transformer, "processor", None)
+    if processor is None or _has_chat_template(processor):
+        return
+
+    modality_config.pop("message", None)
+    input_formatter = getattr(transformer, "input_formatter", None)
+    if input_formatter is not None and hasattr(input_formatter, "supported_modalities"):
+        input_formatter.supported_modalities = list(modality_config.keys())
+
+
 def get_reranker_model(
     model_name: str = config("RERANKER_NAME", default="cross-encoder/ms-marco-MiniLM-L-6-v2"), gpu_id: int = 0
 ):
@@ -203,6 +234,7 @@ def get_reranker_model(
     if reranker_max_length is not None:
         cross_encoder_kwargs["max_length"] = reranker_max_length
     model = CrossEncoder(model_name, **cross_encoder_kwargs)
+    _disable_message_modality_without_chat_template(model)
     return None, model
 
 

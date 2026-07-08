@@ -7,6 +7,9 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from decouple import UndefinedValueError, config
 from tqdm.auto import tqdm
 
@@ -27,6 +30,7 @@ from models import get_reranker_model, rerank
 
 DEFAULT_POS_SCORE_FIELD = "pos_scores_stronger_reranker"
 DEFAULT_NEG_SCORE_FIELD = "neg_scores_stronger_reranker"
+DEFAULT_PARQUET_SCORE_FIELD = "score_stronger_reranker"
 DEFAULT_RERANKER_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
@@ -52,6 +56,10 @@ def _config_first(names: Sequence[str], *, cast: Callable | None = None, default
 
 def incomplete_output_path(output_path: str) -> str:
     return f"{output_path}.incomplete"
+
+
+def _is_parquet_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() == ".parquet"
 
 
 def _write_jsonl_rows(handle, rows: Sequence[dict[str, Any]], fsync: bool) -> None:
@@ -204,6 +212,317 @@ def _collect_reranker_sample_pairs(
     return sample_queries, sample_docs
 
 
+def _parquet_output_schema(input_schema: pa.Schema, score_column: str) -> pa.Schema:
+    fields = [field for field in input_schema if field.name != score_column]
+    fields.append(pa.field(score_column, pa.float32()))
+    return pa.schema(fields)
+
+
+def _validate_parquet_columns(
+    input_schema: pa.Schema,
+    *,
+    question_column: str,
+    answer_column: str,
+    score_column: str,
+    rejected_column: str,
+    only_verified: bool,
+) -> None:
+    if not question_column:
+        raise ValueError("question_column must not be empty")
+    if not answer_column:
+        raise ValueError("answer_column must not be empty")
+    if not score_column:
+        raise ValueError("parquet_score_column must not be empty")
+    if only_verified and not rejected_column:
+        raise ValueError("rejected_column must not be empty when only_verified is enabled")
+
+    column_names = set(input_schema.names)
+    missing = [name for name in (question_column, answer_column) if name not in column_names]
+    if missing:
+        raise ValueError(f"Parquet input is missing required column(s): {', '.join(missing)}")
+    if only_verified and rejected_column not in column_names:
+        raise ValueError(f"Parquet input is missing required column {rejected_column!r} for --only-verified")
+
+
+def _existing_parquet_scores(df: pd.DataFrame, score_column: str) -> pd.Series:
+    if score_column not in df.columns:
+        return pd.Series(pd.NA, index=df.index, dtype="Float32")
+    return pd.to_numeric(df[score_column], errors="coerce")
+
+
+def _verified_parquet_rows(df: pd.DataFrame, rejected_column: str) -> pd.Series:
+    return df[rejected_column].eq(False).fillna(False)
+
+
+def _parquet_rows_to_score(
+    df: pd.DataFrame,
+    *,
+    question_column: str,
+    answer_column: str,
+    score_column: str,
+    rejected_column: str,
+    only_verified: bool,
+) -> tuple[pd.Series, pd.Series]:
+    score_values = _existing_parquet_scores(df, score_column)
+    mask = score_values.isna() & df[question_column].notna() & df[answer_column].notna()
+    if only_verified:
+        mask &= _verified_parquet_rows(df, rejected_column)
+    return score_values, mask
+
+
+def _score_parquet_batch(
+    batch: pa.RecordBatch,
+    *,
+    tokenizer,
+    reranker_model,
+    safe_rerank: OOMRetryReranker,
+    reranker_batch_size: int,
+    output_schema: pa.Schema,
+    question_column: str,
+    answer_column: str,
+    score_column: str,
+    rejected_column: str,
+    only_verified: bool,
+) -> tuple[pa.Table, int]:
+    df = batch.to_pandas()
+    score_values, mask = _parquet_rows_to_score(
+        df,
+        question_column=question_column,
+        answer_column=answer_column,
+        score_column=score_column,
+        rejected_column=rejected_column,
+        only_verified=only_verified,
+    )
+
+    scored_count = int(mask.sum())
+    if scored_count:
+        score_rows = df.loc[mask, [question_column, answer_column]]
+        queries = score_rows[question_column].astype(str).tolist()
+        answers = score_rows[answer_column].astype(str).tolist()
+        scores = safe_rerank(
+            tokenizer,
+            reranker_model,
+            queries,
+            answers,
+            batch_size=reranker_batch_size,
+        )
+        if len(scores) != scored_count:
+            raise RuntimeError(f"Reranker returned {len(scores)} scores for {scored_count} pairs")
+        score_values.loc[mask] = [float(score) for score in scores]
+
+    result_df = df.drop(columns=[score_column], errors="ignore")
+    result_df[score_column] = score_values.astype("float32")
+    result_df = result_df[list(output_schema.names)]
+    return pa.Table.from_pandas(result_df, schema=output_schema, preserve_index=False), scored_count
+
+
+def _collect_parquet_reranker_sample_pairs(
+    input_path: str,
+    sample_size: int,
+    *,
+    question_column: str,
+    answer_column: str,
+    score_column: str,
+    rejected_column: str,
+    only_verified: bool,
+) -> tuple[list[str], list[str]]:
+    if sample_size <= 0:
+        return [], []
+
+    parquet_file = pq.ParquetFile(input_path)
+    schema_names = set(parquet_file.schema_arrow.names)
+    columns = [question_column, answer_column]
+    if score_column in schema_names:
+        columns.append(score_column)
+    if only_verified:
+        columns.append(rejected_column)
+
+    sample_queries: list[str] = []
+    sample_docs: list[str] = []
+    batch_size = max(1, min(65_536, max(sample_size * 4, 1_024)))
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        df = batch.to_pandas()
+        _, mask = _parquet_rows_to_score(
+            df,
+            question_column=question_column,
+            answer_column=answer_column,
+            score_column=score_column,
+            rejected_column=rejected_column,
+            only_verified=only_verified,
+        )
+        if not mask.any():
+            continue
+
+        for query, answer in df.loc[mask, [question_column, answer_column]].itertuples(index=False, name=None):
+            sample_queries.append(str(query))
+            sample_docs.append(str(answer))
+            if len(sample_docs) >= sample_size:
+                return sample_queries, sample_docs
+
+    return sample_queries, sample_docs
+
+
+def add_stronger_reranker_scores_parquet(
+    input_path: str,
+    output_path: str,
+    reranker_model_name: str,
+    reranker_batch_size: int | None = None,
+    record_batch_size: int = 32,
+    score_column: str = DEFAULT_PARQUET_SCORE_FIELD,
+    question_column: str = "question",
+    answer_column: str = "answer",
+    rejected_column: str = "rejected",
+    only_verified: bool = False,
+    resume: bool = True,
+    fsync: bool = False,
+    report_path: str | None = None,
+    auto_reranker_batch_size_candidates: str | None = None,
+    auto_reranker_batch_size_min: int = 1,
+    auto_reranker_batch_size_max: int = 64,
+    auto_reranker_batch_size_sample_size: int = 128,
+    auto_reranker_batch_size_memory_utilization: float = 0.70,
+) -> dict[str, Any]:
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        raise ValueError("input_path and output_path must be different; in-place updates are not supported")
+    if not _is_parquet_path(output_path):
+        raise ValueError("Parquet input requires output_path ending with .parquet")
+    if record_batch_size <= 0:
+        raise ValueError("record_batch_size must be greater than 0")
+
+    validate_batch_size_options(
+        reranker_batch_size,
+        auto_reranker_batch_size_min,
+        auto_reranker_batch_size_max,
+        auto_reranker_batch_size_sample_size,
+        auto_reranker_batch_size_memory_utilization,
+        "reranker",
+    )
+
+    ensure_parent_dir(output_path)
+    work_path = incomplete_output_path(output_path)
+    input_parquet = pq.ParquetFile(input_path)
+    input_schema = input_parquet.schema_arrow
+    _validate_parquet_columns(
+        input_schema,
+        question_column=question_column,
+        answer_column=answer_column,
+        score_column=score_column,
+        rejected_column=rejected_column,
+        only_verified=only_verified,
+    )
+    output_schema = _parquet_output_schema(input_schema, score_column)
+
+    if resume and not os.path.exists(work_path) and os.path.exists(output_path):
+        completed_rows = pq.ParquetFile(output_path).metadata.num_rows
+        print(f"{output_path} already exists with {completed_rows:,} rows; nothing to resume.")
+        return {
+            "completed": True,
+            "input_path": input_path,
+            "output_path": output_path,
+            "format": "parquet",
+            "already_completed_rows": completed_rows,
+            "newly_scored_rows": 0,
+            "newly_scored_pairs": 0,
+        }
+
+    if os.path.exists(work_path):
+        if resume:
+            print(f"Removing incomplete parquet output {work_path}; parquet resume restarts this file.")
+        os.remove(work_path)
+
+    tokenizer, reranker_model = get_reranker_model(reranker_model_name)
+    print("Stronger reranker loaded.")
+    rerank_function = partial(rerank, model_name=reranker_model_name)
+
+    if reranker_batch_size is None:
+        candidates = parse_batch_size_candidates(
+            auto_reranker_batch_size_candidates,
+            minimum=auto_reranker_batch_size_min,
+            maximum=auto_reranker_batch_size_max,
+        )
+        sample_queries, sample_docs = _collect_parquet_reranker_sample_pairs(
+            input_path,
+            auto_reranker_batch_size_sample_size,
+            question_column=question_column,
+            answer_column=answer_column,
+            score_column=score_column,
+            rejected_column=rejected_column,
+            only_verified=only_verified,
+        )
+        reranker_batch_size = benchmark_reranker_batch_size(
+            tokenizer,
+            reranker_model,
+            sample_queries,
+            sample_docs,
+            candidates,
+            rerank_function,
+            memory_utilization=auto_reranker_batch_size_memory_utilization,
+        )
+    else:
+        print(f"Using explicit reranker batch size: {reranker_batch_size}")
+    assert reranker_batch_size is not None
+
+    safe_rerank = OOMRetryReranker(rerank_function, reranker_batch_size)
+    print(f"Effective reranker batch size: {reranker_batch_size}")
+
+    newly_scored_rows = 0
+    total_output_rows = 0
+    writer = pq.ParquetWriter(work_path, output_schema, compression="zstd", use_dictionary=True)
+    try:
+        total_rows = input_parquet.metadata.num_rows
+        with tqdm(total=total_rows, unit="row", desc="Adding stronger reranker parquet scores") as pbar:
+            for batch in input_parquet.iter_batches(batch_size=record_batch_size):
+                output_table, scored_count = _score_parquet_batch(
+                    batch,
+                    tokenizer=tokenizer,
+                    reranker_model=reranker_model,
+                    safe_rerank=safe_rerank,
+                    reranker_batch_size=reranker_batch_size,
+                    output_schema=output_schema,
+                    question_column=question_column,
+                    answer_column=answer_column,
+                    score_column=score_column,
+                    rejected_column=rejected_column,
+                    only_verified=only_verified,
+                )
+                writer.write_table(output_table)
+                newly_scored_rows += scored_count
+                total_output_rows += output_table.num_rows
+                pbar.update(output_table.num_rows)
+    finally:
+        writer.close()
+
+    if fsync:
+        with open(work_path, "r+b") as handle:
+            os.fsync(handle.fileno())
+
+    os.replace(work_path, output_path)
+    report = {
+        "completed": True,
+        "input_path": input_path,
+        "output_path": output_path,
+        "format": "parquet",
+        "reranker_model_name": reranker_model_name,
+        "reranker_batch_size": reranker_batch_size,
+        "record_batch_size": record_batch_size,
+        "parquet_score_column": score_column,
+        "question_column": question_column,
+        "answer_column": answer_column,
+        "rejected_column": rejected_column,
+        "only_verified": only_verified,
+        "resumed_rows": 0,
+        "newly_scored_rows": newly_scored_rows,
+        "newly_scored_pairs": newly_scored_rows,
+        "total_output_rows": total_output_rows,
+    }
+    if report_path:
+        ensure_parent_dir(report_path)
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+    return report
+
+
 def add_stronger_reranker_scores_jsonl(
     input_path: str,
     output_path: str,
@@ -221,7 +540,38 @@ def add_stronger_reranker_scores_jsonl(
     auto_reranker_batch_size_max: int = 64,
     auto_reranker_batch_size_sample_size: int = 128,
     auto_reranker_batch_size_memory_utilization: float = 0.70,
+    parquet_score_column: str = DEFAULT_PARQUET_SCORE_FIELD,
+    question_column: str = "question",
+    answer_column: str = "answer",
+    rejected_column: str = "rejected",
+    only_verified: bool = False,
 ) -> dict[str, Any]:
+    if _is_parquet_path(input_path):
+        return add_stronger_reranker_scores_parquet(
+            input_path=input_path,
+            output_path=output_path,
+            reranker_model_name=reranker_model_name,
+            reranker_batch_size=reranker_batch_size,
+            record_batch_size=record_batch_size,
+            score_column=parquet_score_column,
+            question_column=question_column,
+            answer_column=answer_column,
+            rejected_column=rejected_column,
+            only_verified=only_verified,
+            resume=resume,
+            fsync=fsync,
+            report_path=report_path,
+            auto_reranker_batch_size_candidates=auto_reranker_batch_size_candidates,
+            auto_reranker_batch_size_min=auto_reranker_batch_size_min,
+            auto_reranker_batch_size_max=auto_reranker_batch_size_max,
+            auto_reranker_batch_size_sample_size=auto_reranker_batch_size_sample_size,
+            auto_reranker_batch_size_memory_utilization=auto_reranker_batch_size_memory_utilization,
+        )
+    if _is_parquet_path(output_path):
+        raise ValueError("Parquet output requires a parquet input_path")
+    if only_verified:
+        raise ValueError("--only-verified is only supported for parquet inputs")
+
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise ValueError("input_path and output_path must be different; in-place updates are not supported")
     if not pos_score_field:
@@ -364,7 +714,9 @@ def add_stronger_reranker_scores_jsonl(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Add stronger-reranker score fields to a FlagEmbedding-style JSONL.")
+    parser = argparse.ArgumentParser(
+        description="Add stronger-reranker score fields to a FlagEmbedding-style JSONL or question/answer parquet."
+    )
     parser.add_argument("--input_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument(
@@ -389,7 +741,37 @@ def main() -> None:
     )
     parser.add_argument("--pos_score_field", type=str, default=DEFAULT_POS_SCORE_FIELD)
     parser.add_argument("--neg_score_field", type=str, default=DEFAULT_NEG_SCORE_FIELD)
+    parser.add_argument(
+        "--parquet_score_column",
+        type=str,
+        default=_config_optional("STRONGER_RERANKER_PARQUET_SCORE_COLUMN", default=DEFAULT_PARQUET_SCORE_FIELD),
+        help="Output score column for question/answer parquet inputs.",
+    )
+    parser.add_argument(
+        "--question_column",
+        type=str,
+        default=_config_optional("STRONGER_RERANKER_PARQUET_QUESTION_COLUMN", default="question"),
+        help="Question column for parquet inputs.",
+    )
+    parser.add_argument(
+        "--answer_column",
+        type=str,
+        default=_config_optional("STRONGER_RERANKER_PARQUET_ANSWER_COLUMN", default="answer"),
+        help="Answer column for parquet inputs.",
+    )
+    parser.add_argument(
+        "--rejected_column",
+        type=str,
+        default=_config_optional("STRONGER_RERANKER_PARQUET_REJECTED_COLUMN", default="rejected"),
+        help="Rejected/verification column used by --only-verified for parquet inputs.",
+    )
     parser.add_argument("--score_negatives", action="store_true")
+    parser.add_argument(
+        "--only-verified",
+        dest="only_verified",
+        action="store_true",
+        help="For parquet inputs, score only rows where rejected is False.",
+    )
     parser.add_argument("--resume", dest="resume", action="store_true")
     parser.add_argument("--no_resume", dest="resume", action="store_false")
     parser.set_defaults(resume=True)
@@ -433,6 +815,11 @@ def main() -> None:
         pos_score_field=args.pos_score_field,
         neg_score_field=args.neg_score_field,
         score_negatives=args.score_negatives,
+        parquet_score_column=args.parquet_score_column,
+        question_column=args.question_column,
+        answer_column=args.answer_column,
+        rejected_column=args.rejected_column,
+        only_verified=args.only_verified,
         resume=args.resume,
         fsync=args.fsync,
         report_path=report_path,

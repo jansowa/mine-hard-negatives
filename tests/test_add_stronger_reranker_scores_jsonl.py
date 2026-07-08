@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
@@ -187,3 +188,91 @@ def test_ignores_null_values_in_original_score_fields(monkeypatch, tmp_path):
     rows = _jsonl_rows(output_path)
     assert rows[0]["pos_scores"] == [None]
     assert rows[0]["pos_scores_stronger_reranker"] == [5.0]
+
+
+def test_adds_scores_to_question_answer_parquet(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.parquet"
+    output_path = tmp_path / "output.parquet"
+    pd.DataFrame(
+        {
+            "question": ["q1", "q2"],
+            "answer": ["a1", "a22"],
+            "source": ["webfaq", "clips"],
+        }
+    ).to_parquet(input_path, index=False)
+    calls = _patch_reranker(monkeypatch, lambda queries, docs: [float(len(q) + len(d)) for q, d in zip(queries, docs)])
+
+    report = add_stronger_reranker_scores_jsonl(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        reranker_model_name="final-reranker",
+        reranker_batch_size=2,
+        record_batch_size=10,
+    )
+
+    df = pd.read_parquet(output_path)
+    assert report["format"] == "parquet"
+    assert report["newly_scored_pairs"] == 2
+    assert df["source"].tolist() == ["webfaq", "clips"]
+    assert df["score_stronger_reranker"].tolist() == [4.0, 5.0]
+    assert calls == [(["q1", "q2"], ["a1", "a22"], 2, "final-reranker")]
+
+
+def test_only_verified_scores_only_not_rejected_parquet_rows(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.parquet"
+    output_path = tmp_path / "output.parquet"
+    pd.DataFrame(
+        {
+            "question": ["q1", "q2", "q3", "q4"],
+            "answer": ["a1", "a2", "a3", "a4"],
+            "rejected": [False, True, None, False],
+        }
+    ).to_parquet(input_path, index=False)
+    calls = _patch_reranker(monkeypatch, [10.0, 20.0])
+
+    report = add_stronger_reranker_scores_jsonl(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        reranker_model_name="final-reranker",
+        reranker_batch_size=4,
+        record_batch_size=10,
+        only_verified=True,
+    )
+
+    df = pd.read_parquet(output_path)
+    scores = df["score_stronger_reranker"].tolist()
+    assert report["newly_scored_pairs"] == 2
+    assert scores[0] == 10.0
+    assert pd.isna(scores[1])
+    assert pd.isna(scores[2])
+    assert scores[3] == 20.0
+    assert calls == [(["q1", "q4"], ["a1", "a4"], 4, "final-reranker")]
+
+
+def test_only_verified_requires_rejected_column_for_parquet(tmp_path):
+    input_path = tmp_path / "input.parquet"
+    output_path = tmp_path / "output.parquet"
+    pd.DataFrame({"question": ["q"], "answer": ["a"]}).to_parquet(input_path, index=False)
+
+    with pytest.raises(ValueError, match="missing required column 'rejected'"):
+        add_stronger_reranker_scores_jsonl(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            reranker_model_name="final-reranker",
+            reranker_batch_size=1,
+            only_verified=True,
+        )
+
+
+def test_parquet_input_requires_parquet_output_path(tmp_path):
+    input_path = tmp_path / "input.parquet"
+    output_path = tmp_path / "output.jsonl"
+    pd.DataFrame({"question": ["q"], "answer": ["a"]}).to_parquet(input_path, index=False)
+
+    with pytest.raises(ValueError, match="output_path ending with .parquet"):
+        add_stronger_reranker_scores_jsonl(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            reranker_model_name="final-reranker",
+            reranker_batch_size=1,
+        )

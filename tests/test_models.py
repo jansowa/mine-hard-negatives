@@ -73,6 +73,67 @@ def test_non_flag_rerankers_use_generic_cross_encoder_path(monkeypatch):
     ]
 
 
+def test_cross_encoder_disables_message_modality_without_chat_template(monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        nn=types.SimpleNamespace(Identity=lambda: object()),
+    )
+
+    class FakeModule:
+        def __init__(self):
+            self.modality_config = {"text": {"method": "forward"}, "message": {"method": "forward"}}
+            self.processor = types.SimpleNamespace(chat_template=None)
+            self.input_formatter = types.SimpleNamespace(supported_modalities=["text", "message"])
+
+    class FakeCrossEncoder:
+        def __init__(self, *_args, **_kwargs):
+            self.module = FakeModule()
+
+        def __getitem__(self, index):
+            assert index == 0
+            return self.module
+
+    monkeypatch.setattr(models, "_import_torch", lambda: fake_torch)
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", FakeCrossEncoder)
+
+    _, model = get_reranker_model("mixedbread-ai/mxbai-rerank-base-v2")
+
+    assert model.module.modality_config == {"text": {"method": "forward"}}
+    assert model.module.input_formatter.supported_modalities == ["text"]
+
+
+def test_cross_encoder_keeps_message_modality_with_chat_template(monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        nn=types.SimpleNamespace(Identity=lambda: object()),
+    )
+
+    class FakeModule:
+        def __init__(self):
+            self.modality_config = {"text": {"method": "forward"}, "message": {"method": "forward"}}
+            self.processor = types.SimpleNamespace(chat_template="{% for message in messages %}{{ message }}{% endfor %}")
+            self.input_formatter = types.SimpleNamespace(supported_modalities=["text", "message"])
+
+    class FakeCrossEncoder:
+        def __init__(self, *_args, **_kwargs):
+            self.module = FakeModule()
+
+        def __getitem__(self, index):
+            assert index == 0
+            return self.module
+
+    monkeypatch.setattr(models, "_import_torch", lambda: fake_torch)
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", FakeCrossEncoder)
+
+    _, model = get_reranker_model("example-org/chat-reranker")
+
+    assert model.module.modality_config == {
+        "text": {"method": "forward"},
+        "message": {"method": "forward"},
+    }
+    assert model.module.input_formatter.supported_modalities == ["text", "message"]
+
+
 def test_flag_embedding_reranker_receives_correct_max_length(monkeypatch):
     calls = []
 
