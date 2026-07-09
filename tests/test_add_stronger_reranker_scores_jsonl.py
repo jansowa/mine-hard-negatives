@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app_code"))
 from add_stronger_reranker_scores_jsonl import (
     add_stronger_reranker_scores_jsonl,
     incomplete_output_path,
+    parquet_resume_source_path,
 )
 
 
@@ -276,3 +277,42 @@ def test_parquet_input_requires_parquet_output_path(tmp_path):
             reranker_model_name="final-reranker",
             reranker_batch_size=1,
         )
+
+
+def test_parquet_resume_reuses_existing_incomplete_rows(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.parquet"
+    output_path = tmp_path / "output.parquet"
+    pd.DataFrame(
+        {
+            "question": ["q1", "q2", "q3"],
+            "answer": ["a1", "a2", "a3"],
+            "source": ["old", "new", "new"],
+        }
+    ).to_parquet(input_path, index=False)
+    pd.DataFrame(
+        {
+            "question": ["q1"],
+            "answer": ["a1"],
+            "source": ["old"],
+            "score_stronger_reranker": [11.0],
+        }
+    ).to_parquet(incomplete_output_path(str(output_path)), index=False)
+    calls = _patch_reranker(monkeypatch, lambda queries, _docs: [22.0 if query == "q2" else 33.0 for query in queries])
+
+    report = add_stronger_reranker_scores_jsonl(
+        input_path=str(input_path),
+        output_path=str(output_path),
+        reranker_model_name="final-reranker",
+        reranker_batch_size=2,
+        record_batch_size=1,
+        resume=True,
+    )
+
+    df = pd.read_parquet(output_path)
+    assert report["resumed_rows"] == 1
+    assert report["newly_scored_pairs"] == 2
+    assert df["question"].tolist() == ["q1", "q2", "q3"]
+    assert df["score_stronger_reranker"].tolist() == [11.0, 22.0, 33.0]
+    assert calls == [(["q2"], ["a2"], 2, "final-reranker"), (["q3"], ["a3"], 2, "final-reranker")]
+    assert not Path(incomplete_output_path(str(output_path))).exists()
+    assert not Path(parquet_resume_source_path(str(output_path))).exists()

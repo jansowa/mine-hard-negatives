@@ -218,6 +218,73 @@ def _parquet_output_schema(input_schema: pa.Schema, score_column: str) -> pa.Sch
     return pa.schema(fields)
 
 
+def parquet_resume_source_path(output_path: str) -> str:
+    return f"{incomplete_output_path(output_path)}.resume_source"
+
+
+def _iter_parquet_batches_from_row(
+    parquet_file: pq.ParquetFile,
+    *,
+    batch_size: int,
+    skip_rows: int = 0,
+):
+    seen_rows = 0
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        batch_rows = batch.num_rows
+        batch_start = seen_rows
+        batch_end = seen_rows + batch_rows
+        seen_rows = batch_end
+
+        if batch_end <= skip_rows:
+            continue
+
+        local_start = max(0, skip_rows - batch_start)
+        yield batch.slice(local_start, batch_rows - local_start)
+
+
+def _open_parquet_resume_source(path: str, output_schema: pa.Schema) -> pq.ParquetFile:
+    try:
+        parquet_file = pq.ParquetFile(path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot resume from {path}; the incomplete parquet is not readable. "
+            "If the previous process was killed before pyarrow wrote the footer, the already-scored rows cannot be "
+            "recovered from this file."
+        ) from exc
+
+    missing_columns = [name for name in output_schema.names if name not in parquet_file.schema_arrow.names]
+    if missing_columns:
+        raise ValueError(f"Cannot resume from {path}; missing column(s): {', '.join(missing_columns)}")
+    return parquet_file
+
+
+def _close_parquet_file(parquet_file: pq.ParquetFile) -> None:
+    close = getattr(parquet_file, "close", None)
+    if close is not None:
+        close()
+
+
+def _copy_parquet_resume_rows(
+    *,
+    resume_path: str,
+    writer: pq.ParquetWriter,
+    output_schema: pa.Schema,
+    batch_size: int,
+) -> int:
+    parquet_file = _open_parquet_resume_source(resume_path, output_schema)
+    copied_rows = 0
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            table = pa.Table.from_batches([batch]).select(output_schema.names)
+            if table.schema != output_schema:
+                table = table.cast(output_schema, safe=False)
+            writer.write_table(table)
+            copied_rows += table.num_rows
+        return copied_rows
+    finally:
+        _close_parquet_file(parquet_file)
+
+
 def _validate_parquet_columns(
     input_schema: pa.Schema,
     *,
@@ -320,6 +387,7 @@ def _collect_parquet_reranker_sample_pairs(
     input_path: str,
     sample_size: int,
     *,
+    skip_rows: int = 0,
     question_column: str,
     answer_column: str,
     score_column: str,
@@ -340,8 +408,8 @@ def _collect_parquet_reranker_sample_pairs(
     sample_queries: list[str] = []
     sample_docs: list[str] = []
     batch_size = max(1, min(65_536, max(sample_size * 4, 1_024)))
-    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
-        df = batch.to_pandas()
+    for batch in _iter_parquet_batches_from_row(parquet_file, batch_size=batch_size, skip_rows=skip_rows):
+        df = pa.Table.from_batches([batch]).select(columns).to_pandas()
         _, mask = _parquet_rows_to_score(
             df,
             question_column=question_column,
@@ -400,8 +468,10 @@ def add_stronger_reranker_scores_parquet(
 
     ensure_parent_dir(output_path)
     work_path = incomplete_output_path(output_path)
+    resume_path = parquet_resume_source_path(output_path)
     input_parquet = pq.ParquetFile(input_path)
     input_schema = input_parquet.schema_arrow
+    total_rows = input_parquet.metadata.num_rows
     _validate_parquet_columns(
         input_schema,
         question_column=question_column,
@@ -425,10 +495,96 @@ def add_stronger_reranker_scores_parquet(
             "newly_scored_pairs": 0,
         }
 
-    if os.path.exists(work_path):
-        if resume:
-            print(f"Removing incomplete parquet output {work_path}; parquet resume restarts this file.")
-        os.remove(work_path)
+    resumed_rows = 0
+    resume_source_path: str | None = None
+    if resume:
+        resume_candidates: list[tuple[int, str]] = []
+        resume_errors: list[Exception] = []
+        for candidate_path in (work_path, resume_path):
+            if not os.path.exists(candidate_path):
+                continue
+            try:
+                candidate_file = _open_parquet_resume_source(candidate_path, output_schema)
+                try:
+                    resume_candidates.append((candidate_file.metadata.num_rows, candidate_path))
+                finally:
+                    _close_parquet_file(candidate_file)
+            except Exception as exc:
+                resume_errors.append(exc)
+
+        if resume_candidates:
+            resumed_rows, selected_resume_path = max(resume_candidates, key=lambda item: item[0])
+            if resumed_rows > total_rows:
+                raise ValueError(
+                    f"Cannot resume from {selected_resume_path}; it has {resumed_rows:,} rows but input has "
+                    f"{total_rows:,} rows"
+                )
+            if resumed_rows:
+                if selected_resume_path != resume_path:
+                    if os.path.exists(resume_path):
+                        os.remove(resume_path)
+                    os.replace(selected_resume_path, resume_path)
+                elif os.path.exists(work_path):
+                    os.remove(work_path)
+                resume_source_path = resume_path
+                print(f"Resume enabled: found {resumed_rows:,} already scored parquet rows in {resume_source_path}")
+            else:
+                if os.path.exists(work_path):
+                    os.remove(work_path)
+                if os.path.exists(resume_path):
+                    os.remove(resume_path)
+        elif resume_errors:
+            raise resume_errors[0]
+    else:
+        if os.path.exists(work_path):
+            os.remove(work_path)
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
+
+    if resumed_rows == total_rows and resume_source_path is not None:
+        writer = pq.ParquetWriter(work_path, output_schema, compression="zstd", use_dictionary=True)
+        try:
+            copied_rows = _copy_parquet_resume_rows(
+                resume_path=resume_source_path,
+                writer=writer,
+                output_schema=output_schema,
+                batch_size=record_batch_size,
+            )
+            if copied_rows != resumed_rows:
+                raise RuntimeError(f"Copied {copied_rows:,} resume rows but expected {resumed_rows:,}")
+        finally:
+            writer.close()
+
+        if fsync:
+            with open(work_path, "r+b") as handle:
+                os.fsync(handle.fileno())
+        os.replace(work_path, output_path)
+        if os.path.exists(resume_source_path):
+            os.remove(resume_source_path)
+        report = {
+            "completed": True,
+            "input_path": input_path,
+            "output_path": output_path,
+            "format": "parquet",
+            "reranker_model_name": reranker_model_name,
+            "reranker_batch_size": reranker_batch_size,
+            "record_batch_size": record_batch_size,
+            "parquet_score_column": score_column,
+            "question_column": question_column,
+            "answer_column": answer_column,
+            "rejected_column": rejected_column,
+            "only_verified": only_verified,
+            "resumed_rows": resumed_rows,
+            "newly_scored_rows": 0,
+            "newly_scored_pairs": 0,
+            "total_output_rows": resumed_rows,
+        }
+        if report_path:
+            ensure_parent_dir(report_path)
+            with open(report_path, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+        return report
 
     tokenizer, reranker_model = get_reranker_model(reranker_model_name)
     print("Stronger reranker loaded.")
@@ -443,6 +599,7 @@ def add_stronger_reranker_scores_parquet(
         sample_queries, sample_docs = _collect_parquet_reranker_sample_pairs(
             input_path,
             auto_reranker_batch_size_sample_size,
+            skip_rows=resumed_rows,
             question_column=question_column,
             answer_column=answer_column,
             score_column=score_column,
@@ -469,9 +626,28 @@ def add_stronger_reranker_scores_parquet(
     total_output_rows = 0
     writer = pq.ParquetWriter(work_path, output_schema, compression="zstd", use_dictionary=True)
     try:
-        total_rows = input_parquet.metadata.num_rows
-        with tqdm(total=total_rows, unit="row", desc="Adding stronger reranker parquet scores") as pbar:
-            for batch in input_parquet.iter_batches(batch_size=record_batch_size):
+        if resume_source_path is not None:
+            copied_rows = _copy_parquet_resume_rows(
+                resume_path=resume_source_path,
+                writer=writer,
+                output_schema=output_schema,
+                batch_size=record_batch_size,
+            )
+            if copied_rows != resumed_rows:
+                raise RuntimeError(f"Copied {copied_rows:,} resume rows but expected {resumed_rows:,}")
+            total_output_rows += copied_rows
+
+        with tqdm(
+            total=total_rows,
+            unit="row",
+            desc="Adding stronger reranker parquet scores",
+            initial=resumed_rows,
+        ) as pbar:
+            for batch in _iter_parquet_batches_from_row(
+                input_parquet,
+                batch_size=record_batch_size,
+                skip_rows=resumed_rows,
+            ):
                 output_table, scored_count = _score_parquet_batch(
                     batch,
                     tokenizer=tokenizer,
@@ -497,6 +673,8 @@ def add_stronger_reranker_scores_parquet(
             os.fsync(handle.fileno())
 
     os.replace(work_path, output_path)
+    if resume_source_path is not None and os.path.exists(resume_source_path):
+        os.remove(resume_source_path)
     report = {
         "completed": True,
         "input_path": input_path,
@@ -510,7 +688,7 @@ def add_stronger_reranker_scores_parquet(
         "answer_column": answer_column,
         "rejected_column": rejected_column,
         "only_verified": only_verified,
-        "resumed_rows": 0,
+        "resumed_rows": resumed_rows,
         "newly_scored_rows": newly_scored_rows,
         "newly_scored_pairs": newly_scored_rows,
         "total_output_rows": total_output_rows,
